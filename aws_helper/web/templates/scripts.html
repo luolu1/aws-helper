@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}开机脚本 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2>保存开机脚本模板</h2>
+  <p class="hint">
+    存好的模板可以在「一键开机」页面一键套用。不要写 <span class="mono">#!/bin/bash</span>，
+    渲染时会自动加上。脚本以 root 身份执行。
+  </p>
+  <div class="grid g2">
+    <label class="f">
+      <span>模板名称（同名会覆盖）</span>
+      <input type="text" id="name" placeholder="docker-基础环境">
+    </label>
+    <label class="f">
+      <span>预装软件包（空格分隔）</span>
+      <input type="text" id="packages" placeholder="curl wget vim git">
+    </label>
+  </div>
+  <label class="f mt">
+    <span>脚本内容</span>
+    <textarea id="body" rows="12" placeholder="curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p"></textarea>
+  </label>
+  <div class="row mt">
+    <button onclick="preview()">预览渲染结果</button>
+    <span style="flex:1"></span>
+    <button class="primary" onclick="save()">保存模板</button>
+  </div>
+</div>
+
+<div class="card" id="preview-card" style="display:none">
+  <h2>渲染预览</h2>
+  <p class="hint">这是最终传给 EC2 UserData 的内容（boto3 会自动 base64 编码）。</p>
+  <pre class="out" id="preview-out"></pre>
+</div>
+
+<div class="card">
+  <h2>已保存的模板</h2>
+  {% if scripts %}
+  <table>
+    <thead><tr><th>名称</th><th>软件包</th><th>脚本预览</th><th style="width:120px">操作</th></tr></thead>
+    <tbody>
+      {% for s in scripts %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td class="mono">{{ s.packages | join(' ') or '-' }}</td>
+        <td class="mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          {{ s.body[:90] or '（空）' }}
+        </td>
+        <td>
+          <button class="sm" onclick="load({{ s.id }})">载入</button>
+          <button class="sm danger" onclick="del({{ s.id }})">删除</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">还没有保存的模板</div>
+  {% endif %}
+</div>
+
+<script id="script-data" type="application/json">{{ scripts | tojson }}</script>
+{% endblock %}
+
+{% block script %}
+<script>
+const SCRIPTS = JSON.parse(document.getElementById('script-data').textContent);
+
+function load(id) {
+  const s = SCRIPTS.find(x => x.id === id);
+  if (!s) return;
+  document.getElementById('name').value = s.name;
+  document.getElementById('body').value = s.body;
+  document.getElementById('packages').value = (s.packages || []).join(' ');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  toast('已载入到编辑区，修改后保存会覆盖同名模板');
+}
+
+async function save() {
+  const name = document.getElementById('name').value.trim();
+  if (!name) return toast('模板名称必填', 'err');
+  const form = new FormData();
+  form.append('name', name);
+  form.append('body', document.getElementById('body').value);
+  form.append('packages', document.getElementById('packages').value);
+  try {
+    await api('/api/scripts', { method: 'POST', form });
+    toast('已保存', 'ok');
+    setTimeout(() => location.reload(), 700);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function del(id) {
+  if (!confirm('删除这个模板？')) return;
+  try {
+    await api('/api/scripts/' + id, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    setTimeout(() => location.reload(), 500);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function preview() {
+  try {
+    const d = await api('/api/scripts/preview', {
+      method: 'POST',
+      json: {
+        body: document.getElementById('body').value,
+        hostname: 'example-host',
+        packages: document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean)
+      }
+    });
+    document.getElementById('preview-card').style.display = 'block';
+    document.getElementById('preview-out').textContent = d.rendered;
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+</script>
+{% endblock %}

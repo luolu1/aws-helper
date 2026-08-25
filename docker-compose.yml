@@ -1,0 +1,45 @@
+services:
+  aws-helper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aws-helper:latest
+    container_name: aws-helper
+    restart: unless-stopped
+
+    # 默认只绑本机。要对外暴露把 AWS_HELPER_BIND 改成 0.0.0.0，
+    # 并务必在前面加 HTTPS 反代 —— 面板持有 AWS 凭据。
+    ports:
+      - "${AWS_HELPER_BIND:-127.0.0.1}:${AWS_HELPER_PORT:-8765}:8765"
+
+    environment:
+      AWS_HELPER_DATA: /data
+      AWS_HELPER_HOST: 0.0.0.0
+      AWS_HELPER_PORT: 8765
+      # 仅首次启动生效，之后以数据库里的密码为准
+      AWS_HELPER_PASSWORD: ${AWS_HELPER_PASSWORD:-}
+      AWS_HELPER_SESSION_KEY: ${AWS_HELPER_SESSION_KEY:-}
+      AWS_HELPER_SESSION_TTL: ${AWS_HELPER_SESSION_TTL:-86400}
+
+    volumes:
+      - aws-helper-data:/data
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  aws-helper-data:
+    name: aws-helper-data

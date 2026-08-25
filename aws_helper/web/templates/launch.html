@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block title %}一键开机 — AWS 小助手{% endblock %}
+
+{% block body %}
+{% if not accounts %}
+<div class="card"><div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div></div>
+{% else %}
+
+<div class="card">
+  <h2>一键开机</h2>
+  <p class="hint">
+    只填名称就能开：其余全部用默认值（Ubuntu 24.04 / t3.micro / 16GB / 只开 22 端口）。
+    工具会自动解析最新 AMI、创建密钥对并保存私钥、创建安全组、等待公网 IP。
+  </p>
+
+  <div class="grid g3">
+    <label class="f">
+      <span>账号</span>
+      <select id="account_id">
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域</span>
+      <select id="region">
+        {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>实例名称（必填）</span>
+      <input type="text" id="name" placeholder="my-node" required>
+    </label>
+  </div>
+
+  <div class="grid g4 mt">
+    <label class="f">
+      <span>规格</span>
+      <select id="instance_type">
+        {% for code, desc in types.items() %}
+        <option value="{{ code }}" {% if code == 't3.micro' %}selected{% endif %}>{{ code }} — {{ desc }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>镜像</span>
+      <select id="image_key">
+        {% for key, spec in images.items() %}
+        <option value="{{ key }}" {% if key == 'ubuntu-24.04' %}selected{% endif %}>{{ spec.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>磁盘 (GB)</span>
+      <input type="number" id="disk_size" value="16" min="8" max="1024">
+    </label>
+    <label class="f">
+      <span>数量</span>
+      <input type="number" id="count" value="1" min="1" max="20">
+    </label>
+  </div>
+
+  <div class="grid g3 mt">
+    <label class="f">
+      <span>放通端口（逗号分隔）</span>
+      <input type="text" id="open_ports" value="22" placeholder="22, 80, 443">
+    </label>
+    <label class="f">
+      <span>root 密码（留空则不开 root 登录）</span>
+      <input type="text" id="root_password" placeholder="留空更安全，用密钥登录">
+    </label>
+    <label class="f">
+      <span>预装软件包（空格分隔）</span>
+      <input type="text" id="packages" placeholder="curl wget vim">
+    </label>
+  </div>
+
+  <label class="f mt" style="max-width:420px">
+    <span>指定 AMI ID（选填，填了则忽略上面的镜像选择）</span>
+    <input type="text" id="image_id" placeholder="ami-0123456789abcdef0">
+  </label>
+
+  <div class="row mt">
+    <label class="chk"><input type="checkbox" id="enable_ipv6"> 分配 IPv6（自建 VPC + IGW + 双栈路由）</label>
+    <label class="chk"><input type="checkbox" id="allow_all_ports"> 放通全部端口（不推荐）</label>
+  </div>
+</div>
+
+<div class="card">
+  <h2>开机脚本</h2>
+  <p class="hint">
+    首次启动时由 cloud-init 以 root 执行，不要写 <span class="mono">#!/bin/bash</span> 开头。
+    可以先「预览」看最终生成的完整脚本。
+  </p>
+
+  {% if scripts %}
+  <label class="f" style="max-width:340px">
+    <span>套用已保存的模板</span>
+    <select id="tpl" onchange="applyTpl()">
+      <option value="">— 不套用 —</option>
+      {% for s in scripts %}
+      <option value="{{ s.id }}" data-body="{{ s.body | e }}" data-pkgs="{{ s.packages | join(' ') }}">{{ s.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% endif %}
+
+  <label class="f mt">
+    <span>脚本内容</span>
+    <textarea id="script" rows="10" placeholder="apt-get update -y
+apt-get install -y docker.io
+systemctl enable --now docker"></textarea>
+  </label>
+
+  <div class="row mt">
+    <button onclick="preview()">预览最终脚本</button>
+    <span style="flex:1"></span>
+    <button class="primary" onclick="doLaunch()">开始创建</button>
+  </div>
+</div>
+
+<div class="card" id="preview-card" style="display:none">
+  <h2>脚本预览</h2>
+  <pre class="out" id="preview-out"></pre>
+</div>
+
+<div class="card" id="result-card" style="display:none">
+  <h2>创建结果</h2>
+  <table>
+    <thead><tr><th>名称</th><th>实例 ID</th><th>公网 IP</th><th>IPv6</th><th>SSH 命令</th></tr></thead>
+    <tbody id="result-rows"></tbody>
+  </table>
+  <p class="hint mt" id="key-hint" style="margin-bottom:0"></p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+function applyTpl() {
+  const opt = document.getElementById('tpl').selectedOptions[0];
+  if (!opt || !opt.value) return;
+  document.getElementById('script').value = opt.dataset.body || '';
+  if (opt.dataset.pkgs) document.getElementById('packages').value = opt.dataset.pkgs;
+}
+
+function collect() {
+  const ports = document.getElementById('open_ports').value
+    .split(',').map(s => parseInt(s.trim(), 10)).filter(n => n >= 1 && n <= 65535);
+  return {
+    account_id: parseInt(document.getElementById('account_id').value, 10),
+    region: document.getElementById('region').value,
+    name: document.getElementById('name').value.trim(),
+    instance_type: document.getElementById('instance_type').value,
+    image_key: document.getElementById('image_key').value,
+    image_id: document.getElementById('image_id').value.trim(),
+    disk_size: parseInt(document.getElementById('disk_size').value, 10) || 16,
+    count: parseInt(document.getElementById('count').value, 10) || 1,
+    open_ports: ports.length ? ports : [22],
+    allow_all_ports: document.getElementById('allow_all_ports').checked,
+    enable_ipv6: document.getElementById('enable_ipv6').checked,
+    script: document.getElementById('script').value,
+    root_password: document.getElementById('root_password').value.trim(),
+    packages: document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean)
+  };
+}
+
+async function preview() {
+  const c = collect();
+  try {
+    const d = await api('/api/scripts/preview', {
+      method: 'POST',
+      json: { body: c.script, root_password: c.root_password, hostname: c.name || 'example', packages: c.packages }
+    });
+    document.getElementById('preview-card').style.display = 'block';
+    document.getElementById('preview-out').textContent = d.rendered;
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function doLaunch() {
+  const c = collect();
+  if (!c.name) return toast('实例名称必填', 'err');
+  if (c.allow_all_ports && !confirm('放通全部端口会把所有服务暴露到公网，确定继续？')) return;
+  if (!confirm(`确认在 ${c.region} 创建 ${c.count} 台 ${c.instance_type}？会产生实际费用。`)) return;
+
+  try {
+    const r = await api('/api/launch', { method: 'POST', json: c });
+    const task = await watchTask(r.task_id, `开机 ${c.name}`);
+    showResult(task.result.instances, c);
+    Progress.finish();
+    toast(`创建成功 ${task.result.instances.length} 台`, 'ok');
+  } catch (e) {
+    Progress.finish();
+    toast(e.message, 'err');
+  }
+}
+
+function showResult(list, cfg) {
+  document.getElementById('result-card').style.display = 'block';
+  document.getElementById('result-rows').innerHTML = list.map(i => {
+    const ssh = i.public_ip
+      ? `ssh -i ${i.key_name}.pem ${i.ssh_user}@${i.public_ip}`
+      : '（无公网 IP）';
+    return `<tr>
+      <td>${escapeHtml(i.name)}</td>
+      <td class="mono">${escapeHtml(i.instance_id)}</td>
+      <td class="mono">${escapeHtml(i.public_ip || '-')}</td>
+      <td class="mono">${escapeHtml(i.ipv6 || '-')}</td>
+      <td class="mono">${escapeHtml(ssh)}</td>
+    </tr>`;
+  }).join('');
+
+  const withKey = list.find(i => i.has_private_key);
+  document.getElementById('key-hint').innerHTML = withKey
+    ? `私钥已加密保存。下载：<a href="/api/keypairs/${cfg.account_id}/${cfg.region}/${encodeURIComponent(withKey.key_name)}" target="_blank">${escapeHtml(withKey.key_name)}</a>
+       （AWS 只在创建时返回一次私钥，请及时保存到本地并 chmod 600）`
+    : '使用了已有密钥对，私钥请用你本地已有的那份。';
+}
+
+function onProgressClose() {}
+</script>
+{% endblock %}

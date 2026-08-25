@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+{% block title %}账号 / 日志 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2 id="form-title">添加 AWS 账号</h2>
+  <p class="hint" id="form-hint">
+    保存前会用你填的凭据（配了代理就走代理）实际调一次 DescribeRegions 校验。
+    Secret Key 和代理地址都用 Fernet 加密后存本地 SQLite，页面只显示掩码。
+    建议用最小权限 IAM 用户（EC2 权限即可，不需要账单权限）。
+  </p>
+
+  <input type="hidden" id="edit_id" value="">
+
+  <div class="grid g2">
+    <label class="f">
+      <span>备注名（唯一）</span>
+      <input type="text" id="label" placeholder="主账号-东京">
+    </label>
+    <label class="f">
+      <span>默认区域</span>
+      <select id="acct_region">
+        {% for code, name in regions.items() %}
+        <option value="{{ code }}" {% if code == 'ap-northeast-1' %}selected{% endif %}>{{ code }} — {{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>Access Key ID</span>
+      <input type="text" id="access_key" placeholder="AKIA..." autocomplete="off">
+    </label>
+    <label class="f">
+      <span id="secret_label">Secret Access Key</span>
+      <input type="password" id="secret_key" autocomplete="off">
+    </label>
+  </div>
+
+  <div class="grid g2 mt">
+    <label class="f">
+      <span>出站代理（选填，此账号所有 AWS 请求都走它）</span>
+      <input type="text" id="proxy" placeholder="socks5h://user:pass@127.0.0.1:1080" autocomplete="off">
+    </label>
+    <label class="f">
+      <span>备注（选填）</span>
+      <input type="text" id="note" placeholder="用途、归属人等">
+    </label>
+  </div>
+
+  <p class="hint mt">
+    支持 <span class="mono">socks5h</span> / <span class="mono">socks5</span> /
+    <span class="mono">socks4</span> / <span class="mono">http</span> /
+    <span class="mono">https</span>。不写协议按 socks5h 处理，必须带端口。
+    <span class="mono">socks5h</span> 让域名在代理端解析，避免本地 DNS 泄漏 ——
+    填 <span class="mono">socks5</span> 会自动升级成它。留空即直连。
+  </p>
+
+  <div class="row mt">
+    <button onclick="testProxy()">测试代理连通性</button>
+    <span style="flex:1"></span>
+    <button id="cancel-btn" onclick="resetForm()" style="display:none">取消编辑</button>
+    <button class="primary" id="submit-btn" onclick="submitAccount()">校验并保存</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>已添加的账号</h2>
+  {% if accounts %}
+  <table>
+    <thead>
+      <tr>
+        <th>备注名</th><th>Access Key</th><th>默认区域</th>
+        <th>出站代理</th><th>备注</th><th style="width:150px">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in accounts %}
+      <tr>
+        <td>{{ a.label }}</td>
+        <td class="mono">{{ a.masked() }}</td>
+        <td class="mono">{{ a.region }}</td>
+        <td class="mono">
+          {% if a.proxy %}<span class="tag ok">{{ a.masked_proxy() }}</span>
+          {% else %}<span class="tag">直连</span>{% endif %}
+        </td>
+        <td>{{ a.note or '-' }}</td>
+        <td>
+          <button class="sm" onclick="editAccount({{ a.id }})">编辑</button>
+          <button class="sm danger" onclick="delAccount({{ a.id }})">删除</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">还没有账号</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>操作日志</h2>
+  {% if logs %}
+  <table>
+    <thead><tr><th style="width:150px">时间</th><th style="width:100px">类型</th><th>对象</th><th>结果</th><th>详情</th></tr></thead>
+    <tbody>
+      {% for l in logs %}
+      <tr>
+        <td class="mono" data-ts="{{ l.created_at }}">{{ l.created_at }}</td>
+        <td>{{ l.kind }}</td>
+        <td class="mono">{{ l.target or '-' }}</td>
+        <td><span class="tag {{ 'ok' if l.ok else 'err' }}">{{ '成功' if l.ok else '失败' }}</span></td>
+        <td>{{ l.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">还没有日志</div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+// 后端存的是 unix 秒，前端转本地时间显示
+document.querySelectorAll('td[data-ts]').forEach(td => {
+  const ts = parseInt(td.dataset.ts, 10);
+  if (ts) td.textContent = new Date(ts * 1000).toLocaleString();
+});
+
+const F = id => document.getElementById(id);
+
+function resetForm() {
+  F('edit_id').value = '';
+  ['label', 'access_key', 'secret_key', 'proxy', 'note'].forEach(id => F(id).value = '');
+  F('form-title').textContent = '添加 AWS 账号';
+  F('secret_label').textContent = 'Secret Access Key';
+  F('submit-btn').textContent = '校验并保存';
+  F('cancel-btn').style.display = 'none';
+}
+
+async function editAccount(id) {
+  try {
+    const a = (await api('/api/accounts/' + id)).account;
+    F('edit_id').value = a.id;
+    F('label').value = a.label;
+    F('access_key').value = a.access_key;
+    F('secret_key').value = '';
+    F('proxy').value = a.proxy;
+    F('note').value = a.note;
+    F('acct_region').value = a.region;
+    F('form-title').textContent = '编辑账号：' + a.label;
+    F('secret_label').textContent = 'Secret Access Key（留空沿用原密钥）';
+    F('submit-btn').textContent = '保存修改';
+    F('cancel-btn').style.display = '';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+function collectForm() {
+  const form = new FormData();
+  form.append('label', F('label').value.trim());
+  form.append('access_key', F('access_key').value.trim());
+  form.append('secret_key', F('secret_key').value.trim());
+  form.append('region', F('acct_region').value);
+  form.append('proxy', F('proxy').value.trim());
+  form.append('note', F('note').value.trim());
+  return form;
+}
+
+async function submitAccount() {
+  const id = F('edit_id').value;
+  const label = F('label').value.trim();
+  const ak = F('access_key').value.trim();
+  const sk = F('secret_key').value.trim();
+
+  if (!label || !ak) return toast('备注名和 Access Key 必填', 'err');
+  if (!id && !sk) return toast('新增账号必须填 Secret Access Key', 'err');
+
+  const btn = F('submit-btn');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '正在校验…';
+  try {
+    if (id) {
+      await api('/api/accounts/' + id, { method: 'PUT', form: collectForm() });
+      toast('已保存修改', 'ok');
+    } else {
+      const d = await api('/api/accounts', { method: 'POST', form: collectForm() });
+      toast(`保存成功，可用区域 ${d.regions} 个`, 'ok');
+    }
+    setTimeout(() => location.reload(), 800);
+  } catch (e) {
+    toast(e.message, 'err');
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+async function testProxy() {
+  const proxy = F('proxy').value.trim();
+  if (!proxy) return toast('请先填写代理地址', 'err');
+
+  const payload = { proxy, region: F('acct_region').value };
+  const id = F('edit_id').value;
+  if (id) {
+    payload.account_id = parseInt(id, 10);
+  } else {
+    payload.access_key = F('access_key').value.trim();
+    payload.secret_key = F('secret_key').value.trim();
+    if (!payload.access_key || !payload.secret_key) {
+      return toast('新增账号测试代理需要先填 Access Key 和 Secret Key', 'err');
+    }
+  }
+
+  toast('正在通过代理访问 AWS…');
+  try {
+    const d = await api('/api/accounts/test-proxy', { method: 'POST', json: payload });
+    toast(`代理可用：${d.proxy} → 拿到 ${d.regions} 个区域，耗时 ${d.elapsed_ms}ms`, 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function delAccount(id) {
+  if (!confirm('删除这个账号？相关的密钥和换 IP 规则也会一起删除。')) return;
+  try {
+    await api('/api/accounts/' + id, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    setTimeout(() => location.reload(), 500);
+  } catch (e) { toast(e.message, 'err'); }
+}
+</script>
+{% endblock %}

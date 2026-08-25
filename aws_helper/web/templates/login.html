@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 — AWS 小助手</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="card">
+    <h2>AWS 小助手</h2>
+    <p class="hint">一键开机 · 换 IP · 开机脚本 &nbsp;v{{ version }}</p>
+    <form method="post" action="/login">
+      <label class="f">
+        <span>管理密码</span>
+        <input type="password" name="password" autofocus required>
+      </label>
+      {% if error %}
+      <p style="color:var(--err);font-size:13px;margin:10px 0 0">{{ error }}</p>
+      {% endif %}
+      <div class="row mt">
+        <button class="primary" style="width:100%">登录</button>
+      </div>
+    </form>
+    <p class="hint mt" style="margin-bottom:0">
+      <a href="{{ docs_url }}#忘记密码" target="_blank" rel="noopener noreferrer">忘记密码？</a>
+    </p>
+  </div>
+</div>
+</body>
+</html>

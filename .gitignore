@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 测试与工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 本地配置与数据（含 AWS 凭据，绝不入库）
+.env
+*.db
+*.db-shm
+*.db-wal
+secret.key
+data/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 与本项目无关的目录
+xboard_Outbound_plugin/
+.omo/

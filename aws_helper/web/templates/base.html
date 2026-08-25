@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AWS 小助手{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <div class="brand">AWS 小助手</div>
+  <nav>
+    <a href="/" class="{% if active == 'instances' %}on{% endif %}">实例</a>
+    <a href="/launch" class="{% if active == 'launch' %}on{% endif %}">一键开机</a>
+    <a href="/scripts" class="{% if active == 'scripts' %}on{% endif %}">开机脚本</a>
+    <a href="/autoip" class="{% if active == 'autoip' %}on{% endif %}">自动换 IP</a>
+    <a href="/accounts" class="{% if active == 'accounts' %}on{% endif %}">账号 / 日志</a>
+    <a href="/profile" class="{% if active == 'profile' %}on{% endif %}">用户面板</a>
+  </nav>
+  <form method="post" action="/logout" style="margin:0">
+    <button class="sm">退出</button>
+  </form>
+</header>
+
+<main>
+{% block body %}{% endblock %}
+</main>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+
+{% if accounts is defined %}
+<script>
+  const ACCOUNTS = {{ accounts | map(attribute='id') | list | tojson }};
+  // 账号/区域选择器的持久化，跨页面记住上次选择
+  function rememberSelectors() {
+    ['account_id', 'region'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const saved = localStorage.getItem('sel_' + id);
+      if (saved && [...el.options].some(o => o.value === saved)) el.value = saved;
+      el.addEventListener('change', () => localStorage.setItem('sel_' + id, el.value));
+    });
+  }
+  document.addEventListener('DOMContentLoaded', rememberSelectors);
+</script>
+{% endif %}
+
+{% block script %}{% endblock %}
+</body>
+</html>

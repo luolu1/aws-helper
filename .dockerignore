@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.git/
+.gitignore
+venv/
+.venv/
+tests/
+deploy/
+aws_helper/demo/
+*.md
+.env
+Dockerfile
+docker-compose.yml

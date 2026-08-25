@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}用户面板 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2>修改登录密码</h2>
+  <p class="hint">
+    密码经 PBKDF2-SHA256 加盐哈希存储，不可逆。修改成功后
+    <strong>其他设备的登录会立即失效</strong>，当前浏览器保持登录。
+    上次修改：<span class="mono" id="pw-changed">{{ password_changed_at }}</span>
+  </p>
+
+  <div class="grid g3">
+    <label class="f">
+      <span>当前密码</span>
+      <input type="password" id="current_password" autocomplete="current-password">
+    </label>
+    <label class="f">
+      <span>新密码</span>
+      <input type="password" id="new_password" autocomplete="new-password">
+    </label>
+    <label class="f">
+      <span>确认新密码</span>
+      <input type="password" id="confirm_password" autocomplete="new-password">
+    </label>
+  </div>
+
+  <p class="hint mt">
+    要求：至少 {{ min_length }} 位，且包含大写、小写、数字、符号中的至少三类。
+  </p>
+
+  <div class="row mt">
+    <button onclick="suggest()">生成一个强密码</button>
+    <span style="flex:1"></span>
+    <button class="primary" id="pw-btn" onclick="changePassword()">修改密码</button>
+  </div>
+
+  <p class="hint mt" id="suggested" style="display:none"></p>
+</div>
+
+<div class="card">
+  <h2>忘记密码怎么办</h2>
+  <p class="hint">
+    面板不做邮件找回（多一层 SMTP 依赖，且邮箱本身可能失守）。
+    在服务器上执行下面的命令即可重置，重置后所有会话失效：
+  </p>
+  <pre class="out">python3 -m aws_helper.cli reset-password              # 生成随机强密码
+python3 -m aws_helper.cli reset-password --password '你的新密码'
+python3 -m aws_helper.cli status                      # 查看密码/会话状态
+python3 -m aws_helper.cli logout-all                  # 下线全部会话</pre>
+</div>
+
+<div class="card">
+  <h2>登录会话</h2>
+  <p class="hint">
+    会话令牌只存 SHA-256 摘要，有效期 {{ session_hours }} 小时。
+    发现不认识的会话就踢掉，并立刻改密码。
+  </p>
+  <table>
+    <thead>
+      <tr><th>会话</th><th>IP</th><th>客户端</th><th>登录时间</th><th>最近活动</th><th style="width:90px">操作</th></tr>
+    </thead>
+    <tbody id="session-rows">
+      {% for s in sessions %}
+      <tr>
+        <td class="mono">{{ s.id }}{% if s.current %} <span class="tag ok">当前</span>{% endif %}</td>
+        <td class="mono">{{ s.ip or '-' }}</td>
+        <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s.user_agent or '-' }}</td>
+        <td class="mono" data-ts="{{ s.created_at }}">{{ s.created_at }}</td>
+        <td class="mono" data-ts="{{ s.last_seen }}">{{ s.last_seen }}</td>
+        <td>
+          {% if not s.current %}
+          <button class="sm danger" onclick="revoke('{{ s.id }}')">踢下线</button>
+          {% else %}
+          <span class="hint">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="row end mt">
+    <button class="danger" onclick="revokeOthers()">下线其他所有会话</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>登录记录</h2>
+  <p class="hint">
+    同一 IP 连续 {{ fail_limit }} 次密码错误会锁定 {{ lock_minutes }} 分钟。
+    看到大量失败记录说明有人在试密码。
+  </p>
+  {% if history %}
+  <table>
+    <thead><tr><th style="width:160px">时间</th><th>结果</th><th>IP</th><th>客户端</th><th>说明</th></tr></thead>
+    <tbody>
+      {% for h in history %}
+      <tr>
+        <td class="mono" data-ts="{{ h.created_at }}">{{ h.created_at }}</td>
+        <td><span class="tag {{ 'ok' if h.ok else 'err' }}">{{ '成功' if h.ok else '失败' }}</span></td>
+        <td class="mono">{{ h.ip or '-' }}</td>
+        <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ h.user_agent or '-' }}</td>
+        <td>{{ h.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">还没有登录记录</div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+document.querySelectorAll('[data-ts]').forEach(el => {
+  const ts = parseInt(el.dataset.ts, 10);
+  el.textContent = ts ? new Date(ts * 1000).toLocaleString() : '—';
+});
+const pwChanged = document.getElementById('pw-changed');
+if (pwChanged) {
+  const ts = parseInt(pwChanged.textContent.trim(), 10);
+  pwChanged.textContent = ts ? new Date(ts * 1000).toLocaleString() : '从未';
+}
+
+function suggest() {
+  const chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const symbols = '!@#$%^&*-_=+';
+  const pick = set => set[crypto.getRandomValues(new Uint32Array(1))[0] % set.length];
+  let out = '';
+  for (let i = 0; i < 14; i++) out += pick(chars);
+  out += pick(symbols) + pick('23456789');
+  document.getElementById('new_password').value = out;
+  document.getElementById('confirm_password').value = out;
+  const box = document.getElementById('suggested');
+  box.style.display = '';
+  box.innerHTML = '已填入建议密码：<span class="mono">' + escapeHtml(out) + '</span> —— 请先存到密码管理器再保存。';
+}
+
+async function changePassword() {
+  const cur = document.getElementById('current_password').value;
+  const nw = document.getElementById('new_password').value;
+  const cf = document.getElementById('confirm_password').value;
+  if (!cur || !nw || !cf) return toast('三个密码框都要填', 'err');
+  if (nw !== cf) return toast('两次输入的新密码不一致', 'err');
+
+  const btn = document.getElementById('pw-btn');
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = '正在修改…';
+  try {
+    const form = new FormData();
+    form.append('current_password', cur);
+    form.append('new_password', nw);
+    form.append('confirm_password', cf);
+    const d = await api('/api/profile/password', { method: 'POST', form });
+    toast(d.message, 'ok');
+    setTimeout(() => location.reload(), 1200);
+  } catch (e) {
+    toast(e.message, 'err');
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+async function revoke(id) {
+  if (!confirm('踢掉这个会话？该设备需要重新登录。')) return;
+  try {
+    await api('/api/profile/sessions/' + id, { method: 'DELETE' });
+    toast('已踢下线', 'ok');
+    setTimeout(() => location.reload(), 600);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function revokeOthers() {
+  if (!confirm('下线除当前浏览器之外的所有会话？')) return;
+  try {
+    const d = await api('/api/profile/sessions/revoke-others', { method: 'POST' });
+    toast(`已下线 ${d.removed} 个会话`, 'ok');
+    setTimeout(() => location.reload(), 600);
+  } catch (e) { toast(e.message, 'err'); }
+}
+</script>
+{% endblock %}

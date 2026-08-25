@@ -1,0 +1,349 @@
+# AWS 小助手
+
+一键开机、换 IP、开机脚本。Web 面板 + 后台自动换 IP 监控。
+
+## 为什么写这个
+
+现有的多云面板里，AWS 都是"顺带支持"：能创建实例但没有 UserData 注入，
+能看列表但没有换 IP，更没有 IP 被墙后自动更换。这个工具只做 AWS，把三件事做完整。
+
+## 一键部署
+
+两种方式，二选一。都由同一个脚本完成，装完得到统一的 `aws-helper` 管理命令。
+
+```bash
+# 交互选择部署方式
+sudo bash deploy/install.sh
+
+# 或直接指定
+sudo bash deploy/install.sh --mode systemd     # systemd + Python 虚拟环境
+sudo bash deploy/install.sh --mode docker      # Docker Compose
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--mode systemd\|docker` | 部署方式，省略则交互询问 |
+| `--host ADDR` | 监听地址，默认 `127.0.0.1`。填 `0.0.0.0` 会二次确认 |
+| `--port PORT` | 监听端口，默认 `8765` |
+| `--password PASS` | 指定初始密码，省略则自动生成强密码 |
+| `--yes` | 非交互，全部用默认值 |
+
+装完控制台会打印访问地址和初始密码。脚本**幂等**：重复执行只更新程序和依赖，
+已有的密码、AWS 凭据、换 IP 规则都保留 —— 这种情况下摘要会明确写「沿用原有密码」，
+不会打印一个其实用不了的新密码。
+
+### systemd 模式
+
+在 `/opt/aws-helper/venv` 建独立 Python 虚拟环境，依赖只装在里面，不碰系统 Python。
+
+| 项目 | 路径 |
+|---|---|
+| 程序 | `/opt/aws-helper/aws_helper` |
+| 虚拟环境 | `/opt/aws-helper/venv` |
+| 数据 | `/var/lib/aws-helper`（权限 700） |
+| 配置 | `/etc/aws-helper/aws-helper.env`（权限 640） |
+| 服务单元 | `/etc/systemd/system/aws-helper.service` |
+
+以专用系统用户 `awshelper` 运行，非 root。单元里开了 `ProtectSystem=strict`、
+`NoNewPrivileges`、`PrivateTmp`，只有数据目录可写。开机自启，异常退出 5 秒后重启。
+
+缺 `python3-venv` 时脚本会自动装。要求 Python 3.10+。
+
+### Docker Compose 模式
+
+构建镜像后用 compose 运行，数据存命名卷 `aws-helper-data`。
+
+容器内以 uid 999 的 `awshelper` 用户运行，带 `no-new-privileges`，
+`/data` 权限 700，内置 healthcheck 打 `/healthz`。
+端口默认只映射到 `127.0.0.1`，日志轮转限制 10MB × 3。
+
+脚本会先验证 compose **真的能连上 docker 守护进程**，而不只是检查命令存在 ——
+`docker-compose` 1.29 在新版 requests 环境下会抛
+`Not supported URL scheme http+docker` 而完全不可用。遇到这种情况脚本会自动下载
+官方 compose v2 插件。
+
+## 管理命令
+
+两种部署方式共用同一套命令，脚本会自动路由到 systemctl 或 docker compose：
+
+```bash
+aws-helper status            # 查看运行状态
+aws-helper logs -f           # 跟踪日志
+aws-helper start|stop|restart
+aws-helper reset-password    # 忘记密码时重置
+aws-helper info              # 查看密码/会话/登录记录
+aws-helper logout-all        # 下线所有登录会话
+aws-helper uninstall         # 卸载，会分别询问是否删除数据
+```
+
+卸载会移除服务/容器、安装目录和管理命令本身，数据是否删除单独确认 ——
+不会顺手把你的 AWS 凭据一起清掉。
+
+## 手动运行（开发用）
+
+```bash
+pip install -r requirements.txt
+python3 -m aws_helper
+```
+
+首次启动会生成随机初始密码并打印到控制台，打开 http://127.0.0.1:8765 登录，
+之后在「用户面板」里改成自己的密码。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `AWS_HELPER_PASSWORD` | 随机生成 | **仅**用作首次启动的初始密码，库里已有密码后不再生效 |
+| `AWS_HELPER_DATA` | `~/.aws-helper` | 数据目录（SQLite + 加密密钥） |
+| `AWS_HELPER_HOST` | `127.0.0.1` | 监听地址 |
+| `AWS_HELPER_PORT` | `8765` | 监听端口 |
+| `AWS_HELPER_SESSION_TTL` | `86400` | 会话有效期（秒） |
+| `AWS_HELPER_SESSION_KEY` | 随机生成 | 会话签名密钥，不设则重启后需重新登录 |
+| `AWS_HELPER_ENDPOINT_URL` | 无 | 覆盖 AWS endpoint，用于本地测试 |
+
+`AWS_HELPER_PASSWORD` 只在库里还没有密码时用作初始值 —— 否则你在面板改了密码，
+重启又被环境变量覆盖回去。
+
+**面板持有你的 AWS 凭据。** 默认只听 127.0.0.1。要对外暴露必须放到 HTTPS 反代之后，
+并设置一个强密码。
+
+## 用户面板
+
+登录后进「用户面板」，三件事：
+
+**改密码** — 需要输入当前密码，新密码要求至少 10 位且包含大写、小写、数字、符号中的
+至少三类。改成功后其他设备的登录立即失效，当前浏览器保持登录。有个「生成一个强密码」
+按钮可以直接填。
+
+**会话管理** — 列出所有活跃登录（IP、客户端、登录时间、最近活动），标出当前会话。
+可以单独踢掉某个会话，或一键「下线其他所有会话」。当前会话不能踢自己 —— 要退出用退出按钮。
+
+**登录记录** — 成功和失败都记，带 IP 和 User-Agent。看到大量失败说明有人在试密码。
+
+密码经 PBKDF2-SHA256 加盐哈希（26 万次迭代）存储，不可逆。会话令牌只存 SHA-256 摘要，
+数据库被读走也无法冒用登录态。每次请求都会校验令牌在库中是否仍存在，所以改密码和
+踢下线能立刻生效 —— 只验 Cookie 签名做不到这点。
+
+同一 IP 连续 5 次密码错误锁定 15 分钟，锁定期内即使密码正确也拒绝。锁定按 IP 隔离，
+不影响其他来源。反代后面会读 `X-Forwarded-For` 第一跳。
+
+## 忘记密码
+
+不做邮件找回（多一层 SMTP 依赖，且邮箱本身可能失守）。在服务器上执行：
+
+```bash
+python3 -m aws_helper.cli reset-password              # 生成随机强密码
+python3 -m aws_helper.cli reset-password --password '你的新密码'
+python3 -m aws_helper.cli status                      # 查看密码/会话/登录记录
+python3 -m aws_helper.cli logout-all                  # 下线全部会话
+```
+
+重置会作废所有会话，也会清掉登录锁定状态 —— 被锁在门外时用它能立刻恢复。
+弱密码需要显式加 `--force`。
+
+CLI 只读写本地数据目录，不经过网络和登录校验，面板打不开时同样可用。
+用 `--data-dir` 或 `AWS_HELPER_DATA` 指定数据目录。
+
+## 三个核心功能
+
+### 一键开机
+
+填个名称点创建，后台自动完成：解析最新 AMI → 创建密钥对并加密保存私钥 →
+创建安全组（默认只开 22）→ RunInstances → 轮询等公网 IP。
+
+- 支持批量（数量填 N 就开 N 台，共用密钥对和安全组）
+- 支持直接指定 AMI ID，用私有/自定义镜像
+- 勾选 IPv6 时自建 VPC + 子网 + IGW + v4/v6 双默认路由，并确保拿到 IPv6 地址
+- 私钥只在创建时由 AWS 返回一次，工具立刻加密落库，页面可下载
+
+### 开机脚本
+
+写进表单的脚本由 cloud-init 在首次启动时以 root 执行。不要写 `#!/bin/bash`
+开头，渲染时会自动加上——写了会被明确拒绝，而不是静默出错。
+
+渲染顺序固定：shebang → 设置 hostname → 安装软件包 → 开启 root 登录（可选）→ **你的脚本**。
+你的脚本永远在最后，前面的固定动作失败不会阻断它。
+
+可以先点「预览最终脚本」看完整内容再创建。常用脚本可存成模板复用。
+
+开启 root 密码登录用的是 `sshd_config.d/` drop-in 文件，不删除原有配置。
+主配置里硬编码了 `PasswordAuthentication no` 且不含 `Include` 时会就地修正。
+
+### 换 IP
+
+两种策略：
+
+| 策略 | 机制 | 停机 | 适用 |
+|---|---|---|---|
+| `eip` | 分配新弹性 IP → 绑定 → 释放旧的 | 不停机，立即生效 | 默认，推荐 |
+| `dynamic` | stop → start，AWS 重新分配动态 IP | 约 1 分钟 | 不想留 EIP 时 |
+
+绑了 EIP 的实例用 `dynamic` 不会换 IP，工具会明确报错而不是假装成功。
+
+支持 IP 段白名单/黑名单：换出来的地址不在允许范围内会自动释放重试，
+用完尝试次数才报错。整个过程不留空闲 EIP。
+
+`eip` 策略先确认新地址生效再释放旧的——反过来会在绑定失败时同时丢掉两个 IP。
+
+### 自动换 IP
+
+后台每 30 秒扫一遍规则，按各自间隔探测实例 TCP 端口，
+连续失败达到阈值就自动换 IP。也就是 IP 被墙后自动更换。
+
+每条规则可配：探测端口、检查间隔、失败阈值、换 IP 策略、允许/排除的 IP 段、最大尝试次数。
+探测恢复后失败计数清零，不会累积误触发。
+
+也可以脱离 Web 单独跑：
+
+```bash
+python3 -m aws_helper.autoip
+```
+
+## 多账号与独立代理
+
+每个账号可单独配一个出站代理，该账号的所有 AWS API 请求都走它。多账号各走各的代理，互不影响。
+
+| 协议 | 示例 |
+|---|---|
+| SOCKS5（域名代理端解析，推荐） | `socks5h://127.0.0.1:1080` |
+| SOCKS5 + 认证 | `socks5h://user:pass@1.2.3.4:1080` |
+| SOCKS4 | `socks4://1.2.3.4:9050` |
+| HTTP / HTTPS | `http://proxy.local:8080` |
+
+不写协议时按 `socks5h` 处理，必须带端口。填 `socks5` 会自动升级成 `socks5h` ——
+后者让域名在代理端解析，避免本地 DNS 泄漏。留空即直连。
+
+botocore 原生不支持 socks（它把代理 URL 交给 urllib3 的 `proxy_from_url`，
+后者只认 http/https），工具内部替换了 HTTP session 层来支持。
+
+代理地址和其中的密码与 Secret Key 同等加密存储，页面和日志只显示掩码
+（`socks5h://user:***@host:port`）。
+
+「测试代理连通性」按钮会先单独完成一次 SOCKS 握手，再通过代理实调 DescribeRegions，
+所以报错能区分是代理不通、代理认证失败，还是 AWS 凭据有问题 —— botocore 默认会把这
+三种都包装成同一个 endpoint 错误。
+
+## 账号编辑
+
+账号列表每行有「编辑」按钮，点了会把该账号载入上方表单，可改备注名、Access Key、
+Secret Key、区域、代理和备注。
+
+Secret Key 留空表示沿用原密钥，不必重新粘贴。代理留空表示清除代理改为直连。
+保存前同样会实际调 AWS 校验一次（配了代理就走代理）。
+
+## 弹性 IP 计费提醒
+
+未绑定的 EIP 按小时计费。绑在**已终止实例**上的 EIP 同样计费，
+但 `describe_addresses` 仍会返回 InstanceId，看起来像"已绑定"，很容易漏掉。
+
+弹性 IP 面板把这两种都标为计费中，「释放全部计费中未使用的 IP」会一起清掉。
+
+## IAM 权限
+
+给个只有 EC2 权限的 IAM 用户就够了，不需要账单权限。用到的 API：
+
+```
+ec2:DescribeRegions          ec2:DescribeImages           ec2:RunInstances
+ec2:DescribeInstances        ec2:DescribeInstanceAttribute
+ec2:StartInstances           ec2:StopInstances            ec2:RebootInstances
+ec2:TerminateInstances       ec2:CreateKeyPair            ec2:DescribeKeyPairs
+ec2:CreateSecurityGroup      ec2:AuthorizeSecurityGroupIngress
+ec2:DescribeSecurityGroups   ec2:DescribeVpcs             ec2:DescribeSubnets
+ec2:AllocateAddress          ec2:AssociateAddress         ec2:ReleaseAddress
+ec2:DescribeAddresses        ec2:CreateTags               ec2:DescribeVolumes
+```
+
+勾选 IPv6 还需要：`CreateVpc` `CreateSubnet` `CreateInternetGateway`
+`AttachInternetGateway` `CreateRoute` `DescribeRouteTables` `AssociateRouteTable`
+`ModifyVpcAttribute` `ModifySubnetAttribute` `AssociateSubnetCidrBlock` `AssignIpv6Addresses`
+
+## 凭据存储
+
+AWS Secret Access Key 和代理地址用 Fernet 加密后存 SQLite，页面只显示掩码。
+加密密钥取 `AWS_HELPER_SECRET`，未设置时在数据目录生成 `secret.key`（权限 0600）。
+
+换掉密钥会导致已存凭据无法解密——工具会明确报错，不会静默失败。
+
+面板登录密码走单向哈希，会话令牌只存摘要，两者都不可逆、也不需要 Fernet 密钥。
+
+Access Key ID 按设计明文存储，用于展示掩码。
+
+旧版本的数据库（没有代理列、没有会话表）打开时会自动补齐，不需要删库重建。
+
+## 测试
+
+```bash
+pip install "moto[ec2,server]==5.0.28" pytest httpx PySocks
+python3 -m pytest tests/ -q
+```
+
+240 个测试，不碰真实 AWS 账号。覆盖开机全链路、UserData 注入与顺序、安全组端口、
+换 IP 两种策略、EIP 泄漏与孤儿回收、IP 段规则、凭据与代理加密、账号编辑、
+密码哈希与强度、会话生命周期、登录锁定、CLI 密码重置、自动换 IP 触发与恢复。
+
+代理相关测试用 [tests/socks_server.py](tests/socks_server.py) 起真实 SOCKS5 服务器
+（支持 RFC 1929 认证），断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
+这些测试跑在真实 HTTP 的 moto server 上，因为 `mock_aws` 在 botocore 层拦截调用，
+根本不产生 socket 流量，代理永远不会被拨号。
+
+## 代码结构
+
+```
+aws_helper/
+  auth.py            密码哈希、强度校验、登录锁定判定
+  cli.py             密码重置 / 状态查看 / 下线全部会话
+  core/aws.py        boto3 客户端工厂、SOCKS 代理支持、区域与镜像元数据
+  core/userdata.py   开机脚本渲染与校验
+  core/launch.py     一键开机、实例列表、电源操作
+  core/ipchange.py   换 IP 两种策略、EIP 清理
+  store.py           SQLite 持久层（加密凭据、会话、脚本模板、规则、日志）
+  tasks.py           后台任务与进度跟踪
+  autoip.py          自动换 IP 监控循环
+  web/app.py         FastAPI 路由
+  web/templates/     六个页面
+  demo/              演示环境（moto 后端 + 预置数据）
+
+deploy/install.sh    一键部署（systemd / docker 两种方式）
+Dockerfile           容器镜像（非 root + healthcheck）
+docker-compose.yml   compose 服务定义
+requirements.txt     固定版本的运行时依赖
+```
+
+## 两种方式并存
+
+想同时跑两套（比如一套生产、一套试新版），换个端口装第二种即可：
+
+```bash
+sudo bash deploy/install.sh --mode systemd --port 8765
+sudo bash deploy/install.sh --mode docker  --port 8766
+```
+
+两者完全隔离，互不影响：
+
+| | systemd | docker |
+|---|---|---|
+| 安装目录 | `/opt/aws-helper` | `/opt/aws-helper-docker` |
+| 数据 | `/var/lib/aws-helper` | docker 卷 `aws-helper-data` |
+| 管理命令 | `aws-helper-systemd` | `aws-helper-docker` |
+
+两套密码、AWS 账号、脚本模板各自独立。`aws-helper` 是软链，指向最近一次安装的那套；
+要明确操作某一套就用带后缀的命令。
+
+卸载其中一种时会检测另一种是否还在，不会删掉共享的东西，`aws-helper` 软链自动指向剩下那套。
+
+## 端口冲突与常见问题
+
+安装脚本会在部署前检查端口。若被**其他进程**占用会直接终止并打印占用者的 PID ——
+不会装完却让服务陷入反复重启（那种情况摘要照样显示"部署完成"，
+用户拿着"正确"的密码登不进去，很难排查）。重装本程序自己占的端口不受影响。
+
+健康检查失败时脚本返回非 0 退出码，便于 CI 或上层脚本判断。
+
+| 现象 | 处理 |
+|---|---|
+| 端口被占用 | 换端口 `--port 8790`，或停掉占用进程 |
+| 服务启动失败 | `aws-helper logs` 看日志 |
+| 忘记密码 | `aws-helper reset-password` |
+| 被登录锁定 | `aws-helper reset-password`（会清掉锁定状态） |
+| 改了密码想确认 | `aws-helper info` 看密码更新时间和会话 |
+| `docker compose` 不可用 | 脚本会自动装 v2 插件；失败则手动装后重试 |

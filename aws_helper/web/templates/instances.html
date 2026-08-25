@@ -1,0 +1,272 @@
+{% extends "base.html" %}
+{% block title %}实例 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2>实例列表</h2>
+  <p class="hint">选账号和区域后点刷新。勾选实例可批量执行电源操作，或对单台实例换 IP。</p>
+
+  {% if not accounts %}
+  <div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div>
+  {% else %}
+  <div class="grid g4">
+    <label class="f">
+      <span>账号</span>
+      <select id="account_id">
+        {% for a in accounts %}
+        <option value="{{ a.id }}">{{ a.label }}（{{ a.masked() }}）</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域</span>
+      <select id="region">
+        {% for code, name in regions.items() %}
+        <option value="{{ code }}">{{ code }} — {{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <button class="primary" style="width:100%" onclick="refresh()">刷新列表</button>
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <button style="width:100%" onclick="showEips()">弹性 IP</button>
+    </label>
+  </div>
+
+  <div class="row mt">
+    <button class="sm" onclick="power('start')">开机</button>
+    <button class="sm" onclick="power('stop')">关机</button>
+    <button class="sm" onclick="power('reboot')">重启</button>
+    <button class="sm danger" onclick="power('terminate')">终止</button>
+    <span style="flex:1"></span>
+    <span class="hint" id="count" style="margin:0"></span>
+  </div>
+  {% endif %}
+</div>
+
+{% if accounts %}
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th style="width:34px"><input type="checkbox" id="all" onclick="toggleAll(this)"></th>
+        <th>名称</th>
+        <th>实例 ID</th>
+        <th>状态</th>
+        <th>规格</th>
+        <th>公网 IP</th>
+        <th>内网 IP</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td colspan="8" class="empty">点「刷新列表」加载</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card" id="eip-card" style="display:none">
+  <h2>弹性 IP</h2>
+  <p class="hint">未绑定、或绑在已终止实例上的弹性 IP 都在按小时计费，建议及时释放。</p>
+  <table>
+    <thead><tr><th>地址</th><th>Allocation ID</th><th>绑定实例</th><th>状态</th></tr></thead>
+    <tbody id="eip-rows"></tbody>
+  </table>
+  <div class="row end mt">
+    <button class="danger" onclick="releaseIdle()">释放全部计费中未使用的 IP</button>
+  </div>
+</div>
+
+<!-- 换 IP 弹窗 -->
+<div class="mask" id="ip-mask">
+  <div class="box">
+    <h2>换 IP</h2>
+    <p class="hint" id="ip-target"></p>
+    <div class="grid g2">
+      <label class="f">
+        <span>策略</span>
+        <select id="ip-strategy">
+          <option value="eip">弹性 IP 重分配（不停机，立即生效）</option>
+          <option value="dynamic">停机再开机换动态 IP（约 1 分钟不可用）</option>
+        </select>
+      </label>
+      <label class="f">
+        <span>最多尝试次数</span>
+        <input type="number" id="ip-attempts" value="1" min="1" max="20">
+      </label>
+    </div>
+    <div class="grid g2 mt">
+      <label class="f">
+        <span>允许的 IP 段（逗号分隔，留空不限制）</span>
+        <input type="text" id="ip-allow" placeholder="13.112.0.0/14, 18.176.0.0/12">
+      </label>
+      <label class="f">
+        <span>排除的 IP 段（逗号分隔）</span>
+        <input type="text" id="ip-deny" placeholder="52.0.0.0/8">
+      </label>
+    </div>
+    <p class="hint mt">
+      填了 IP 段后，换出来的地址不在范围内会自动释放重试，直到用完尝试次数。
+    </p>
+    <div class="row end mt">
+      <button onclick="document.getElementById('ip-mask').classList.remove('on')">取消</button>
+      <button class="primary" onclick="doChangeIp()">开始换 IP</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+let INSTANCES = [];
+let ipTarget = null;
+
+function sel() {
+  return {
+    account_id: parseInt(document.getElementById('account_id').value, 10),
+    region: document.getElementById('region').value
+  };
+}
+
+async function refresh() {
+  const s = sel();
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = '<tr><td colspan="8" class="empty">加载中…</td></tr>';
+  try {
+    const data = await api(`/api/instances?account_id=${s.account_id}&region=${s.region}`);
+    INSTANCES = data.instances;
+    render();
+    toast(`找到 ${INSTANCES.length} 台实例`, 'ok');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
+    toast(e.message, 'err');
+  }
+}
+
+function stateTag(state) {
+  const cls = state === 'running' ? 'ok' : (state === 'stopped' ? 'err' : 'warn');
+  return `<span class="tag ${cls}">${escapeHtml(state)}</span>`;
+}
+
+function render() {
+  const tbody = document.getElementById('rows');
+  document.getElementById('count').textContent = `共 ${INSTANCES.length} 台`;
+  if (!INSTANCES.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">该区域没有实例</td></tr>';
+    return;
+  }
+  tbody.innerHTML = INSTANCES.map(i => `
+    <tr>
+      <td><input type="checkbox" class="pick" value="${escapeHtml(i.instance_id)}"></td>
+      <td>${escapeHtml(i.name || '-')}</td>
+      <td class="mono">${escapeHtml(i.instance_id)}</td>
+      <td>${stateTag(i.state)}</td>
+      <td class="mono">${escapeHtml(i.instance_type)}</td>
+      <td class="mono">${escapeHtml(i.public_ip || '-')}</td>
+      <td class="mono">${escapeHtml(i.private_ip || '-')}</td>
+      <td>
+        <button class="sm" onclick="openIp('${escapeHtml(i.instance_id)}','${escapeHtml(i.public_ip || '')}')">换 IP</button>
+      </td>
+    </tr>`).join('');
+}
+
+function toggleAll(box) {
+  document.querySelectorAll('.pick').forEach(c => c.checked = box.checked);
+}
+
+function picked() {
+  return [...document.querySelectorAll('.pick:checked')].map(c => c.value);
+}
+
+async function power(action) {
+  const ids = picked();
+  if (!ids.length) return toast('请先勾选实例', 'err');
+  const names = { start: '开机', stop: '关机', reboot: '重启', terminate: '终止' };
+  if (action === 'terminate' && !confirm(`确认终止 ${ids.length} 台实例？这会永久删除，无法恢复。`)) return;
+  try {
+    await api('/api/instances/power', { method: 'POST', json: { ...sel(), action, instance_ids: ids } });
+    toast(`${names[action]} 指令已发送（${ids.length} 台）`, 'ok');
+    setTimeout(refresh, 2500);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+function openIp(id, ip) {
+  ipTarget = id;
+  document.getElementById('ip-target').textContent = `实例 ${id}，当前 IP ${ip || '无'}`;
+  document.getElementById('ip-mask').classList.add('on');
+}
+
+async function doChangeIp() {
+  const parse = v => v.split(',').map(s => s.trim()).filter(Boolean);
+  const payload = {
+    ...sel(),
+    instance_id: ipTarget,
+    strategy: document.getElementById('ip-strategy').value,
+    max_attempts: parseInt(document.getElementById('ip-attempts').value, 10) || 1,
+    allow_cidrs: parse(document.getElementById('ip-allow').value),
+    deny_cidrs: parse(document.getElementById('ip-deny').value)
+  };
+  document.getElementById('ip-mask').classList.remove('on');
+  try {
+    const r = await api('/api/change-ip', { method: 'POST', json: payload });
+    const task = await watchTask(r.task_id, '换 IP');
+    const d = task.result;
+    Progress.finish(
+      `<span class="mono" style="flex:1;text-align:left">${escapeHtml(d.old_ip || '无')} → ${escapeHtml(d.new_ip)}</span>`
+    );
+    toast(`换 IP 成功：${d.new_ip}（尝试 ${d.attempts} 次）`, 'ok');
+  } catch (e) {
+    Progress.finish();
+    toast(e.message, 'err');
+  }
+}
+
+function onProgressClose() { refresh(); }
+
+async function showEips() {
+  const s = sel();
+  const card = document.getElementById('eip-card');
+  card.style.display = 'block';
+  try {
+    const data = await api(`/api/addresses?account_id=${s.account_id}&region=${s.region}`);
+    const rows = document.getElementById('eip-rows');
+    if (!data.addresses.length) {
+      rows.innerHTML = '<tr><td colspan="4" class="empty">没有弹性 IP</td></tr>';
+      return;
+    }
+    rows.innerHTML = data.addresses.map(a => {
+      let tag;
+      if (a.idle) tag = '<span class="tag warn">未绑定，计费中</span>';
+      else if (a.orphaned) tag = '<span class="tag err">实例已消失，计费中</span>';
+      else tag = '<span class="tag ok">已绑定</span>';
+      return `
+      <tr>
+        <td class="mono">${escapeHtml(a.public_ip)}</td>
+        <td class="mono">${escapeHtml(a.allocation_id || '-')}</td>
+        <td class="mono">${escapeHtml(a.instance_id || '-')}</td>
+        <td>${tag}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function releaseIdle() {
+  if (!confirm('释放所有计费中但未使用的弹性 IP（未绑定的 + 绑在已终止实例上的）？')) return;
+  try {
+    const d = await api('/api/addresses/release-idle', { method: 'POST', json: sel() });
+    toast(`已释放 ${d.released.length} 个：${d.released.join(', ') || '无'}`, 'ok');
+    showEips();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+</script>
+{% endblock %}
