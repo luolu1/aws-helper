@@ -22,25 +22,42 @@ class ProbeResult:
     detail: str
 
 
-def probe(ip: str, mode: str = "tcp", port: int = 22, timeout: float = 5.0) -> ProbeResult:
+def probe(
+    ip: str, mode: str = "tcp", port: int = 22, timeout: float = 5.0, attempts: int = 2
+) -> ProbeResult:
     """探测 IP 是否可达。
 
     tcp  — 连指定端口，能建连即视为通
     icmp — 无 root 权限时 raw socket 不可用，退回 tcp
+
+    单次超时就判失败会被瞬时抖动误触发（换 IP 是有代价的操作），
+    所以重试 attempts 次，任意一次成功即视为可达。
     """
     if not ip:
         return ProbeResult(False, "实例没有公网 IP")
     if mode == "icmp":
         # 容器里通常没有 CAP_NET_RAW，统一用 TCP 探测更可靠
         mode = "tcp"
-    try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return ProbeResult(True, f"tcp/{port} 可达")
-    except OSError as exc:
-        return ProbeResult(False, f"tcp/{port} 不可达: {exc}")
+
+    last = ""
+    for i in range(max(1, attempts)):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                suffix = f"（第 {i + 1} 次尝试）" if i else ""
+                return ProbeResult(True, f"tcp/{port} 可达{suffix}")
+        except OSError as exc:
+            last = str(exc)
+            if i + 1 < max(1, attempts):
+                time.sleep(1)
+    return ProbeResult(False, f"tcp/{port} 连续 {max(1, attempts)} 次不可达: {last}")
 
 
-def check_rule(store: Store, rule: dict[str, Any]) -> dict[str, Any]:
+DEFAULT_COOLDOWN = 1800
+
+
+def check_rule(
+    store: Store, rule: dict[str, Any], cooldown: int = DEFAULT_COOLDOWN
+) -> dict[str, Any]:
     """检查单条规则，必要时触发换 IP。返回本轮动作说明。"""
     now = int(time.time())
     if now - int(rule["last_check"]) < int(rule["interval_sec"]):
@@ -88,7 +105,17 @@ def check_rule(store: Store, rule: dict[str, Any]) -> dict[str, Any]:
         )
         return {"action": "fail", "reason": result.detail, "count": fail_count}
 
-    # 达到阈值，换 IP
+    # 冷却期：刚换过 IP 就再换往往是新 IP 的路由还没生效或服务没起来，
+    # 继续换只会白烧弹性 IP 配额（默认每区域 5 个）并把实例反复停机。
+    since_change = now - int(rule["last_change"])
+    if int(rule["last_change"]) and since_change < cooldown:
+        store.update_rule_state(int(rule["id"]), fail_count=fail_count, last_check=now)
+        return {
+            "action": "cooldown",
+            "reason": f"{since_change}s 前刚换过 IP，冷却 {cooldown}s",
+            "retry_after": cooldown - since_change,
+        }
+
     try:
         changed = ipchange.change_ip(
             creds,
@@ -123,11 +150,11 @@ def check_rule(store: Store, rule: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_once(store: Store) -> list[dict[str, Any]]:
+def run_once(store: Store, cooldown: int = DEFAULT_COOLDOWN) -> list[dict[str, Any]]:
     """遍历所有启用的规则跑一轮。"""
     out = []
     for rule in store.list_ip_rules(enabled_only=True):
-        out.append({"rule_id": rule["id"], **check_rule(store, rule)})
+        out.append({"rule_id": rule["id"], **check_rule(store, rule, cooldown)})
     return out
 
 

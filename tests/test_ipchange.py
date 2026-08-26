@@ -74,6 +74,44 @@ def test_unknown_strategy_rejected(creds, instance):
         ipchange.change_ip(creds, "us-east-1", instance.instance_id, strategy="magic")
 
 
+def test_dynamic_refuses_when_secondary_nic_present(creds, instance):
+    """有辅助网卡时 stop/start 不会换 IP（AWS 官方文档明确的例外）。
+
+    必须提前拦住，否则会白白停机一次，IP 还是原来那个。
+    """
+    session = aws.ec2(creds)
+    inst = session.describe_instances(InstanceIds=[instance.instance_id])[
+        "Reservations"
+    ][0]["Instances"][0]
+    subnet_id = inst["NetworkInterfaces"][0]["SubnetId"]
+
+    extra = session.create_network_interface(SubnetId=subnet_id)
+    session.attach_network_interface(
+        NetworkInterfaceId=extra["NetworkInterface"]["NetworkInterfaceId"],
+        InstanceId=instance.instance_id,
+        DeviceIndex=1,
+    )
+
+    with pytest.raises(ipchange.IpChangeError, match="辅助网卡"):
+        ipchange.change_ip(
+            creds, "us-east-1", instance.instance_id, strategy="dynamic"
+        )
+
+
+def test_instance_state_unchanged_after_blocked_dynamic(creds, instance):
+    """被拦下时实例不该被停机 —— 拦截必须发生在任何 stop 之前。"""
+    session = aws.ec2(creds)
+    ipchange.change_ip(creds, "us-east-1", instance.instance_id, "eip")
+
+    with pytest.raises(ipchange.IpChangeError):
+        ipchange.change_ip(
+            creds, "us-east-1", instance.instance_id, strategy="dynamic"
+        )
+
+    live = session.describe_instances(InstanceIds=[instance.instance_id])
+    assert live["Reservations"][0]["Instances"][0]["State"]["Name"] == "running"
+
+
 def test_deny_cidr_forces_retry_then_fails(creds, instance):
     """所有 IP 都被 deny 段覆盖时，应耗尽重试次数并报错，且不留下空闲 EIP。"""
     rule = ipchange.IpRule(deny_cidrs=["0.0.0.0/0"], max_attempts=3)

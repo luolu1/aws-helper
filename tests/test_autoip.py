@@ -93,10 +93,10 @@ def test_threshold_reached_triggers_change(env, always_down):
     store, aid, inst = env
     old_ip = inst.public_ip
 
-    first = autoip.check_rule(store, _rule(store, aid, inst.instance_id))
+    first = autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=0)
     assert first["action"] == "fail"
 
-    second = autoip.check_rule(store, store.list_ip_rules()[0])
+    second = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=0)
     assert second["action"] == "changed", second
     assert second["old_ip"] == old_ip
     assert second["new_ip"] != old_ip
@@ -127,10 +127,53 @@ def test_recovery_resets_fail_count(env, monkeypatch):
 
 def test_change_is_logged(env, always_down):
     store, aid, inst = env
-    autoip.check_rule(store, _rule(store, aid, inst.instance_id))
-    autoip.check_rule(store, store.list_ip_rules()[0])
+    autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=0)
+    autoip.check_rule(store, store.list_ip_rules()[0], cooldown=0)
     logs = store.list_logs()
     assert any(l["kind"] == "autoip" and l["ok"] == 1 for l in logs)
+
+
+def test_cooldown_prevents_back_to_back_changes(env, always_down):
+    """刚换过 IP 不能立刻再换。
+
+    新 IP 的路由生效和服务启动都需要时间，此时探测仍然失败是正常的。
+    继续换只会白烧弹性 IP 配额（默认每区域 5 个）并反复停机。
+    """
+    store, aid, inst = env
+    autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=1800)
+    first = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
+    assert first["action"] == "changed"
+
+    store.update_rule_state(store.list_ip_rules()[0]["id"], fail_count=5)
+    second = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
+    assert second["action"] == "cooldown"
+    assert second["retry_after"] > 0
+
+
+def test_cooldown_expires(env, always_down):
+    store, aid, inst = env
+    autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=1800)
+    autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
+
+    rule_id = store.list_ip_rules()[0]["id"]
+    store.update_rule_state(
+        rule_id, fail_count=5, last_change=int(time.time()) - 3600
+    )
+    out = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
+    assert out["action"] == "changed"
+
+
+def test_probe_retries_before_declaring_failure():
+    """探测失败要重试，避免瞬时抖动触发换 IP。"""
+    result = autoip.probe("127.0.0.1", "tcp", 1, timeout=0.5, attempts=3)
+    assert not result.ok
+    assert "连续 3 次" in result.detail
+
+
+def test_probe_single_attempt_still_supported():
+    result = autoip.probe("127.0.0.1", "tcp", 1, timeout=0.5, attempts=1)
+    assert not result.ok
+    assert "连续 1 次" in result.detail
 
 
 def test_interval_not_reached_skips(env):

@@ -7,6 +7,8 @@
   <p class="hint">
     后台每 30 秒扫一遍规则。对启用的实例按间隔探测 TCP 端口，
     连续失败达到阈值就自动换 IP —— 也就是 IP 被墙后自动更换。
+    每次探测内部会重试 2 次以避开瞬时抖动；换过 IP 后有 30 分钟冷却，
+    避免新 IP 路由还没生效就反复换，白烧弹性 IP 配额（默认每区域 5 个）。
   </p>
   <div class="row">
     <span class="tag {{ 'ok' if monitor_on else 'err' }}" id="mon-tag">

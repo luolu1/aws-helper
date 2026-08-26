@@ -166,7 +166,14 @@ def _change_via_eip(
 def _change_via_restart(
     session: Any, instance_id: str, rule: IpRule, progress: ProgressFn
 ) -> IpChangeResult:
-    """停机再开机换动态 IP。绑了 EIP 的实例必须先解绑，否则 IP 不会变。"""
+    """停机再开机换动态 IP。
+
+    AWS 官方文档（Stop and start Amazon EC2 instances）明确列出两种例外，
+    这两种情况下 stop/start 不会分配新的公网 IPv4，必须提前拦住而不是
+    重启一遍再发现 IP 没变：
+      1. 实例绑定了弹性 IP —— EIP 在 stop/start 期间保持关联
+      2. 实例有辅助网卡，或有关联了 EIP 的辅助私有 IPv4
+    """
     inst = _describe(session, instance_id)
     old_ip = inst.get("PublicIpAddress")
 
@@ -175,6 +182,12 @@ def _change_via_restart(
         raise IpChangeError(
             f"实例绑定了弹性 IP {eip.get('PublicIp')}，重启不会更换地址。"
             "请改用 eip 策略，或先在控制台解绑。"
+        )
+
+    blocker = _dynamic_ip_blocker(session, inst)
+    if blocker:
+        raise IpChangeError(
+            f"{blocker}，AWS 在这种配置下重启不会分配新的公网 IPv4。请改用 eip 策略。"
         )
 
     attempts = 0
@@ -217,6 +230,31 @@ def _change_via_restart(
         )
 
     raise IpChangeError("换 IP 未成功")
+
+
+def _dynamic_ip_blocker(session: Any, inst: dict[str, Any]) -> str | None:
+    """返回阻止 stop/start 换 IP 的原因，没有则返回 None。"""
+    nics = inst.get("NetworkInterfaces") or []
+    if len(nics) > 1:
+        return f"实例有 {len(nics)} 张网卡（存在辅助网卡）"
+
+    eip_public_ips = {
+        addr.get("PublicIp")
+        for addr in session.describe_addresses(
+            Filters=[{"Name": "instance-id", "Values": [inst["InstanceId"]]}]
+        ).get("Addresses", [])
+    }
+    for nic in nics:
+        for private in nic.get("PrivateIpAddresses") or []:
+            if private.get("Primary"):
+                continue
+            assoc = private.get("Association") or {}
+            if assoc.get("PublicIp") in eip_public_ips and assoc.get("PublicIp"):
+                return (
+                    f"辅助私有地址 {private.get('PrivateIpAddress')} "
+                    f"关联了弹性 IP {assoc.get('PublicIp')}"
+                )
+    return None
 
 
 def _current_eip(
