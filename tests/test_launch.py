@@ -66,11 +66,29 @@ def test_launch_without_password_has_no_root_block(mock_ec2, creds, ubuntu_ami):
     assert "chpasswd" not in decoded
 
 
+def test_default_security_group_opens_everything(mock_ec2, creds, ubuntu_ami):
+    """默认放通全部端口和协议。"""
+    results = launch.launch(
+        creds, launch.LaunchRequest(name="node-default-sg", region="us-east-1")
+    )
+    session = aws.ec2(creds)
+    sg = session.describe_security_groups(GroupIds=[results[0].security_group_id])
+    perms = sg["SecurityGroups"][0]["IpPermissions"]
+
+    assert len(perms) == 1
+    assert perms[0]["IpProtocol"] == "-1"
+    assert perms[0]["IpRanges"] == [{"CidrIp": "0.0.0.0/0"}]
+
+
 def test_security_group_opens_only_requested_ports(mock_ec2, creds, ubuntu_ami):
+    """显式关掉全放通后，只开指定端口。"""
     results = launch.launch(
         creds,
         launch.LaunchRequest(
-            name="node-sg", region="us-east-1", open_ports=[22, 443]
+            name="node-sg",
+            region="us-east-1",
+            allow_all_ports=False,
+            open_ports=[22, 443],
         ),
     )
     session = aws.ec2(creds)

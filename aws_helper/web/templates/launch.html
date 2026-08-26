@@ -61,8 +61,8 @@
 
   <div class="grid g3 mt">
     <label class="f">
-      <span>放通端口（逗号分隔）</span>
-      <input type="text" id="open_ports" value="22" placeholder="22, 80, 443">
+      <span id="ports_label">放通端口（全放通时忽略此项）</span>
+      <input type="text" id="open_ports" value="22" placeholder="22, 80, 443" disabled>
     </label>
     <label class="f">
       <span>root 密码（留空则不开 root 登录）</span>
@@ -81,8 +81,16 @@
 
   <div class="row mt">
     <label class="chk"><input type="checkbox" id="enable_ipv6"> 分配 IPv6（自建 VPC + IGW + 双栈路由）</label>
-    <label class="chk"><input type="checkbox" id="allow_all_ports"> 放通全部端口（不推荐）</label>
+    <label class="chk">
+      <input type="checkbox" id="allow_all_ports" checked onchange="togglePorts()">
+      放通全部端口（默认）
+    </label>
   </div>
+
+  <p class="hint mt" id="sg-hint">
+    当前安全组：<span class="tag warn">全部端口 + 全部协议对 0.0.0.0/0 开放</span>
+    取消勾选可改为只放通上面填写的端口。
+  </p>
 </div>
 
 <div class="card">
@@ -136,6 +144,17 @@ systemctl enable --now docker"></textarea>
 
 {% block script %}
 <script>
+function togglePorts() {
+  const all = document.getElementById('allow_all_ports').checked;
+  document.getElementById('open_ports').disabled = all;
+  document.getElementById('ports_label').textContent =
+    all ? '放通端口（全放通时忽略此项）' : '放通端口（逗号分隔）';
+  document.getElementById('sg-hint').innerHTML = all
+    ? '当前安全组：<span class="tag warn">全部端口 + 全部协议对 0.0.0.0/0 开放</span> 取消勾选可改为只放通上面填写的端口。'
+    : '当前安全组：<span class="tag ok">只放通指定端口</span> 勾选上面的复选框可改为全部放通。';
+}
+document.addEventListener('DOMContentLoaded', togglePorts);
+
 function applyTpl() {
   const opt = document.getElementById('tpl').selectedOptions[0];
   if (!opt || !opt.value) return;
@@ -181,8 +200,8 @@ async function preview() {
 async function doLaunch() {
   const c = collect();
   if (!c.name) return toast('实例名称必填', 'err');
-  if (c.allow_all_ports && !confirm('放通全部端口会把所有服务暴露到公网，确定继续？')) return;
-  if (!confirm(`确认在 ${c.region} 创建 ${c.count} 台 ${c.instance_type}？会产生实际费用。`)) return;
+  const sg = c.allow_all_ports ? '全部端口对 0.0.0.0/0 开放' : `仅放通 ${c.open_ports.join(', ')}`;
+  if (!confirm(`确认在 ${c.region} 创建 ${c.count} 台 ${c.instance_type}？\n安全组：${sg}\n会产生实际费用。`)) return;
 
   try {
     const r = await api('/api/launch', { method: 'POST', json: c });

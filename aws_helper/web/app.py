@@ -558,7 +558,8 @@ async def api_launch(request: Request, _: None = Guard):
             disk_size=int(body.get("disk_size", 16)),
             count=int(body.get("count", 1)),
             open_ports=[int(p) for p in body.get("open_ports") or [22]],
-            allow_all_ports=bool(body.get("allow_all_ports")),
+            # 字段缺失时默认全放通，与表单默认勾选一致
+            allow_all_ports=bool(body.get("allow_all_ports", True)),
             enable_ipv6=bool(body.get("enable_ipv6")),
             script=body.get("script", ""),
             root_password=body.get("root_password") or None,

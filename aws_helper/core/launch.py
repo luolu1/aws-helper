@@ -31,10 +31,10 @@ class LaunchRequest:
     disk_size: int = 16
     disk_type: str = "gp3"
     count: int = 1
-    # 安全组放通的端口。默认只开 SSH，避免全端口暴露
+    # 默认放通全部端口（allow_all_ports=True）。取消勾选后才按 open_ports 逐个开。
     open_ports: list[int] = field(default_factory=lambda: [22])
     open_cidr: str = "0.0.0.0/0"
-    allow_all_ports: bool = False
+    allow_all_ports: bool = True
     assign_public_ip: bool = True
     enable_ipv6: bool = False
     # 开机脚本
