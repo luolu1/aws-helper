@@ -84,6 +84,12 @@ def launch(
 
     spec = aws.IMAGES.get(req.image_key)
     if spec is None and not req.image_id:
+        if not req.image_key:
+            raise LaunchError(
+                "没有选择镜像。该系统类别与架构的组合下没有可用镜像"
+                "（例如 AWS 未发布 ARM64 的 Windows Server），"
+                "请换个组合，或在「指定 AMI ID」里手动填一个"
+            )
         raise LaunchError(f"未知镜像: {req.image_key}")
     ssh_user = spec.ssh_user if spec else "ubuntu"
     is_windows = bool(spec and spec.is_windows)

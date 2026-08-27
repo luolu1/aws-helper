@@ -172,6 +172,31 @@ def test_catalog_windows_arm_is_empty(panel):
     assert d["images"] == []
 
 
+def test_empty_image_key_gets_actionable_error(mock_ec2, creds, ubuntu_ami):
+    """镜像下拉为空（如 Windows+ARM64）时提交，报错要说明白怎么办。
+
+    原来只说"未知镜像: "，用户看不出是组合没镜像还是自己填错了。
+    """
+    with pytest.raises(launch.LaunchError, match="没有选择镜像") as excinfo:
+        launch.launch(
+            creds, launch.LaunchRequest(name="no-img", region="us-east-1", image_key="")
+        )
+    message = str(excinfo.value)
+    assert "指定 AMI ID" in message
+    assert "ARM64 的 Windows" in message
+
+
+def test_empty_image_key_ok_with_explicit_ami(mock_ec2, creds, ubuntu_ami):
+    """手动填了 AMI ID 时，镜像下拉为空不该阻断开机。"""
+    results = launch.launch(
+        creds,
+        launch.LaunchRequest(
+            name="explicit-only", region="us-east-1", image_key="", image_id=ubuntu_ami
+        ),
+    )
+    assert results[0].image_id == ubuntu_ami
+
+
 def test_catalog_rejects_bad_params(panel):
     c, aid, _ = panel
     assert c.get(
