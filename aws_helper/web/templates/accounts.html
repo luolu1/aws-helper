@@ -55,10 +55,34 @@
   </p>
 
   <div class="row mt">
+    <button onclick="probeAccount()">账号探测 / 配额</button>
     <button onclick="testProxy()">测试代理连通性</button>
     <span style="flex:1"></span>
     <button id="cancel-btn" onclick="resetForm()" style="display:none">取消编辑</button>
     <button class="primary" id="submit-btn" onclick="submitAccount()">校验并保存</button>
+  </div>
+</div>
+
+<div class="card" id="probe-card" style="display:none">
+  <h2>账号探测结果</h2>
+  <p class="hint">
+    分项检查凭据、账号状态、开机权限和 vCPU 配额。
+    账号被 AWS 封禁时只读接口仍然正常、DryRun 也会通过，只有真实写操作才会暴露 —— 这里会单独标出来。
+  </p>
+  <table>
+    <thead><tr><th style="width:150px">检查项</th><th style="width:70px">结果</th><th>详情</th></tr></thead>
+    <tbody id="probe-rows"></tbody>
+  </table>
+
+  <div class="grid g2 mt">
+    <div>
+      <p class="hint" style="margin:0 0 6px">vCPU 配额</p>
+      <table><tbody id="quota-rows"></tbody></table>
+    </div>
+    <div>
+      <p class="hint" style="margin:0 0 6px">当前用量</p>
+      <table><tbody id="usage-rows"></tbody></table>
+    </div>
   </div>
 </div>
 
@@ -195,6 +219,51 @@ async function submitAccount() {
     toast(e.message, 'err');
     btn.disabled = false;
     btn.textContent = original;
+  }
+}
+
+async function probeAccount() {
+  const id = F('edit_id').value;
+  if (!id) return toast('请先点某个账号的「编辑」，再执行探测', 'err');
+  const region = F('acct_region').value;
+
+  toast('正在探测账号（会真实调用 AWS API）…');
+  try {
+    const d = await api(`/api/probe-account?account_id=${id}&region=${region}`);
+    F('probe-card').style.display = 'block';
+
+    F('probe-rows').innerHTML = d.checks.map(c => `
+      <tr>
+        <td>${escapeHtml(c.name)}</td>
+        <td><span class="tag ${c.ok ? 'ok' : 'err'}">${c.ok ? '通过' : '未通过'}</span></td>
+        <td class="mono" style="font-size:12px">${escapeHtml(c.detail)}</td>
+      </tr>`).join('');
+
+    F('quota-rows').innerHTML = d.quotas.length
+      ? d.quotas.map(q => `
+        <tr>
+          <td>${escapeHtml(q.label)}</td>
+          <td class="mono"><span class="tag ${q.value > 0 ? 'ok' : 'err'}">${q.value}</span></td>
+        </tr>`).join('')
+      : '<tr><td class="hint">读不到配额（可能缺 servicequotas:GetServiceQuota）</td></tr>';
+
+    const u = d.usage;
+    const rows = [
+      ['运行中实例', u.running_instances],
+      ['运行中 vCPU', u.running_vcpus],
+      ['已停止实例', u.stopped_instances],
+      ['EBS 卷', `${u.volumes} 个 / ${u.volume_gib} GiB`],
+      ['弹性 IP', `${u.addresses} 个（空闲 ${u.idle_addresses}）`],
+    ];
+    F('usage-rows').innerHTML = rows.map(([k, v]) => {
+      const warn = (k === '弹性 IP' && u.idle_addresses > 0) || (k === '已停止实例' && u.stopped_instances > 0);
+      return `<tr><td>${k}</td><td class="mono">${warn ? '<span class="tag warn">' + escapeHtml(String(v)) + '</span>' : escapeHtml(String(v))}</td></tr>`;
+    }).join('');
+
+    toast(d.healthy ? '探测通过，账号可用' : '探测发现问题，见下方结果', d.healthy ? 'ok' : 'err');
+    F('probe-card').scrollIntoView({ behavior: 'smooth' });
+  } catch (e) {
+    toast(e.message, 'err');
   }
 }
 

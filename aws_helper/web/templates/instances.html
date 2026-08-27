@@ -186,12 +186,51 @@ async function power(action) {
   const ids = picked();
   if (!ids.length) return toast('请先勾选实例', 'err');
   const names = { start: '开机', stop: '关机', reboot: '重启', terminate: '终止' };
-  if (action === 'terminate' && !confirm(`确认终止 ${ids.length} 台实例？这会永久删除，无法恢复。`)) return;
+
+  if (action === 'terminate') return terminateWithCleanup(ids);
+
   try {
     await api('/api/instances/power', { method: 'POST', json: { ...sel(), action, instance_ids: ids } });
     toast(`${names[action]} 指令已发送（${ids.length} 台）`, 'ok');
     setTimeout(refresh, 2500);
   } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+// 终止要连带清理会继续计费的资源，耗时较长，走后台任务 + 进度弹窗
+async function terminateWithCleanup(ids) {
+  const msg = `确认终止 ${ids.length} 台实例？\n\n`
+    + '会永久删除，无法恢复。同时清理以下关联资源以免继续计费：\n'
+    + '  · 弹性 IP（未绑定按小时计费）\n'
+    + '  · 残留 EBS 卷（DeleteOnTermination=false 的会一直计费）\n'
+    + '  · 本工具创建的安全组、密钥对、自建 VPC\n\n'
+    + '不会动默认 VPC、默认安全组，以及还有其他实例在用的 VPC。';
+  if (!confirm(msg)) return;
+
+  try {
+    const r = await api('/api/instances/power', {
+      method: 'POST',
+      json: { ...sel(), action: 'terminate', instance_ids: ids, cleanup: true }
+    });
+    const task = await watchTask(r.task_id, `终止并清理 ${ids.length} 台实例`);
+    const c = task.result.cleaned || {};
+    const labels = {
+      instances: '实例', addresses: '弹性 IP', volumes: '残留卷',
+      security_groups: '安全组', key_pairs: '密钥对', vpcs: '自建 VPC'
+    };
+    const lines = Object.entries(c)
+      .filter(([, v]) => v && v.length)
+      .map(([k, v]) => `${labels[k] || k} ${v.length} 个`);
+    let html = `<span style="flex:1;text-align:left;font-size:12px">已清理：${escapeHtml(lines.join('，') || '仅实例')}`;
+    if (task.result.failed && task.result.failed.length) {
+      html += `<br><span style="color:var(--warn)">未能清理：${escapeHtml(task.result.failed.join('；'))}</span>`;
+    }
+    html += '</span>';
+    Progress.finish(html);
+    toast('终止并清理完成', 'ok');
+  } catch (e) {
+    Progress.finish();
     toast(e.message, 'err');
   }
 }

@@ -211,6 +211,29 @@ def launch_page(request: Request, _: None = Guard):
     )
 
 
+@app.get("/api/probe-account")
+def api_probe_account(account_id: int, region: str, _: None = Guard):
+    """探测账号可用性、vCPU 配额与当前用量。
+
+    分项返回：账号可能只读正常但写操作被 AWS 封禁（账号级 Blocked），
+    DryRun 也会通过，只有分项探测才能定位到底哪一步不行。
+    """
+    creds = store.credentials(account_id, region)
+    try:
+        result = aws.probe_account(creds, region)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    failed = [c["name"] for c in result["checks"] if not c["ok"]]
+    store.log(
+        "probe",
+        region,
+        result["healthy"],
+        "全部通过" if result["healthy"] else f"未通过: {', '.join(failed)}",
+    )
+    return {"ok": True, **result}
+
+
 @app.get("/api/catalog")
 def api_catalog(
     account_id: int,
@@ -574,7 +597,30 @@ async def api_power(request: Request, _: None = Guard):
     region = body["region"]
     action = body["action"]
     ids = body.get("instance_ids") or []
+    cleanup = bool(body.get("cleanup", True))
     creds = store.credentials(account_id, region)
+
+    # terminate 要清理关联资源（等实例真终止 + 删卷/网络），耗时可达数分钟，
+    # 必须走后台任务，否则 HTTP 请求会超时。
+    if action == "terminate":
+        def job(progress: Any) -> dict[str, Any]:
+            result = launch.power(creds, region, action, ids, cleanup, progress)
+            cleaned = result.get("cleaned", {})
+            summary = "，".join(
+                f"{name} {len(items)}" for name, items in cleaned.items() if items
+            )
+            store.log(
+                "terminate",
+                ",".join(ids),
+                not result.get("failed"),
+                f"已清理: {summary or '仅实例'}"
+                + (f"；失败: {'; '.join(result['failed'])}" if result.get("failed") else ""),
+            )
+            return result
+
+        task_id = manager.submit("terminate", f"终止并清理 {len(ids)} 台实例", job)
+        return {"ok": True, "task_id": task_id, "action": action}
+
     try:
         result = launch.power(creds, region, action, ids)
     except Exception as exc:

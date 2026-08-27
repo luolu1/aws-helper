@@ -590,6 +590,175 @@ IMAGES: dict[str, ImageSpec] = {
 }
 
 
+# EC2 的 vCPU 配额按实例族分组，QuotaCode 见 Service Quotas 控制台
+VCPU_QUOTAS: dict[str, tuple[str, str]] = {
+    "standard": ("L-1216C47A", "标准按需实例（A C D H I M R T Z）"),
+    "spot": ("L-34B43A08", "Spot 实例（标准族）"),
+    "g_family": ("L-DB2E81BA", "G 和 VT 按需实例"),
+    "p_family": ("L-417A185B", "P 按需实例"),
+    "inf": ("L-1945791B", "Inf 按需实例"),
+}
+
+
+def probe_account(creds: Credentials, region: str) -> dict[str, Any]:
+    """探测账号在该区域的可用性、配额与用量。
+
+    分项返回而不是一次成败：账号可能只读正常但写操作被封
+    （账号级 Blocked），或者只是缺某个权限。分开报才能定位。
+    """
+    result: dict[str, Any] = {
+        "region": region,
+        "checks": [],
+        "quotas": [],
+        "usage": {},
+        "healthy": True,
+    }
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        result["checks"].append({"name": name, "ok": ok, "detail": detail})
+        if not ok:
+            result["healthy"] = False
+
+    session = ec2(creds, region)
+
+    try:
+        regions = session.describe_regions()["Regions"]
+        record("凭据与网络", True, f"可访问 {len(regions)} 个区域")
+    except Exception as exc:
+        record("凭据与网络", False, _short(exc))
+        return result
+
+    try:
+        identity = client("sts", creds, region).get_caller_identity()
+        arn = identity.get("Arn", "")
+        is_root = arn.endswith(":root")
+        result["account_id"] = identity.get("Account", "")
+        result["is_root"] = is_root
+        record(
+            "账号身份",
+            not is_root,
+            f"{arn}" + ("（root 凭据风险高，建议换 IAM 用户）" if is_root else ""),
+        )
+    except Exception as exc:
+        record("账号身份", False, _short(exc))
+
+    # DryRun 只校验权限，不校验账号状态；账号被封时 DryRun 仍会通过，
+    # 所以这里额外做一次真实的只读写探测组合来判断。
+    try:
+        session.run_instances(
+            ImageId="ami-00000000000000000",
+            InstanceType="t3.micro",
+            MinCount=1,
+            MaxCount=1,
+            DryRun=True,
+        )
+        record("开机权限", True, "DryRun 通过")
+    except Exception as exc:
+        message = str(exc)
+        if "DryRunOperation" in message:
+            record("开机权限", True, "DryRun 通过")
+        elif "InvalidAMIID" in message or "does not exist" in message:
+            record("开机权限", True, "有权限（AMI 占位符无效属预期）")
+        elif "Blocked" in message:
+            record("开机权限", False, "账号被 AWS 封禁，需提工单解封")
+        else:
+            record("开机权限", False, _short(exc))
+
+    try:
+        quotas = client("service-quotas", creds, region)
+        for key, (code, label) in VCPU_QUOTAS.items():
+            try:
+                quota = quotas.get_service_quota(ServiceCode="ec2", QuotaCode=code)
+                value = quota["Quota"]["Value"]
+                result["quotas"].append(
+                    {
+                        "key": key,
+                        "label": label,
+                        "code": code,
+                        "value": value,
+                        "adjustable": quota["Quota"].get("Adjustable", False),
+                    }
+                )
+            except Exception:
+                continue
+        if result["quotas"]:
+            zero = [q for q in result["quotas"] if q["value"] == 0]
+            record(
+                "vCPU 配额",
+                not zero,
+                f"读到 {len(result['quotas'])} 项"
+                + (
+                    f"，其中 {len(zero)} 项为 0（账号未激活或被限制）"
+                    if zero
+                    else ""
+                ),
+            )
+        else:
+            record("vCPU 配额", False, "读不到配额，可能缺 servicequotas:GetServiceQuota")
+    except Exception as exc:
+        record("vCPU 配额", False, _short(exc))
+
+    result["usage"] = _count_usage(session)
+    return result
+
+
+def _count_usage(session: Any) -> dict[str, Any]:
+    """统计当前占用：运行中 vCPU、实例数、卷容量、弹性 IP。"""
+    usage = {
+        "running_instances": 0,
+        "running_vcpus": 0,
+        "stopped_instances": 0,
+        "volumes": 0,
+        "volume_gib": 0,
+        "addresses": 0,
+        "idle_addresses": 0,
+    }
+    try:
+        resp = session.describe_instances(
+            Filters=[
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                }
+            ]
+        )
+        for res in resp.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                state = inst.get("State", {}).get("Name")
+                cpu = inst.get("CpuOptions") or {}
+                vcpus = cpu.get("CoreCount", 0) * cpu.get("ThreadsPerCore", 1)
+                if state in ("pending", "running"):
+                    usage["running_instances"] += 1
+                    usage["running_vcpus"] += vcpus
+                else:
+                    usage["stopped_instances"] += 1
+    except Exception:
+        pass
+
+    try:
+        for vol in session.describe_volumes().get("Volumes", []):
+            usage["volumes"] += 1
+            usage["volume_gib"] += vol.get("Size", 0)
+    except Exception:
+        pass
+
+    try:
+        for addr in session.describe_addresses().get("Addresses", []):
+            usage["addresses"] += 1
+            if not addr.get("InstanceId"):
+                usage["idle_addresses"] += 1
+    except Exception:
+        pass
+
+    return usage
+
+
+def _short(exc: Exception) -> str:
+    code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+    text = str(exc)
+    return f"{code}: {text[:120]}" if code else text[:140]
+
+
 def images_by_os_arch(os_family: str, arch: str) -> dict[str, ImageSpec]:
     """按系统类别和架构筛镜像，供级联选择使用。"""
     return {

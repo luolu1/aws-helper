@@ -541,9 +541,17 @@ def list_instances(creds: aws.Credentials, region: str) -> list[dict[str, Any]]:
 
 
 def power(
-    creds: aws.Credentials, region: str, action: str, instance_ids: list[str]
+    creds: aws.Credentials,
+    region: str,
+    action: str,
+    instance_ids: list[str],
+    cleanup: bool = True,
+    progress: ProgressFn = _noop,
 ) -> dict[str, Any]:
-    """电源操作：start / stop / reboot / terminate。"""
+    """电源操作：start / stop / reboot / terminate。
+
+    terminate 且 cleanup=True 时，连带清理会继续计费或占配额的关联资源。
+    """
     session = aws.ec2(creds, region)
     calls = {
         "start": session.start_instances,
@@ -556,8 +564,270 @@ def power(
         raise LaunchError(f"不支持的操作: {action}")
     if not instance_ids:
         raise LaunchError("请至少选择一台实例")
+
+    if action == "terminate" and cleanup:
+        return terminate_and_cleanup(creds, region, instance_ids, progress)
+
     resp = fn(InstanceIds=instance_ids)
     return {"ok": True, "action": action, "count": len(instance_ids), "raw": _strip(resp)}
+
+
+def collect_related_resources(
+    session: Any, instance_ids: list[str]
+) -> dict[str, Any]:
+    """在终止之前把关联资源记下来。
+
+    终止后 AWS 会逐步解除标签和关联，届时再查就找不到这些资源了，
+    必须先采集。
+    """
+    found: dict[str, Any] = {
+        "volumes": [],
+        "addresses": [],
+        "security_groups": [],
+        "key_pairs": [],
+        "network_interfaces": [],
+        "vpcs": [],
+    }
+
+    resp = session.describe_instances(InstanceIds=instance_ids)
+    for res in resp.get("Reservations", []):
+        for inst in res.get("Instances", []):
+            for mapping in inst.get("BlockDeviceMappings") or []:
+                ebs = mapping.get("Ebs") or {}
+                if ebs.get("VolumeId"):
+                    found["volumes"].append(ebs["VolumeId"])
+            if inst.get("KeyName"):
+                found["key_pairs"].append(inst["KeyName"])
+            for nic in inst.get("NetworkInterfaces") or []:
+                if nic.get("NetworkInterfaceId"):
+                    found["network_interfaces"].append(nic["NetworkInterfaceId"])
+                for group in nic.get("Groups") or []:
+                    found["security_groups"].append(group["GroupId"])
+                if nic.get("VpcId"):
+                    found["vpcs"].append(nic["VpcId"])
+            for group in inst.get("SecurityGroups") or []:
+                found["security_groups"].append(group["GroupId"])
+            if inst.get("VpcId"):
+                found["vpcs"].append(inst["VpcId"])
+
+    addrs = session.describe_addresses(
+        Filters=[{"Name": "instance-id", "Values": instance_ids}]
+    )
+    for addr in addrs.get("Addresses", []):
+        if addr.get("AllocationId"):
+            found["addresses"].append(
+                {
+                    "allocation_id": addr["AllocationId"],
+                    "public_ip": addr.get("PublicIp", ""),
+                }
+            )
+
+    for key in ("volumes", "security_groups", "key_pairs", "network_interfaces", "vpcs"):
+        found[key] = sorted(set(found[key]))
+    return found
+
+
+def terminate_and_cleanup(
+    creds: aws.Credentials,
+    region: str,
+    instance_ids: list[str],
+    progress: ProgressFn = _noop,
+) -> dict[str, Any]:
+    """终止实例并清理会残留计费的资源。
+
+    按 AWS 官方文档，终止实例后这些仍然计费或占配额：
+      - 弹性 IP：解绑但仍分配在账户下，未绑定按小时计费
+      - EBS 卷：DeleteOnTermination=false 的卷会保留并持续计费
+      - 安全组 / 密钥对 / 自建 VPC：不计费但占配额，堆积后无法创建新资源
+
+    删除顺序有依赖：卷和网卡要等实例真的终止，安全组要等网卡释放，
+    VPC 要等里面所有东西都清空。任何一步失败都记进 failed 而不中断，
+    尽最大努力清理。
+    """
+    session = aws.ec2(creds, region)
+
+    progress("正在采集关联资源")
+    resources = collect_related_resources(session, instance_ids)
+
+    cleaned: dict[str, list[str]] = {
+        "instances": [],
+        "addresses": [],
+        "volumes": [],
+        "security_groups": [],
+        "key_pairs": [],
+        "vpcs": [],
+    }
+    failed: list[str] = []
+
+    # 先释放弹性 IP：这是唯一会持续产生真实费用的项，优先止损
+    for addr in resources["addresses"]:
+        try:
+            session.release_address(AllocationId=addr["allocation_id"])
+            cleaned["addresses"].append(addr["public_ip"] or addr["allocation_id"])
+            progress(f"已释放弹性 IP {addr['public_ip']}")
+        except ClientError as exc:
+            failed.append(f"弹性 IP {addr['public_ip']}: {_code(exc) or exc}")
+
+    progress(f"正在终止 {len(instance_ids)} 台实例")
+    try:
+        session.terminate_instances(InstanceIds=instance_ids)
+        cleaned["instances"] = list(instance_ids)
+    except ClientError as exc:
+        raise LaunchError(f"终止实例失败: {exc}") from exc
+
+    progress("正在等待实例完全终止")
+    _wait_terminated(session, instance_ids, progress)
+
+    for volume_id in resources["volumes"]:
+        try:
+            info = session.describe_volumes(VolumeIds=[volume_id])["Volumes"][0]
+        except ClientError:
+            continue  # 随实例一起删掉了
+        if info.get("State") == "deleted":
+            continue
+        try:
+            session.delete_volume(VolumeId=volume_id)
+            cleaned["volumes"].append(volume_id)
+            progress(f"已删除残留卷 {volume_id}")
+        except ClientError as exc:
+            failed.append(f"卷 {volume_id}: {_code(exc) or exc}")
+
+    for group_id in resources["security_groups"]:
+        try:
+            info = session.describe_security_groups(GroupIds=[group_id])
+        except ClientError:
+            continue
+        groups = info.get("SecurityGroups") or []
+        if not groups or groups[0].get("GroupName") == "default":
+            continue  # 默认安全组删不掉也不该删
+        try:
+            session.delete_security_group(GroupId=group_id)
+            cleaned["security_groups"].append(group_id)
+            progress(f"已删除安全组 {group_id}")
+        except ClientError as exc:
+            failed.append(f"安全组 {group_id}: {_code(exc) or exc}")
+
+    # 只删本工具建的密钥对，用户自己的不动
+    for key_name in resources["key_pairs"]:
+        if not key_name.startswith("awshelper-"):
+            continue
+        try:
+            session.delete_key_pair(KeyName=key_name)
+            cleaned["key_pairs"].append(key_name)
+            progress(f"已删除密钥对 {key_name}")
+        except ClientError as exc:
+            failed.append(f"密钥对 {key_name}: {_code(exc) or exc}")
+
+    for vpc_id in resources["vpcs"]:
+        if _delete_vpc_if_ours(session, vpc_id, progress, failed):
+            cleaned["vpcs"].append(vpc_id)
+
+    return {
+        "ok": True,
+        "action": "terminate",
+        "count": len(instance_ids),
+        "cleaned": cleaned,
+        "failed": failed,
+    }
+
+
+def _wait_terminated(
+    session: Any, instance_ids: list[str], progress: ProgressFn, timeout: int = 300
+) -> None:
+    deadline = time.time() + timeout
+    pending = set(instance_ids)
+    while pending and time.time() < deadline:
+        try:
+            resp = session.describe_instances(InstanceIds=list(pending))
+        except ClientError:
+            return
+        for res in resp.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                if inst.get("State", {}).get("Name") == "terminated":
+                    pending.discard(inst["InstanceId"])
+        if pending:
+            progress(f"等待 {len(pending)} 台实例终止")
+            time.sleep(3)
+
+
+def _delete_vpc_if_ours(
+    session: Any, vpc_id: str, progress: ProgressFn, failed: list[str]
+) -> bool:
+    """删除本工具为 IPv6 双栈自建的 VPC。
+
+    默认 VPC 和还有别的实例在用的 VPC 一律不动 —— 误删会打断用户其他业务。
+    """
+    try:
+        info = session.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]
+    except ClientError:
+        return False
+    if info.get("IsDefault"):
+        return False
+
+    try:
+        live = session.describe_instances(
+            Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                },
+            ]
+        )
+        if any(r.get("Instances") for r in live.get("Reservations", [])):
+            return False
+    except ClientError:
+        return False
+
+    try:
+        for nic in session.describe_network_interfaces(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("NetworkInterfaces", []):
+            if nic.get("Status") == "available":
+                session.delete_network_interface(
+                    NetworkInterfaceId=nic["NetworkInterfaceId"]
+                )
+
+        for igw in session.describe_internet_gateways(
+            Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+        ).get("InternetGateways", []):
+            session.detach_internet_gateway(
+                InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id
+            )
+            session.delete_internet_gateway(
+                InternetGatewayId=igw["InternetGatewayId"]
+            )
+
+        # 路由表关联要先解除，否则子网删不掉；main 路由表随 VPC 一起走
+        for table in session.describe_route_tables(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("RouteTables", []):
+            is_main = any(a.get("Main") for a in table.get("Associations") or [])
+            for assoc in table.get("Associations") or []:
+                if not assoc.get("Main") and assoc.get("RouteTableAssociationId"):
+                    session.disassociate_route_table(
+                        AssociationId=assoc["RouteTableAssociationId"]
+                    )
+            if not is_main:
+                session.delete_route_table(RouteTableId=table["RouteTableId"])
+
+        for subnet in session.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("Subnets", []):
+            session.delete_subnet(SubnetId=subnet["SubnetId"])
+
+        for group in session.describe_security_groups(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("SecurityGroups", []):
+            if group.get("GroupName") != "default":
+                session.delete_security_group(GroupId=group["GroupId"])
+
+        session.delete_vpc(VpcId=vpc_id)
+        progress(f"已删除自建 VPC {vpc_id}")
+        return True
+    except ClientError as exc:
+        failed.append(f"VPC {vpc_id}: {_code(exc) or exc}")
+        return False
 
 
 def _strip(resp: dict[str, Any]) -> dict[str, Any]:

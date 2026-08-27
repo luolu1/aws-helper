@@ -263,6 +263,14 @@ ec2:DescribeAddresses        ec2:CreateTags               ec2:DescribeVolumes
 |---|---|---|
 | `ssm:GetParameter` | 读发行方发布的官方 AMI 参数 | 退回 `DescribeImages` 名称匹配；Windows 镜像不可用 |
 | `ec2:DescribeInstanceTypes` | 拉该区域真实支持的实例规格 | 降级为内置清单，可能选到该区域不支持的规格 |
+| `servicequotas:GetServiceQuota` | 账号探测里查 vCPU 配额 | 探测的配额一项标为未通过，其余不受影响 |
+| `sts:GetCallerIdentity` | 账号探测里确认身份、提示 root 凭据风险 | 身份检查一项失败 |
+
+终止实例的连带清理还需要：`ec2:DeleteVolume` `ec2:DeleteSecurityGroup`
+`ec2:DeleteKeyPair` `ec2:ReleaseAddress`，以及删自建 VPC 时的
+`ec2:DeleteVpc` `ec2:DeleteSubnet` `ec2:DeleteInternetGateway`
+`ec2:DetachInternetGateway` `ec2:DeleteRouteTable` `ec2:DisassociateRouteTable`
+`ec2:DeleteNetworkInterface`。缺哪项就哪项清理不掉，会在结果里标为"未能清理"。
 
 两者都是可选的，缺失时功能降级但不中断。Windows 镜像强依赖 `ssm:GetParameter` ——
 Windows AMI 在 `DescribeImages` 里不可靠（实测 ap-east-1 返回 0 条）。

@@ -176,9 +176,14 @@ def test_orphaned_eip_detected_after_terminate(creds, instance):
 
     describe_addresses 对已终止实例仍会返回 InstanceId，
     只看 InstanceId 是否为空会把这类地址误判为"已绑定"而漏掉。
+
+    这里用 cleanup=False 直接终止 —— 默认的连带清理会主动释放 EIP，
+    那样就没有孤儿可测了。这条测的是"清理没跑或跑失败"后的兜底识别能力。
     """
     result = ipchange.change_ip(creds, "us-east-1", instance.instance_id, "eip")
-    launch.power(creds, "us-east-1", "terminate", [instance.instance_id])
+    launch.power(
+        creds, "us-east-1", "terminate", [instance.instance_id], cleanup=False
+    )
 
     addrs = ipchange.list_addresses(creds, "us-east-1")
     target = [a for a in addrs if a["public_ip"] == result.new_ip][0]
