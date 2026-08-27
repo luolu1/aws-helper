@@ -86,14 +86,33 @@ def test_credentials_masked_proxy():
 # ---------- 真实链路 ----------
 
 
+def _lan_ip() -> str:
+    """取一个非 loopback 的本机地址。
+
+    代理测试必须用它：loopback endpoint 会被有意绕过代理
+    （远端代理连不回我们的 127.0.0.1），那样测不到代理链路。
+    """
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("10.255.255.255", 1))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
 @pytest.fixture
 def moto_endpoint(monkeypatch):
     """起一个真实 HTTP 的 moto 服务，代理需要真的转发 TCP 才能通。"""
     from moto.server import ThreadedMotoServer
 
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    host = _lan_ip()
+    server = ThreadedMotoServer(ip_address=host, port=0, verbose=False)
     server.start()
-    host, port = server.get_host_and_port()
+    _, port = server.get_host_and_port()
     monkeypatch.setenv("AWS_HELPER_ENDPOINT_URL", f"http://{host}:{port}")
     yield host, port
     server.stop()
@@ -194,6 +213,57 @@ def test_unreachable_proxy_fails_loudly(moto_endpoint, creds):
 
 def test_no_proxy_still_works(moto_endpoint, creds):
     assert aws.ec2(creds).describe_regions()["Regions"]
+
+
+# ---------- 本机 endpoint 必须绕过代理 ----------
+
+
+@pytest.mark.parametrize(
+    "endpoint,expected",
+    [
+        ("http://127.0.0.1:5001", True),
+        ("http://localhost:5001", True),
+        ("http://[::1]:5001", True),
+        ("http://127.0.0.53:8080", True),
+        ("http://10.0.0.5:5001", False),
+        ("https://ec2.us-east-1.amazonaws.com", False),
+        ("", False),
+    ],
+)
+def test_endpoint_is_local_detection(monkeypatch, endpoint, expected):
+    monkeypatch.setenv("AWS_HELPER_ENDPOINT_URL", endpoint)
+    assert aws._endpoint_is_local() is expected
+
+
+def test_local_endpoint_skips_proxy_probe(monkeypatch):
+    """本机 endpoint 不做代理预检。
+
+    远端代理连不回我们的 127.0.0.1，预检必然 Connection refused，
+    会把一个完全可用的代理误判成坏的。
+    """
+    monkeypatch.setenv("AWS_HELPER_ENDPOINT_URL", "http://127.0.0.1:5001")
+    assert aws._api_target("us-east-1") is None
+
+
+def test_remote_endpoint_still_probed(monkeypatch):
+    monkeypatch.delenv("AWS_HELPER_ENDPOINT_URL", raising=False)
+    assert aws._api_target("ap-northeast-1") == (
+        "ec2.ap-northeast-1.amazonaws.com",
+        443,
+    )
+
+
+def test_local_endpoint_bypasses_proxy_entirely(mock_ec2, monkeypatch):
+    """配了代理也不能把本机 endpoint 的流量送进代理。
+
+    演示环境（moto 跑在 127.0.0.1）配上真实远端代理时，
+    必须仍然可用 —— 等同于 no_proxy 对 localhost 的标准行为。
+    """
+    monkeypatch.setenv("AWS_HELPER_ENDPOINT_URL", "http://127.0.0.1:5001")
+    with Socks5Server() as proxy:
+        creds = Credentials("testing", "testing", "us-east-1", proxy=proxy.url)
+        assert aws.verify(creds)["regions"] > 0
+        assert proxy.targets == [], "本机 endpoint 的流量不应经过代理"
 
 
 def test_two_accounts_use_separate_proxies(moto_endpoint, creds):

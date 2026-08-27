@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -171,6 +172,10 @@ def client(service: str, creds: Credentials, region: str | None = None) -> Any:
     """构造 boto3 客户端。region 显式传入时覆盖凭据里的默认区域。"""
     config = _BOTO_CONFIG
     proxy = normalize_proxy(creds.proxy)
+    # 本机 endpoint（演示环境的 moto、本地 LocalStack）必须绕过代理，
+    # 远端代理连不回我们的 127.0.0.1。
+    if _endpoint_is_local():
+        proxy = None
     if proxy:
         config = config.merge(
             BotoConfig(proxies={"http": proxy, "https": proxy})
@@ -215,19 +220,48 @@ def verify(creds: Credentials, region: str | None = None) -> dict[str, Any]:
     """调用 DescribeRegions 验证凭据可用，返回可用区域数量。"""
     proxy = normalize_proxy(creds.proxy)
     if proxy:
-        probe_proxy(proxy, target=_api_target(region or creds.region))
+        target = _api_target(region or creds.region)
+        if target:
+            probe_proxy(proxy, target=target)
     resp = ec2(creds, region).describe_regions()
     return {"ok": True, "regions": len(resp.get("Regions", []))}
 
 
-def _api_target(region: str) -> tuple[str, int]:
-    """返回代理需要能连通的目标地址，即本次实际访问的 EC2 endpoint。"""
+def _endpoint_is_local(endpoint: str | None = None) -> bool:
+    """自定义 endpoint 是否指向本机。
+
+    远端代理无法连回我们的 127.0.0.1，这种 endpoint 必须绕过代理直连，
+    否则任何真实代理都会报 Connection refused。等同于 no_proxy 对
+    localhost 的标准行为。
+    """
+    endpoint = endpoint if endpoint is not None else os.environ.get(_ENDPOINT_ENV)
+    if not endpoint:
+        return False
+    host = urlparse(endpoint).hostname
+    if not host:
+        return False
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _api_target(region: str) -> tuple[str, int] | None:
+    """返回代理预检要连的目标地址，无需预检时返回 None。"""
     endpoint = os.environ.get(_ENDPOINT_ENV)
-    if endpoint:
-        parsed = urlparse(endpoint)
-        default_port = 443 if parsed.scheme == "https" else 80
-        return parsed.hostname or "127.0.0.1", parsed.port or default_port
-    return f"ec2.{region}.amazonaws.com", 443
+    if not endpoint:
+        return f"ec2.{region}.amazonaws.com", 443
+    if _endpoint_is_local(endpoint):
+        return None
+
+    parsed = urlparse(endpoint)
+    host = parsed.hostname
+    if not host:
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    return host, parsed.port or default_port
 
 
 def probe_proxy(

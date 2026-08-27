@@ -375,9 +375,12 @@ def server_client(monkeypatch, tmp_path):
     """
     from moto.server import ThreadedMotoServer
 
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    from tests.test_proxy import _lan_ip
+
+    host = _lan_ip()
+    server = ThreadedMotoServer(ip_address=host, port=0, verbose=False)
     server.start()
-    host, port = server.get_host_and_port()
+    _, port = server.get_host_and_port()
 
     monkeypatch.setenv("AWS_HELPER_ENDPOINT_URL", f"http://{host}:{port}")
 
