@@ -360,8 +360,29 @@ def test_non_terminate_actions_stay_synchronous(panel, creds):
     assert "task_id" not in resp.json()
 
 
-def test_accounts_page_has_probe_button(panel):
+def test_accounts_page_shows_quota_columns(panel):
+    """账号列表要直接看到状态和 vCPU 配额，不用点进详情。"""
     c, _, _ = panel
     html = c.get("/accounts").text
-    assert "账号探测 / 配额" in html
-    assert "probeAccount" in html
+
+    assert "vCPU 配额 / 已用" in html
+    assert ">状态<" in html
+    assert 'class="probe-status"' in html
+    assert 'class="probe-quota' in html
+
+
+def test_accounts_page_has_per_row_and_bulk_probe(panel):
+    c, aid, _ = panel
+    html = c.get("/accounts").text
+
+    assert f"probeAccount({aid}," in html, "每行要有独立的检测按钮"
+    assert "probeAll()" in html
+    assert "检测全部账号" in html
+
+
+def test_account_rows_carry_probe_metadata(panel):
+    """行上要带 account/region，批量检测才知道逐个查什么。"""
+    c, aid, _ = panel
+    html = c.get("/accounts").text
+    assert f'data-account="{aid}"' in html
+    assert 'data-region="us-east-1"' in html

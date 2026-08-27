@@ -55,7 +55,6 @@
   </p>
 
   <div class="row mt">
-    <button onclick="probeAccount()">账号探测 / 配额</button>
     <button onclick="testProxy()">测试代理连通性</button>
     <span style="flex:1"></span>
     <button id="cancel-btn" onclick="resetForm()" style="display:none">取消编辑</button>
@@ -89,16 +88,25 @@
 <div class="card">
   <h2>已添加的账号</h2>
   {% if accounts %}
+  <div class="row" style="margin-bottom:12px">
+    <button class="sm" onclick="probeAll()">检测全部账号</button>
+    <span class="hint" style="margin:0">
+      检测会实调 AWS API 查账号状态、vCPU 配额和当前用量
+    </span>
+  </div>
   <table>
     <thead>
       <tr>
         <th>备注名</th><th>Access Key</th><th>默认区域</th>
-        <th>出站代理</th><th>备注</th><th style="width:150px">操作</th>
+        <th>出站代理</th>
+        <th style="width:200px">状态</th>
+        <th style="width:150px">vCPU 配额 / 已用</th>
+        <th style="width:190px">操作</th>
       </tr>
     </thead>
     <tbody>
       {% for a in accounts %}
-      <tr>
+      <tr data-account="{{ a.id }}" data-region="{{ a.region }}">
         <td>{{ a.label }}</td>
         <td class="mono">{{ a.masked() }}</td>
         <td class="mono">{{ a.region }}</td>
@@ -106,8 +114,10 @@
           {% if a.proxy %}<span class="tag ok">{{ a.masked_proxy() }}</span>
           {% else %}<span class="tag">直连</span>{% endif %}
         </td>
-        <td>{{ a.note or '-' }}</td>
+        <td class="probe-status"><span class="hint">未检测</span></td>
+        <td class="probe-quota mono"><span class="hint">—</span></td>
         <td>
+          <button class="sm" onclick="probeAccount({{ a.id }}, '{{ a.region }}')">检测</button>
           <button class="sm" onclick="editAccount({{ a.id }})">编辑</button>
           <button class="sm danger" onclick="delAccount({{ a.id }})">删除</button>
         </td>
@@ -222,49 +232,107 @@ async function submitAccount() {
   }
 }
 
-async function probeAccount() {
-  const id = F('edit_id').value;
-  if (!id) return toast('请先点某个账号的「编辑」，再执行探测', 'err');
-  const region = F('acct_region').value;
+async function probeAccount(id, region) {
+  // 不带参数时兼容旧入口：用编辑区当前选中的账号
+  if (id === undefined) {
+    id = F('edit_id').value;
+    if (!id) return toast('请点某个账号那一行的「检测」按钮', 'err');
+    region = F('acct_region').value;
+  }
 
-  toast('正在探测账号（会真实调用 AWS API）…');
+  const row = document.querySelector(`tr[data-account="${id}"]`);
+  const statusCell = row ? row.querySelector('.probe-status') : null;
+  const quotaCell = row ? row.querySelector('.probe-quota') : null;
+  if (statusCell) statusCell.innerHTML = '<span class="hint">检测中…</span>';
+  if (quotaCell) quotaCell.innerHTML = '<span class="hint">…</span>';
+
   try {
     const d = await api(`/api/probe-account?account_id=${id}&region=${region}`);
-    F('probe-card').style.display = 'block';
-
-    F('probe-rows').innerHTML = d.checks.map(c => `
-      <tr>
-        <td>${escapeHtml(c.name)}</td>
-        <td><span class="tag ${c.ok ? 'ok' : 'err'}">${c.ok ? '通过' : '未通过'}</span></td>
-        <td class="mono" style="font-size:12px">${escapeHtml(c.detail)}</td>
-      </tr>`).join('');
-
-    F('quota-rows').innerHTML = d.quotas.length
-      ? d.quotas.map(q => `
-        <tr>
-          <td>${escapeHtml(q.label)}</td>
-          <td class="mono"><span class="tag ${q.value > 0 ? 'ok' : 'err'}">${q.value}</span></td>
-        </tr>`).join('')
-      : '<tr><td class="hint">读不到配额（可能缺 servicequotas:GetServiceQuota）</td></tr>';
-
-    const u = d.usage;
-    const rows = [
-      ['运行中实例', u.running_instances],
-      ['运行中 vCPU', u.running_vcpus],
-      ['已停止实例', u.stopped_instances],
-      ['EBS 卷', `${u.volumes} 个 / ${u.volume_gib} GiB`],
-      ['弹性 IP', `${u.addresses} 个（空闲 ${u.idle_addresses}）`],
-    ];
-    F('usage-rows').innerHTML = rows.map(([k, v]) => {
-      const warn = (k === '弹性 IP' && u.idle_addresses > 0) || (k === '已停止实例' && u.stopped_instances > 0);
-      return `<tr><td>${k}</td><td class="mono">${warn ? '<span class="tag warn">' + escapeHtml(String(v)) + '</span>' : escapeHtml(String(v))}</td></tr>`;
-    }).join('');
-
-    toast(d.healthy ? '探测通过，账号可用' : '探测发现问题，见下方结果', d.healthy ? 'ok' : 'err');
-    F('probe-card').scrollIntoView({ behavior: 'smooth' });
+    renderRowSummary(statusCell, quotaCell, d);
+    renderProbeDetail(d);
+    return d;
   } catch (e) {
+    if (statusCell) {
+      statusCell.innerHTML = '<span class="tag err">检测失败</span>';
+    }
+    if (quotaCell) quotaCell.innerHTML = '<span class="hint">—</span>';
     toast(e.message, 'err');
+    return null;
   }
+}
+
+// 表格里只放最关键的两项：整体状态和 vCPU 配额/已用
+function renderRowSummary(statusCell, quotaCell, d) {
+  if (statusCell) {
+    const failed = d.checks.filter(c => !c.ok).map(c => c.name);
+    statusCell.innerHTML = d.healthy
+      ? '<span class="tag ok">正常</span>'
+      : `<span class="tag err">异常</span> <span class="hint">${escapeHtml(failed.join('、'))}</span>`;
+  }
+  if (!quotaCell) return;
+
+  const standard = d.quotas.find(q => q.key === 'standard');
+  if (!standard) {
+    quotaCell.innerHTML = '<span class="hint">读不到配额</span>';
+    return;
+  }
+  const limit = standard.value;
+  const used = d.usage.running_vcpus;
+  // 配额为 0 是账号未激活或被限制的明确信号
+  const cls = limit === 0 ? 'err' : (used >= limit ? 'warn' : 'ok');
+  quotaCell.innerHTML =
+    `<span class="tag ${cls}">${used} / ${limit}</span>`
+    + (limit === 0 ? ' <span class="hint">账号受限</span>' : '');
+}
+
+function renderProbeDetail(d) {
+  F('probe-card').style.display = 'block';
+  F('probe-rows').innerHTML = d.checks.map(c => `
+    <tr>
+      <td>${escapeHtml(c.name)}</td>
+      <td><span class="tag ${c.ok ? 'ok' : 'err'}">${c.ok ? '通过' : '未通过'}</span></td>
+      <td class="mono" style="font-size:12px">${escapeHtml(c.detail)}</td>
+    </tr>`).join('');
+
+  F('quota-rows').innerHTML = d.quotas.length
+    ? d.quotas.map(q => `
+      <tr>
+        <td>${escapeHtml(q.label)}</td>
+        <td class="mono"><span class="tag ${q.value > 0 ? 'ok' : 'err'}">${q.value}</span></td>
+      </tr>`).join('')
+    : '<tr><td class="hint">读不到配额（可能缺 servicequotas:GetServiceQuota）</td></tr>';
+
+  const u = d.usage;
+  const rows = [
+    ['运行中实例', u.running_instances],
+    ['运行中 vCPU', u.running_vcpus],
+    ['已停止实例', u.stopped_instances],
+    ['EBS 卷', `${u.volumes} 个 / ${u.volume_gib} GiB`],
+    ['弹性 IP', `${u.addresses} 个（空闲 ${u.idle_addresses}）`],
+  ];
+  F('usage-rows').innerHTML = rows.map(([k, v]) => {
+    const warn = (k === '弹性 IP' && u.idle_addresses > 0)
+      || (k === '已停止实例' && u.stopped_instances > 0);
+    return `<tr><td>${k}</td><td class="mono">${
+      warn ? '<span class="tag warn">' + escapeHtml(String(v)) + '</span>' : escapeHtml(String(v))
+    }</td></tr>`;
+  }).join('');
+
+  toast(d.healthy ? '检测通过，账号可用' : '检测发现问题，见下方明细', d.healthy ? 'ok' : 'err');
+}
+
+async function probeAll() {
+  const rows = [...document.querySelectorAll('tr[data-account]')];
+  if (!rows.length) return toast('还没有账号', 'err');
+
+  toast(`正在依次检测 ${rows.length} 个账号…`);
+  let bad = 0;
+  for (const row of rows) {
+    const d = await probeAccount(row.dataset.account, row.dataset.region);
+    if (!d || !d.healthy) bad++;
+  }
+  toast(bad ? `${rows.length} 个账号中 ${bad} 个有问题` : '全部账号正常',
+        bad ? 'err' : 'ok');
 }
 
 async function testProxy() {
