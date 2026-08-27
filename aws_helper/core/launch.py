@@ -104,7 +104,7 @@ def launch(
         image_id = req.image_id
     else:
         progress("正在解析镜像 AMI")
-        image_id = aws.resolve_ami(session, req.image_key)
+        image_id = aws.resolve_ami(session, req.image_key, creds, req.region)
 
     progress("正在准备密钥对")
     key_name, private_key = _ensure_key_pair(session, req)

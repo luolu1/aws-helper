@@ -59,6 +59,22 @@ AWS EC2 管理面板。一键开机、换 IP、开机脚本注入，附带按账
 如果你的判断标准比端口连通性更精确（比如从境内节点探测、或检测特定服务响应），
 建议关掉自动换 IP，改用外部监控调用面板的换 IP 接口。
 
+**镜像解析用官方 SSM 公共参数**
+
+Ubuntu / Amazon Linux 的 AMI ID 优先通过发行方发布的 SSM 公共参数解析，
+这是 AWS 与 Canonical [推荐的官方方式](https://documentation.ubuntu.com/aws/aws-how-to/instances/find-ubuntu-images/)：
+
+```
+/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+```
+
+参数由发行方维护，各区域自动解析、始终指向最新版本，不会因为命名规则变更而失效。
+
+拿不到时（IAM 缺 `ssm:GetParameter`、区域无此参数）自动退回 `DescribeImages`
+名称匹配，每个系统配多个候选 pattern 依次尝试。都失败会明确提示可在
+「指定 AMI ID」里手动填。
+
 **安全组默认全部放通**
 
 新建实例的安全组默认对 `0.0.0.0/0` 开放**全部端口和全部协议**（IPv6 双栈时同时开 `::/0`），

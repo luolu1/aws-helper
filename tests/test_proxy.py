@@ -289,7 +289,7 @@ def test_launch_through_proxy(moto_endpoint, creds, monkeypatch):
     monkeypatch.setitem(
         aws.IMAGES,
         "ubuntu-24.04",
-        aws.ImageSpec("moto", img["OwnerId"], img["Name"]),
+        aws.ImageSpec("moto", img["OwnerId"], (img["Name"],)),
     )
 
     with Socks5Server() as proxy:

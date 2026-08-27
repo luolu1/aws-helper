@@ -257,6 +257,10 @@ ec2:DescribeAddresses        ec2:CreateTags               ec2:DescribeVolumes
 `AttachInternetGateway` `CreateRoute` `DescribeRouteTables` `AssociateRouteTable`
 `ModifyVpcAttribute` `ModifySubnetAttribute` `AssociateSubnetCidrBlock` `AssignIpv6Addresses`
 
+另外建议加上 `ssm:GetParameter`。镜像解析优先读发行方发布的 SSM 公共参数
+（AWS 与 Canonical 推荐的官方方式，各区域自动解析且始终指向最新版本）。
+没有这个权限也能用 —— 会自动退回 `DescribeImages` 名称匹配，只是多一次失败的调用。
+
 ## 凭据存储
 
 AWS Secret Access Key 和代理地址用 Fernet 加密后存 SQLite，页面只显示掩码。

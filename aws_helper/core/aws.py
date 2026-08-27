@@ -381,73 +381,163 @@ INSTANCE_TYPES: dict[str, str] = {
 
 @dataclass(frozen=True)
 class ImageSpec:
-    """镜像查找规则。用 name 通配符 + owner 定位最新 AMI。"""
+    """镜像查找规则。
+
+    优先用发行方发布的 SSM 公共参数（官方推荐方式，各区域自动解析且始终最新），
+    参数不可用时退回 describe_images 的名称通配符。
+    name_patterns 按顺序尝试，因为发行方会变更命名（例如 Canonical 24.04 起
+    从 hvm-ssd 改为 hvm-ssd-gp3）。
+    """
 
     label: str
     owner: str
-    name_pattern: str
+    name_patterns: tuple[str, ...]
+    ssm_parameter: str | None = None
     arch: str = "x86_64"
     ssh_user: str = "ubuntu"
 
 
 IMAGES: dict[str, ImageSpec] = {
     "ubuntu-24.04": ImageSpec(
-        "Ubuntu 24.04 LTS",
-        "099720109477",
-        "ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*",
-        ssh_user="ubuntu",
-    ),
-    "ubuntu-22.04": ImageSpec(
-        "Ubuntu 22.04 LTS",
-        "099720109477",
-        "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
+        label="Ubuntu 24.04 LTS",
+        owner="099720109477",
+        ssm_parameter=(
+            "/aws/service/canonical/ubuntu/server/24.04/stable/current"
+            "/amd64/hvm/ebs-gp3/ami-id"
+        ),
+        name_patterns=(
+            "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*",
+            "ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-*",
+            "ubuntu/images/hvm-ssd*/ubuntu-noble-*-amd64-server-*",
+        ),
         ssh_user="ubuntu",
     ),
     "ubuntu-24.04-arm": ImageSpec(
-        "Ubuntu 24.04 LTS (ARM64)",
-        "099720109477",
-        "ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-arm64-server-*",
+        label="Ubuntu 24.04 LTS (ARM64)",
+        owner="099720109477",
+        ssm_parameter=(
+            "/aws/service/canonical/ubuntu/server/24.04/stable/current"
+            "/arm64/hvm/ebs-gp3/ami-id"
+        ),
+        name_patterns=(
+            "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*",
+            "ubuntu/images/hvm-ssd/ubuntu-noble-24.04-arm64-server-*",
+            "ubuntu/images/hvm-ssd*/ubuntu-noble-*-arm64-server-*",
+        ),
+        arch="arm64",
+        ssh_user="ubuntu",
+    ),
+    "ubuntu-22.04": ImageSpec(
+        label="Ubuntu 22.04 LTS",
+        owner="099720109477",
+        ssm_parameter=(
+            "/aws/service/canonical/ubuntu/server/22.04/stable/current"
+            "/amd64/hvm/ebs-gp2/ami-id"
+        ),
+        name_patterns=(
+            "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
+            "ubuntu/images/hvm-ssd*/ubuntu-jammy-*-amd64-server-*",
+        ),
+        ssh_user="ubuntu",
+    ),
+    "ubuntu-22.04-arm": ImageSpec(
+        label="Ubuntu 22.04 LTS (ARM64)",
+        owner="099720109477",
+        ssm_parameter=(
+            "/aws/service/canonical/ubuntu/server/22.04/stable/current"
+            "/arm64/hvm/ebs-gp2/ami-id"
+        ),
+        name_patterns=(
+            "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*",
+            "ubuntu/images/hvm-ssd*/ubuntu-jammy-*-arm64-server-*",
+        ),
         arch="arm64",
         ssh_user="ubuntu",
     ),
     "debian-12": ImageSpec(
-        "Debian 12",
-        "136693071363",
-        "debian-12-amd64-*",
+        label="Debian 12",
+        owner="136693071363",
+        name_patterns=("debian-12-amd64-*",),
+        ssh_user="admin",
+    ),
+    "debian-12-arm": ImageSpec(
+        label="Debian 12 (ARM64)",
+        owner="136693071363",
+        name_patterns=("debian-12-arm64-*",),
+        arch="arm64",
         ssh_user="admin",
     ),
     "debian-11": ImageSpec(
-        "Debian 11",
-        "136693071363",
-        "debian-11-amd64-*",
+        label="Debian 11",
+        owner="136693071363",
+        name_patterns=("debian-11-amd64-*",),
         ssh_user="admin",
     ),
     "al2023": ImageSpec(
-        "Amazon Linux 2023",
-        "137112412989",
-        "al2023-ami-2023*-x86_64",
+        label="Amazon Linux 2023",
+        owner="137112412989",
+        ssm_parameter="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        name_patterns=("al2023-ami-2023*-x86_64",),
+        ssh_user="ec2-user",
+    ),
+    "al2023-arm": ImageSpec(
+        label="Amazon Linux 2023 (ARM64)",
+        owner="137112412989",
+        ssm_parameter="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
+        name_patterns=("al2023-ami-2023*-arm64",),
+        arch="arm64",
         ssh_user="ec2-user",
     ),
 }
 
 
-def resolve_ami(session: Any, image_key: str) -> str:
-    """按名称通配符查最新 AMI ID。找不到时抛 LookupError。"""
+def _resolve_via_ssm(creds: Credentials, region: str, parameter: str) -> str | None:
+    """用 SSM 公共参数解析 AMI ID。这是 AWS 与发行方推荐的官方方式。
+
+    失败原因很多（IAM 缺 ssm:GetParameter、区域无此参数、endpoint 不支持），
+    任何失败都返回 None 交给名称匹配兜底，不阻断开机。
+    """
+    try:
+        ssm = client("ssm", creds, region)
+        value = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
+    except Exception:
+        return None
+    return value if value.startswith("ami-") else None
+
+
+def resolve_ami(
+    session: Any,
+    image_key: str,
+    creds: Credentials | None = None,
+    region: str | None = None,
+) -> str:
+    """解析镜像 AMI ID。先试 SSM 公共参数，再退回名称通配符。"""
     spec = IMAGES.get(image_key)
     if spec is None:
         raise LookupError(f"未知镜像: {image_key}")
 
-    resp = session.describe_images(
-        Owners=[spec.owner],
-        Filters=[
-            {"Name": "name", "Values": [spec.name_pattern]},
-            {"Name": "state", "Values": ["available"]},
-        ],
-    )
-    images = resp.get("Images", [])
-    if not images:
-        raise LookupError(
-            f"区域内找不到镜像 {spec.label}（pattern={spec.name_pattern}）"
+    if spec.ssm_parameter and creds is not None:
+        ami = _resolve_via_ssm(creds, region or creds.region, spec.ssm_parameter)
+        if ami:
+            return ami
+
+    tried: list[str] = []
+    for pattern in spec.name_patterns:
+        resp = session.describe_images(
+            Owners=[spec.owner],
+            Filters=[
+                {"Name": "name", "Values": [pattern]},
+                {"Name": "state", "Values": ["available"]},
+            ],
         )
-    images.sort(key=lambda i: i.get("CreationDate", ""), reverse=True)
-    return images[0]["ImageId"]
+        images = resp.get("Images", [])
+        if images:
+            images.sort(key=lambda i: i.get("CreationDate", ""), reverse=True)
+            return images[0]["ImageId"]
+        tried.append(pattern)
+
+    hint = "；".join(tried)
+    raise LookupError(
+        f"区域内找不到 {spec.label}。已尝试 SSM 公共参数和以下名称匹配：{hint}。"
+        "可在开机表单的「指定 AMI ID」里手动填一个该区域可用的 AMI"
+    )

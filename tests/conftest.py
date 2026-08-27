@@ -56,7 +56,7 @@ def ubuntu_ami(mock_ec2, creds, monkeypatch):
     spec = aws.ImageSpec(
         label="moto-test-image",
         owner=img["OwnerId"],
-        name_pattern=img["Name"],
+        name_patterns=(img["Name"],),
         ssh_user="ubuntu",
     )
     monkeypatch.setitem(aws.IMAGES, "ubuntu-24.04", spec)
