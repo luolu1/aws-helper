@@ -64,6 +64,7 @@ class LaunchResult:
     security_group_id: str
     ssh_user: str
     state: str
+    os_family: str = "linux"
 
 
 class LaunchError(RuntimeError):
@@ -85,17 +86,34 @@ def launch(
     if spec is None and not req.image_id:
         raise LaunchError(f"未知镜像: {req.image_key}")
     ssh_user = spec.ssh_user if spec else "ubuntu"
+    is_windows = bool(spec and spec.is_windows)
 
     # 参数校验全部前置：任何 AWS 资源都还没创建，失败时无需清理
-    progress("正在渲染开机脚本")
-    user_data = render(
-        ScriptOptions(
-            custom_script=req.script,
-            root_password=req.root_password,
-            hostname=req.name if req.set_hostname else None,
-            packages=req.packages,
+    if is_windows:
+        # Windows 的 cloud-init 是 EC2Launch，不吃 bash 脚本；
+        # 静默注入一段无效脚本比直接报错更难排查。
+        if req.root_password:
+            raise LaunchError(
+                "Windows 镜像不支持设置 root 密码。"
+                "管理员密码由 AWS 生成，开机后用密钥对在控制台解密获取。"
+            )
+        if req.script.strip() or req.packages:
+            raise LaunchError(
+                "Windows 镜像不支持 Linux 开机脚本和 apt/yum 预装包。"
+                "如需自动化请自行在「指定 AMI ID」配合 PowerShell 方案。"
+            )
+        progress("Windows 镜像：跳过 Linux 开机脚本")
+        user_data = ""
+    else:
+        progress("正在渲染开机脚本")
+        user_data = render(
+            ScriptOptions(
+                custom_script=req.script,
+                root_password=req.root_password,
+                hostname=req.name if req.set_hostname else None,
+                packages=req.packages,
+            )
         )
-    )
 
     session = aws.ec2(creds, req.region)
 
@@ -142,6 +160,7 @@ def launch(
                 security_group_id=sg_id,
                 ssh_user=ssh_user,
                 state=info.get("State", {}).get("Name", "unknown"),
+                os_family="windows" if is_windows else "linux",
             )
         )
     progress("开机完成")
@@ -369,8 +388,6 @@ def _run_instances(
         "KeyName": key_name,
         "MinCount": req.count,
         "MaxCount": req.count,
-        # boto3 会自动 base64 编码 UserData
-        "UserData": user_data,
         "BlockDeviceMappings": [
             {
                 "DeviceName": _root_device(session, image_id),
@@ -382,6 +399,10 @@ def _run_instances(
             }
         ],
     }
+
+    # 空 UserData 就别传（Windows 路径），传空串等于给 cloud-init 一份空脚本
+    if user_data:
+        params["UserData"] = user_data
 
     tags = [{"Key": "Name", "Value": req.name}, {"Key": "ManagedBy", "Value": "aws-helper"}]
     tags += [{"Key": k, "Value": v} for k, v in req.tags.items()]

@@ -9,20 +9,20 @@
 <div class="card">
   <h2>一键开机</h2>
   <p class="hint">
-    只填名称就能开：其余全部用默认值（Ubuntu 24.04 / t3.micro / 16GB / 只开 22 端口）。
-    工具会自动解析最新 AMI、创建密钥对并保存私钥、创建安全组、等待公网 IP。
+    按「系统类别 → 架构 → 镜像 → 规格」逐级选择。镜像 AMI 和实例规格都是
+    <strong>实时从该区域的 AWS API 拉取</strong>，不会出现选了却开不出来的情况。
   </p>
 
   <div class="grid g3">
     <label class="f">
       <span>账号</span>
-      <select id="account_id">
+      <select id="account_id" onchange="loadCatalog()">
         {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
       </select>
     </label>
     <label class="f">
       <span>区域</span>
-      <select id="region">
+      <select id="region" onchange="loadCatalog()">
         {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
       </select>
     </label>
@@ -34,21 +34,34 @@
 
   <div class="grid g4 mt">
     <label class="f">
-      <span>规格</span>
-      <select id="instance_type">
-        {% for code, desc in types.items() %}
-        <option value="{{ code }}" {% if code == 't3.micro' %}selected{% endif %}>{{ code }} — {{ desc }}</option>
+      <span>① 系统类别</span>
+      <select id="os_family" onchange="loadCatalog()">
+        {% for key, label in os_families.items() %}
+        <option value="{{ key }}">{{ label }}</option>
         {% endfor %}
       </select>
     </label>
     <label class="f">
-      <span>镜像</span>
-      <select id="image_key">
-        {% for key, spec in images.items() %}
-        <option value="{{ key }}" {% if key == 'ubuntu-24.04' %}selected{% endif %}>{{ spec.label }}</option>
+      <span>② 架构</span>
+      <select id="arch" onchange="loadCatalog()">
+        {% for key, label in architectures.items() %}
+        <option value="{{ key }}">{{ label }}</option>
         {% endfor %}
       </select>
     </label>
+    <label class="f">
+      <span>③ 镜像</span>
+      <select id="image_key"><option value="">加载中…</option></select>
+    </label>
+    <label class="f">
+      <span>④ 规格<span id="type_count" class="hint"></span></span>
+      <select id="instance_type"><option value="">加载中…</option></select>
+    </label>
+  </div>
+
+  <p class="hint" id="catalog-hint"></p>
+
+  <div class="grid g2 mt">
     <label class="f">
       <span>磁盘 (GB)</span>
       <input type="number" id="disk_size" value="16" min="8" max="1024">
@@ -79,6 +92,12 @@
     <input type="text" id="image_id" placeholder="ami-0123456789abcdef0">
   </label>
 
+  <p class="hint mt" id="win-note" style="display:none">
+    <span class="tag warn">Windows</span>
+    管理员密码由 AWS 生成，开机后在控制台用密钥对解密获取，登录方式是 RDP（3389 端口）。
+    Linux 开机脚本、root 密码、apt 预装包对 Windows 无效，已自动禁用。
+  </p>
+
   <div class="row mt">
     <label class="chk"><input type="checkbox" id="enable_ipv6"> 分配 IPv6（自建 VPC + IGW + 双栈路由）</label>
     <label class="chk">
@@ -93,11 +112,11 @@
   </p>
 </div>
 
-<div class="card">
+<div class="card" id="linux-only-card">
   <h2>开机脚本</h2>
   <p class="hint">
     首次启动时由 cloud-init 以 root 执行，不要写 <span class="mono">#!/bin/bash</span> 开头。
-    可以先「预览」看最终生成的完整脚本。
+    可以先「预览」看最终生成的完整脚本。仅对 Linux 生效。
   </p>
 
   {% if scripts %}
@@ -144,6 +163,76 @@ systemctl enable --now docker"></textarea>
 
 {% block script %}
 <script>
+let CATALOG = null;
+
+async function loadCatalog() {
+  const accountId = document.getElementById('account_id').value;
+  const region = document.getElementById('region').value;
+  const osFamily = document.getElementById('os_family').value;
+  const arch = document.getElementById('arch').value;
+
+  const imgSel = document.getElementById('image_key');
+  const typeSel = document.getElementById('instance_type');
+  imgSel.innerHTML = '<option value="">加载中…</option>';
+  typeSel.innerHTML = '<option value="">加载中…</option>';
+  document.getElementById('type_count').textContent = '';
+
+  try {
+    const d = await api(`/api/catalog?account_id=${accountId}&region=${region}`
+      + `&os_family=${osFamily}&arch=${arch}`);
+    CATALOG = d;
+
+    if (!d.images.length) {
+      imgSel.innerHTML = '<option value="">该组合下没有可用镜像</option>';
+    } else {
+      imgSel.innerHTML = d.images
+        .map(i => `<option value="${escapeHtml(i.key)}">${escapeHtml(i.label)}</option>`)
+        .join('');
+    }
+
+    if (!d.instance_types.length) {
+      typeSel.innerHTML = '<option value="">该区域没有此架构的规格</option>';
+    } else {
+      typeSel.innerHTML = d.instance_types.map(t => {
+        const tag = t.free_tier ? '（免费额度）' : '';
+        return `<option value="${escapeHtml(t.name)}">${escapeHtml(t.label)}${tag}</option>`;
+      }).join('');
+      // 默认选一个小规格，免费额度优先
+      const free = d.instance_types.find(t => t.free_tier);
+      typeSel.value = (free || d.instance_types[0]).name;
+    }
+
+    document.getElementById('type_count').textContent =
+      d.instance_types.length ? `（该区域 ${d.instance_types.length} 种）` : '';
+    document.getElementById('catalog-hint').innerHTML = d.degraded
+      ? '<span class="tag warn">规格清单拉取失败，已降级为内置列表</span> 建议给 IAM 加 ec2:DescribeInstanceTypes'
+      : '';
+    applyOsMode(d.is_windows);
+  } catch (e) {
+    imgSel.innerHTML = '<option value="">加载失败</option>';
+    typeSel.innerHTML = '<option value="">加载失败</option>';
+    document.getElementById('catalog-hint').innerHTML =
+      '<span class="tag err">' + escapeHtml(e.message) + '</span>';
+  }
+}
+
+// Windows 不吃 bash 开机脚本和 root 密码，相关字段直接隐藏
+function applyOsMode(isWindows) {
+  const linuxOnly = document.getElementById('linux-only-card');
+  if (linuxOnly) linuxOnly.style.display = isWindows ? 'none' : '';
+  const rootPw = document.getElementById('root_password');
+  const pkgs = document.getElementById('packages');
+  [rootPw, pkgs].forEach(el => {
+    if (!el) return;
+    el.disabled = isWindows;
+    if (isWindows) el.value = '';
+  });
+  const note = document.getElementById('win-note');
+  if (note) note.style.display = isWindows ? '' : 'none';
+}
+
+document.addEventListener('DOMContentLoaded', loadCatalog);
+
 function togglePorts() {
   const all = document.getElementById('allow_all_ports').checked;
   document.getElementById('open_ports').disabled = all;
@@ -163,6 +252,7 @@ function applyTpl() {
 }
 
 function collect() {
+  const isWindows = document.getElementById('os_family').value === 'windows';
   const ports = document.getElementById('open_ports').value
     .split(',').map(s => parseInt(s.trim(), 10)).filter(n => n >= 1 && n <= 65535);
   return {
@@ -177,9 +267,12 @@ function collect() {
     open_ports: ports.length ? ports : [22],
     allow_all_ports: document.getElementById('allow_all_ports').checked,
     enable_ipv6: document.getElementById('enable_ipv6').checked,
-    script: document.getElementById('script').value,
-    root_password: document.getElementById('root_password').value.trim(),
-    packages: document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean)
+    // Windows 不吃这三项，即使残留也不发送
+    script: isWindows ? '' : document.getElementById('script').value,
+    root_password: isWindows ? '' : document.getElementById('root_password').value.trim(),
+    packages: isWindows
+      ? []
+      : document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean)
   };
 }
 
@@ -218,9 +311,14 @@ async function doLaunch() {
 function showResult(list, cfg) {
   document.getElementById('result-card').style.display = 'block';
   document.getElementById('result-rows').innerHTML = list.map(i => {
-    const ssh = i.public_ip
-      ? `ssh -i ${i.key_name}.pem ${i.ssh_user}@${i.public_ip}`
-      : '（无公网 IP）';
+    let ssh;
+    if (!i.public_ip) {
+      ssh = '（无公网 IP）';
+    } else if (i.os_family === 'windows') {
+      ssh = `RDP ${i.public_ip}:3389（密码需在控制台用密钥解密）`;
+    } else {
+      ssh = `ssh -i ${i.key_name}.pem ${i.ssh_user}@${i.public_ip}`;
+    }
     return `<tr>
       <td>${escapeHtml(i.name)}</td>
       <td class="mono">${escapeHtml(i.instance_id)}</td>
@@ -231,10 +329,14 @@ function showResult(list, cfg) {
   }).join('');
 
   const withKey = list.find(i => i.has_private_key);
-  document.getElementById('key-hint').innerHTML = withKey
-    ? `私钥已加密保存。下载：<a href="/api/keypairs/${cfg.account_id}/${cfg.region}/${encodeURIComponent(withKey.key_name)}" target="_blank">${escapeHtml(withKey.key_name)}</a>
-       （AWS 只在创建时返回一次私钥，请及时保存到本地并 chmod 600）`
+  const isWin = list.some(i => i.os_family === 'windows');
+  let hint = withKey
+    ? `私钥已加密保存。下载：<a href="/api/keypairs/${cfg.account_id}/${cfg.region}/${encodeURIComponent(withKey.key_name)}" target="_blank">${escapeHtml(withKey.key_name)}</a>`
     : '使用了已有密钥对，私钥请用你本地已有的那份。';
+  hint += isWin
+    ? '（Windows 用这个私钥在 EC2 控制台「获取 Windows 密码」处解密出 Administrator 密码）'
+    : '（AWS 只在创建时返回一次私钥，请及时保存到本地并 chmod 600）';
+  document.getElementById('key-hint').innerHTML = hint;
 }
 
 function onProgressClose() {}

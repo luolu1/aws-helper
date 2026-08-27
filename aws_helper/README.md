@@ -257,9 +257,15 @@ ec2:DescribeAddresses        ec2:CreateTags               ec2:DescribeVolumes
 `AttachInternetGateway` `CreateRoute` `DescribeRouteTables` `AssociateRouteTable`
 `ModifyVpcAttribute` `ModifySubnetAttribute` `AssociateSubnetCidrBlock` `AssignIpv6Addresses`
 
-另外建议加上 `ssm:GetParameter`。镜像解析优先读发行方发布的 SSM 公共参数
-（AWS 与 Canonical 推荐的官方方式，各区域自动解析且始终指向最新版本）。
-没有这个权限也能用 —— 会自动退回 `DescribeImages` 名称匹配，只是多一次失败的调用。
+另外建议加上两个权限：
+
+| 权限 | 用途 | 缺失后果 |
+|---|---|---|
+| `ssm:GetParameter` | 读发行方发布的官方 AMI 参数 | 退回 `DescribeImages` 名称匹配；Windows 镜像不可用 |
+| `ec2:DescribeInstanceTypes` | 拉该区域真实支持的实例规格 | 降级为内置清单，可能选到该区域不支持的规格 |
+
+两者都是可选的，缺失时功能降级但不中断。Windows 镜像强依赖 `ssm:GetParameter` ——
+Windows AMI 在 `DescribeImages` 里不可靠（实测 ap-east-1 返回 0 条）。
 
 ## 凭据存储
 

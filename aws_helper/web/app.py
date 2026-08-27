@@ -204,11 +204,54 @@ def launch_page(request: Request, _: None = Guard):
         "launch.html",
         {
             **_page_ctx("launch"),
-            "images": aws.IMAGES,
-            "types": aws.INSTANCE_TYPES,
+            "os_families": aws.OS_FAMILIES,
+            "architectures": aws.ARCHITECTURES,
             "scripts": store.list_scripts(),
         },
     )
+
+
+@app.get("/api/catalog")
+def api_catalog(
+    account_id: int,
+    region: str,
+    os_family: str = "linux",
+    arch: str = "x86_64",
+    _: None = Guard,
+):
+    """返回该区域真实可用的镜像与规格，供级联选择使用。
+
+    规格来自 DescribeInstanceTypes（各区域支持的规格不同，写死的清单
+    必然出现"选了但开不出来"）。拉取失败时降级到内置清单并标注。
+    """
+    if os_family not in aws.OS_FAMILIES:
+        raise HTTPException(400, f"未知系统类别: {os_family}")
+    if arch not in aws.ARCHITECTURES:
+        raise HTTPException(400, f"未知架构: {arch}")
+
+    creds = store.credentials(account_id, region)
+    images = [
+        {"key": key, "label": spec.label, "ssh_user": spec.ssh_user}
+        for key, spec in aws.images_by_os_arch(os_family, arch).items()
+    ]
+
+    degraded = False
+    try:
+        types = aws.list_instance_types(creds, region, arch)
+    except Exception as exc:
+        degraded = True
+        types = aws.fallback_instance_types(arch)
+        store.log("catalog", region, False, f"拉取规格失败，已降级: {exc}")
+
+    return {
+        "ok": True,
+        "os_family": os_family,
+        "arch": arch,
+        "images": images,
+        "instance_types": types,
+        "degraded": degraded,
+        "is_windows": os_family == "windows",
+    }
 
 
 @app.get("/scripts", response_class=HTMLResponse)
@@ -607,6 +650,7 @@ async def api_launch(request: Request, _: None = Guard):
                     "key_name": r.key_name,
                     "has_private_key": bool(r.private_key),
                     "state": r.state,
+                    "os_family": r.os_family,
                 }
                 for r in results
             ]

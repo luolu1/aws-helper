@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -356,37 +357,116 @@ REGIONS: dict[str, str] = {
     "sa-east-1": "南美（圣保罗）",
 }
 
-# 常用规格。value 为展示文本
-INSTANCE_TYPES: dict[str, str] = {
-    "t3.nano": "2 vCPU / 0.5 GiB",
-    "t3.micro": "2 vCPU / 1 GiB（免费额度）",
-    "t3.small": "2 vCPU / 2 GiB",
-    "t3.medium": "2 vCPU / 4 GiB",
-    "t3.large": "2 vCPU / 8 GiB",
-    "t3a.micro": "2 vCPU / 1 GiB",
-    "t3a.small": "2 vCPU / 2 GiB",
-    "t3a.medium": "2 vCPU / 4 GiB",
-    "t2.micro": "1 vCPU / 1 GiB（免费额度）",
-    "t2.small": "1 vCPU / 2 GiB",
-    "t2.medium": "2 vCPU / 4 GiB",
-    "c5.large": "2 vCPU / 4 GiB",
-    "c5.xlarge": "4 vCPU / 8 GiB",
-    "c6i.large": "2 vCPU / 4 GiB",
-    "m6i.large": "2 vCPU / 8 GiB",
-    "t4g.micro": "2 vCPU / 1 GiB（ARM）",
-    "t4g.small": "2 vCPU / 2 GiB（ARM）",
-    "c6g.large": "2 vCPU / 4 GiB（ARM）",
+# 无法调用 DescribeInstanceTypes 时的兜底清单，仅作降级用。
+# 正常路径是 list_instance_types() 直接问 AWS 该区域真实支持什么。
+FALLBACK_INSTANCE_TYPES: dict[str, list[str]] = {
+    "x86_64": [
+        "t3.nano", "t3.micro", "t3.small", "t3.medium", "t3.large",
+        "t3a.micro", "t3a.small", "t3a.medium",
+        "t2.micro", "t2.small", "t2.medium",
+        "c5.large", "c6i.large", "m6i.large",
+    ],
+    "arm64": [
+        "t4g.nano", "t4g.micro", "t4g.small", "t4g.medium", "t4g.large",
+        "c6g.medium", "c6g.large", "c7g.medium", "m6g.medium",
+    ],
+}
+
+# 规格清单按 (region, arch) 缓存。DescribeInstanceTypes 要翻 4 页拉近 400 条，
+# 每次开开机页都拉一遍太慢。
+_TYPE_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+_TYPE_CACHE_TTL = 3600
+
+
+def list_instance_types(
+    creds: Credentials,
+    region: str,
+    arch: str = "x86_64",
+    use_cache: bool = True,
+) -> list[dict[str, Any]]:
+    """列出该区域真实支持的实例规格，按内存和 vCPU 升序。
+
+    直接问 DescribeInstanceTypes，而不是维护一份写死的清单 ——
+    各区域支持的规格不同，写死的清单必然出现"选了但开不出来"。
+    """
+    if arch not in ARCHITECTURES:
+        raise ValueError(f"未知架构: {arch}")
+
+    key = (region, arch)
+    now = time.time()
+    if use_cache and key in _TYPE_CACHE:
+        cached_at, cached = _TYPE_CACHE[key]
+        if now - cached_at < _TYPE_CACHE_TTL:
+            return cached
+
+    session = ec2(creds, region)
+    out: list[dict[str, Any]] = []
+    token: str | None = None
+    while True:
+        params: dict[str, Any] = {
+            "MaxResults": 100,
+            "Filters": [{"Name": "processor-info.supported-architecture", "Values": [arch]}],
+        }
+        if token:
+            params["NextToken"] = token
+        resp = session.describe_instance_types(**params)
+        for item in resp.get("InstanceTypes", []):
+            mib = item["MemoryInfo"]["SizeInMiB"]
+            vcpu = item["VCpuInfo"]["DefaultVCpus"]
+            gib = mib / 1024
+            out.append(
+                {
+                    "name": item["InstanceType"],
+                    "vcpu": vcpu,
+                    "memory_gib": round(gib, 2),
+                    "label": f"{item['InstanceType']} — {vcpu} vCPU / {gib:g} GiB",
+                    "free_tier": bool(item.get("FreeTierEligible")),
+                    "current_gen": bool(item.get("CurrentGeneration")),
+                }
+            )
+        token = resp.get("NextToken")
+        if not token:
+            break
+
+    out.sort(key=lambda t: (t["memory_gib"], t["vcpu"], t["name"]))
+    _TYPE_CACHE[key] = (now, out)
+    return out
+
+
+def fallback_instance_types(arch: str = "x86_64") -> list[dict[str, Any]]:
+    """DescribeInstanceTypes 不可用时的降级清单。"""
+    return [
+        {
+            "name": name,
+            "vcpu": 0,
+            "memory_gib": 0,
+            "label": f"{name}（未校验）",
+            "free_tier": False,
+            "current_gen": True,
+        }
+        for name in FALLBACK_INSTANCE_TYPES.get(arch, [])
+    ]
+
+
+ARCHITECTURES: dict[str, str] = {
+    "x86_64": "64 位（x86）",
+    "arm64": "64 位（ARM）",
+}
+
+OS_FAMILIES: dict[str, str] = {
+    "linux": "Linux / UNIX",
+    "windows": "Windows",
 }
 
 
 @dataclass(frozen=True)
 class ImageSpec:
-    """镜像查找规则。
+    """镜像条目。
 
-    优先用发行方发布的 SSM 公共参数（官方推荐方式，各区域自动解析且始终最新），
-    参数不可用时退回 describe_images 的名称通配符。
-    name_patterns 按顺序尝试，因为发行方会变更命名（例如 Canonical 24.04 起
-    从 hvm-ssd 改为 hvm-ssd-gp3）。
+    优先用发行方发布的 SSM 公共参数（AWS 与发行方推荐的官方方式，
+    各区域自动解析且始终指向最新版本），参数不可用时退回 describe_images
+    名称匹配。name_patterns 按顺序尝试，因为发行方会变更命名
+    （Canonical 24.04 起从 hvm-ssd 改为 hvm-ssd-gp3）。
     """
 
     label: str
@@ -394,66 +474,62 @@ class ImageSpec:
     name_patterns: tuple[str, ...]
     ssm_parameter: str | None = None
     arch: str = "x86_64"
+    os_family: str = "linux"
     ssh_user: str = "ubuntu"
+
+    @property
+    def is_windows(self) -> bool:
+        return self.os_family == "windows"
+
+
+def _canonical(release: str, codename: str, arch: str, volume: str) -> ImageSpec:
+    """按 Canonical 官方文档构造 Ubuntu 镜像条目。
+
+    参数路径格式见 documentation.ubuntu.com/aws：
+    /aws/service/canonical/ubuntu/server/RELEASE/stable/current/ARCH/hvm/VOL/ami-id
+    """
+    suffix = "arm64" if arch == "arm64" else "amd64"
+    label = f"Ubuntu {release} LTS" + (" (ARM64)" if arch == "arm64" else "")
+    return ImageSpec(
+        label=label,
+        owner="099720109477",
+        ssm_parameter=(
+            f"/aws/service/canonical/ubuntu/server/{release}/stable/current"
+            f"/{suffix}/hvm/{volume}/ami-id"
+        ),
+        name_patterns=(
+            f"ubuntu/images/hvm-ssd-gp3/ubuntu-{codename}-{release}-{suffix}-server-*",
+            f"ubuntu/images/hvm-ssd/ubuntu-{codename}-{release}-{suffix}-server-*",
+            f"ubuntu/images/hvm-ssd*/ubuntu-{codename}-*-{suffix}-server-*",
+        ),
+        arch=arch,
+        ssh_user="ubuntu",
+    )
+
+
+def _windows(key_label: str, parameter_name: str, arch: str = "x86_64") -> ImageSpec:
+    """Windows 镜像走 AWS 官方 ami-windows-latest 参数空间。
+
+    Windows AMI 不在 describe_images 的 Owners=amazon 结果里可靠出现
+    （实测 ap-east-1 返回 0 条），只能靠 SSM 参数，所以没有名称兜底。
+    """
+    return ImageSpec(
+        label=key_label,
+        owner="801119661308",
+        ssm_parameter=f"/aws/service/ami-windows-latest/{parameter_name}",
+        name_patterns=(f"{parameter_name}-*",),
+        arch=arch,
+        os_family="windows",
+        ssh_user="Administrator",
+    )
 
 
 IMAGES: dict[str, ImageSpec] = {
-    "ubuntu-24.04": ImageSpec(
-        label="Ubuntu 24.04 LTS",
-        owner="099720109477",
-        ssm_parameter=(
-            "/aws/service/canonical/ubuntu/server/24.04/stable/current"
-            "/amd64/hvm/ebs-gp3/ami-id"
-        ),
-        name_patterns=(
-            "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*",
-            "ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-*",
-            "ubuntu/images/hvm-ssd*/ubuntu-noble-*-amd64-server-*",
-        ),
-        ssh_user="ubuntu",
-    ),
-    "ubuntu-24.04-arm": ImageSpec(
-        label="Ubuntu 24.04 LTS (ARM64)",
-        owner="099720109477",
-        ssm_parameter=(
-            "/aws/service/canonical/ubuntu/server/24.04/stable/current"
-            "/arm64/hvm/ebs-gp3/ami-id"
-        ),
-        name_patterns=(
-            "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*",
-            "ubuntu/images/hvm-ssd/ubuntu-noble-24.04-arm64-server-*",
-            "ubuntu/images/hvm-ssd*/ubuntu-noble-*-arm64-server-*",
-        ),
-        arch="arm64",
-        ssh_user="ubuntu",
-    ),
-    "ubuntu-22.04": ImageSpec(
-        label="Ubuntu 22.04 LTS",
-        owner="099720109477",
-        ssm_parameter=(
-            "/aws/service/canonical/ubuntu/server/22.04/stable/current"
-            "/amd64/hvm/ebs-gp2/ami-id"
-        ),
-        name_patterns=(
-            "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
-            "ubuntu/images/hvm-ssd*/ubuntu-jammy-*-amd64-server-*",
-        ),
-        ssh_user="ubuntu",
-    ),
-    "ubuntu-22.04-arm": ImageSpec(
-        label="Ubuntu 22.04 LTS (ARM64)",
-        owner="099720109477",
-        ssm_parameter=(
-            "/aws/service/canonical/ubuntu/server/22.04/stable/current"
-            "/arm64/hvm/ebs-gp2/ami-id"
-        ),
-        name_patterns=(
-            "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*",
-            "ubuntu/images/hvm-ssd*/ubuntu-jammy-*-arm64-server-*",
-        ),
-        arch="arm64",
-        ssh_user="ubuntu",
-    ),
+    "ubuntu-24.04": _canonical("24.04", "noble", "x86_64", "ebs-gp3"),
+    "ubuntu-24.04-arm": _canonical("24.04", "noble", "arm64", "ebs-gp3"),
+    "ubuntu-22.04": _canonical("22.04", "jammy", "x86_64", "ebs-gp2"),
+    "ubuntu-22.04-arm": _canonical("22.04", "jammy", "arm64", "ebs-gp2"),
+    "ubuntu-20.04": _canonical("20.04", "focal", "x86_64", "ebs-gp2"),
     "debian-12": ImageSpec(
         label="Debian 12",
         owner="136693071363",
@@ -476,19 +552,51 @@ IMAGES: dict[str, ImageSpec] = {
     "al2023": ImageSpec(
         label="Amazon Linux 2023",
         owner="137112412989",
-        ssm_parameter="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        ssm_parameter=(
+            "/aws/service/ami-amazon-linux-latest"
+            "/al2023-ami-kernel-default-x86_64"
+        ),
         name_patterns=("al2023-ami-2023*-x86_64",),
         ssh_user="ec2-user",
     ),
     "al2023-arm": ImageSpec(
         label="Amazon Linux 2023 (ARM64)",
         owner="137112412989",
-        ssm_parameter="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
+        ssm_parameter=(
+            "/aws/service/ami-amazon-linux-latest"
+            "/al2023-ami-kernel-default-arm64"
+        ),
         name_patterns=("al2023-ami-2023*-arm64",),
         arch="arm64",
         ssh_user="ec2-user",
     ),
+    "windows-2025": _windows(
+        "Windows Server 2025", "Windows_Server-2025-English-Full-Base"
+    ),
+    "windows-2022": _windows(
+        "Windows Server 2022", "Windows_Server-2022-English-Full-Base"
+    ),
+    "windows-2019": _windows(
+        "Windows Server 2019", "Windows_Server-2019-English-Full-Base"
+    ),
+    "windows-2022-cn": _windows(
+        "Windows Server 2022（简体中文）",
+        "Windows_Server-2022-Chinese_Simplified-Full-Base",
+    ),
+    "windows-2019-cn": _windows(
+        "Windows Server 2019（简体中文）",
+        "Windows_Server-2019-Chinese_Simplified-Full-Base",
+    ),
 }
+
+
+def images_by_os_arch(os_family: str, arch: str) -> dict[str, ImageSpec]:
+    """按系统类别和架构筛镜像，供级联选择使用。"""
+    return {
+        key: spec
+        for key, spec in IMAGES.items()
+        if spec.os_family == os_family and spec.arch == arch
+    }
 
 
 def _resolve_via_ssm(creds: Credentials, region: str, parameter: str) -> str | None:
