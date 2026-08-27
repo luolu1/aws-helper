@@ -62,29 +62,6 @@
   </div>
 </div>
 
-<div class="card" id="probe-card" style="display:none">
-  <h2>账号探测结果</h2>
-  <p class="hint">
-    分项检查凭据、账号状态、开机权限和 vCPU 配额。
-    账号被 AWS 封禁时只读接口仍然正常、DryRun 也会通过，只有真实写操作才会暴露 —— 这里会单独标出来。
-  </p>
-  <table>
-    <thead><tr><th style="width:150px">检查项</th><th style="width:70px">结果</th><th>详情</th></tr></thead>
-    <tbody id="probe-rows"></tbody>
-  </table>
-
-  <div class="grid g2 mt">
-    <div>
-      <p class="hint" style="margin:0 0 6px">vCPU 配额</p>
-      <table><tbody id="quota-rows"></tbody></table>
-    </div>
-    <div>
-      <p class="hint" style="margin:0 0 6px">当前用量</p>
-      <table><tbody id="usage-rows"></tbody></table>
-    </div>
-  </div>
-</div>
-
 <div class="card">
   <h2>已添加的账号</h2>
   {% if accounts %}
@@ -121,6 +98,9 @@
           <button class="sm" onclick="editAccount({{ a.id }})">编辑</button>
           <button class="sm danger" onclick="delAccount({{ a.id }})">删除</button>
         </td>
+      </tr>
+      <tr class="probe-detail" data-detail="{{ a.id }}" style="display:none">
+        <td colspan="7" style="background:var(--bg);padding:14px 16px"></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -249,7 +229,9 @@ async function probeAccount(id, region) {
   try {
     const d = await api(`/api/probe-account?account_id=${id}&region=${region}`);
     renderRowSummary(statusCell, quotaCell, d);
-    renderProbeDetail(d);
+    renderProbeDetail(id, d);
+    toast(d.healthy ? '检测通过，账号可用' : '检测发现问题，见该账号下方明细',
+          d.healthy ? 'ok' : 'err');
     return d;
   } catch (e) {
     if (statusCell) {
@@ -285,16 +267,20 @@ function renderRowSummary(statusCell, quotaCell, d) {
     + (limit === 0 ? ' <span class="hint">账号受限</span>' : '');
 }
 
-function renderProbeDetail(d) {
-  F('probe-card').style.display = 'block';
-  F('probe-rows').innerHTML = d.checks.map(c => `
+// 明细直接渲染到该账号那一行下面，多账号并排检测时不会互相覆盖
+function renderProbeDetail(id, d) {
+  const row = document.querySelector(`tr[data-detail="${id}"]`);
+  if (!row) return;
+  const cell = row.querySelector('td');
+
+  const checks = d.checks.map(c => `
     <tr>
-      <td>${escapeHtml(c.name)}</td>
-      <td><span class="tag ${c.ok ? 'ok' : 'err'}">${c.ok ? '通过' : '未通过'}</span></td>
+      <td style="width:120px">${escapeHtml(c.name)}</td>
+      <td style="width:70px"><span class="tag ${c.ok ? 'ok' : 'err'}">${c.ok ? '通过' : '未通过'}</span></td>
       <td class="mono" style="font-size:12px">${escapeHtml(c.detail)}</td>
     </tr>`).join('');
 
-  F('quota-rows').innerHTML = d.quotas.length
+  const quotas = d.quotas.length
     ? d.quotas.map(q => `
       <tr>
         <td>${escapeHtml(q.label)}</td>
@@ -303,22 +289,40 @@ function renderProbeDetail(d) {
     : '<tr><td class="hint">读不到配额（可能缺 servicequotas:GetServiceQuota）</td></tr>';
 
   const u = d.usage;
-  const rows = [
-    ['运行中实例', u.running_instances],
-    ['运行中 vCPU', u.running_vcpus],
-    ['已停止实例', u.stopped_instances],
-    ['EBS 卷', `${u.volumes} 个 / ${u.volume_gib} GiB`],
-    ['弹性 IP', `${u.addresses} 个（空闲 ${u.idle_addresses}）`],
-  ];
-  F('usage-rows').innerHTML = rows.map(([k, v]) => {
-    const warn = (k === '弹性 IP' && u.idle_addresses > 0)
-      || (k === '已停止实例' && u.stopped_instances > 0);
-    return `<tr><td>${k}</td><td class="mono">${
-      warn ? '<span class="tag warn">' + escapeHtml(String(v)) + '</span>' : escapeHtml(String(v))
-    }</td></tr>`;
-  }).join('');
+  const usage = [
+    ['运行中实例', u.running_instances, false],
+    ['运行中 vCPU', u.running_vcpus, false],
+    ['已停止实例', u.stopped_instances, u.stopped_instances > 0],
+    ['EBS 卷', `${u.volumes} 个 / ${u.volume_gib} GiB`, u.volumes > 0],
+    ['弹性 IP', `${u.addresses} 个（空闲 ${u.idle_addresses}）`, u.idle_addresses > 0],
+  ].map(([k, v, warn]) => `<tr><td>${k}</td><td class="mono">${
+    warn ? '<span class="tag warn">' + escapeHtml(String(v)) + '</span>' : escapeHtml(String(v))
+  }</td></tr>`).join('');
 
-  toast(d.healthy ? '检测通过，账号可用' : '检测发现问题，见下方明细', d.healthy ? 'ok' : 'err');
+  cell.innerHTML = `
+    <div class="row" style="margin-bottom:8px">
+      <strong style="font-size:13px">检测明细</strong>
+      <span style="flex:1"></span>
+      <span class="hint">${escapeHtml(d.region)} · 出口 ${escapeHtml(d.egress_ip || '未知')} · ${escapeHtml(d.proxy_in_use || '直连')}</span>
+      <button class="sm" onclick="hideProbeDetail(${id})">收起</button>
+    </div>
+    <table style="margin-bottom:12px"><tbody>${checks}</tbody></table>
+    <div class="grid g2">
+      <div>
+        <p class="hint" style="margin:0 0 6px">vCPU 配额（各实例族上限）</p>
+        <table><tbody>${quotas}</tbody></table>
+      </div>
+      <div>
+        <p class="hint" style="margin:0 0 6px">当前用量</p>
+        <table><tbody>${usage}</tbody></table>
+      </div>
+    </div>`;
+  row.style.display = '';
+}
+
+function hideProbeDetail(id) {
+  const row = document.querySelector(`tr[data-detail="${id}"]`);
+  if (row) row.style.display = 'none';
 }
 
 async function probeAll() {

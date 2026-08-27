@@ -699,7 +699,47 @@ def probe_account(creds: Credentials, region: str) -> dict[str, Any]:
         record("vCPU 配额", False, _short(exc))
 
     result["usage"] = _count_usage(session)
+    result["proxy_in_use"] = mask_proxy(normalize_proxy(creds.proxy))
+
+    # 出口 IP 直接影响 AWS 风控判定，能确认就报出来
+    egress = _egress_ip(creds)
+    if egress:
+        result["egress_ip"] = egress
+        record(
+            "出口 IP",
+            True,
+            f"{egress}" + ("（经代理）" if result["proxy_in_use"] else "（直连）"),
+        )
     return result
+
+
+def _egress_ip(creds: Credentials, timeout: float = 10.0) -> str | None:
+    """查 AWS 看到的出口 IP，用与业务调用完全相同的代理配置。
+
+    风控是按出口 IP 判的，用户在浏览器看到的自己 IP 和面板调 AWS 的出口
+    往往不是同一个 —— 必须把实际出口报出来才能定位风控原因。
+    """
+    proxy = normalize_proxy(creds.proxy)
+    try:
+        import urllib.request
+
+        if proxy and proxy.lower().startswith(SOCKS_SCHEMES):
+            from urllib3.contrib.socks import SOCKSProxyManager
+
+            manager = SOCKSProxyManager(proxy, timeout=timeout)
+            resp = manager.request("GET", "https://checkip.amazonaws.com")
+            return resp.data.decode().strip() or None
+
+        handler = (
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            if proxy
+            else urllib.request.ProxyHandler({})
+        )
+        opener = urllib.request.build_opener(handler)
+        with opener.open("https://checkip.amazonaws.com", timeout=timeout) as fh:
+            return fh.read().decode().strip() or None
+    except Exception:
+        return None
 
 
 def _count_usage(session: Any) -> dict[str, Any]:

@@ -229,6 +229,44 @@ def test_probe_counts_idle_addresses(mock_ec2, creds):
     assert usage["idle_addresses"] >= 1
 
 
+def test_probe_reports_proxy_and_egress(mock_ec2, creds):
+    """探测要报出实际出口 IP 和代理状态。
+
+    风控按出口 IP 判定，而用户在浏览器看到的自己 IP 和面板调 AWS 的出口
+    往往不是同一个 —— 不报出来就没法定位风控原因。
+    """
+    with_proxy = aws.Credentials(
+        creds.access_key, creds.secret_key, creds.region,
+        proxy="socks5h://u:secret@1.2.3.4:1080",
+    )
+    with patch.object(aws, "_egress_ip", return_value="203.0.113.9"):
+        result = aws.probe_account(with_proxy, "us-east-1")
+
+    assert result["egress_ip"] == "203.0.113.9"
+    assert "1.2.3.4" in result["proxy_in_use"]
+    assert "secret" not in result["proxy_in_use"], "代理密码不能泄漏"
+
+    egress = [c for c in result["checks"] if c["name"] == "出口 IP"][0]
+    assert "203.0.113.9" in egress["detail"]
+    assert "经代理" in egress["detail"]
+
+
+def test_probe_marks_direct_connection(mock_ec2, creds):
+    with patch.object(aws, "_egress_ip", return_value="198.51.100.4"):
+        result = aws.probe_account(creds, "us-east-1")
+    assert result["proxy_in_use"] == ""
+    egress = [c for c in result["checks"] if c["name"] == "出口 IP"][0]
+    assert "直连" in egress["detail"]
+
+
+def test_probe_tolerates_egress_lookup_failure(mock_ec2, creds):
+    """查不到出口 IP 不能让整个探测失败。"""
+    with patch.object(aws, "_egress_ip", return_value=None):
+        result = aws.probe_account(creds, "us-east-1")
+    assert result["checks"]
+    assert "egress_ip" not in result
+
+
 def test_probe_flags_root_credentials(mock_ec2, creds):
     """root 凭据风险高，探测要提示换 IAM 用户。"""
     with patch.object(aws, "client") as factory:
@@ -358,6 +396,21 @@ def test_non_terminate_actions_stay_synchronous(panel, creds):
     )
     assert resp.status_code == 200
     assert "task_id" not in resp.json()
+
+
+def test_probe_detail_rows_are_inline(panel):
+    """明细要内联在各账号行下方，不能是共享的独立卡片。
+
+    共享卡片在多账号检测时会互相覆盖，看不出结果属于哪个账号。
+    """
+    c, aid, _ = panel
+    html = c.get("/accounts").text
+
+    assert f'data-detail="{aid}"' in html
+    assert 'class="probe-detail"' in html
+    assert 'id="probe-card"' not in html, "旧的共享卡片应已移除"
+    assert "renderProbeDetail" in html
+    assert "hideProbeDetail" in html
 
 
 def test_accounts_page_shows_quota_columns(panel):
