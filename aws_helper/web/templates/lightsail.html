@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Lightsail 轻量实例 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2>Lightsail 轻量实例</h2>
+  <p class="hint">
+    Lightsail 是打包定价的轻量服务器：套餐里含 CPU、内存、SSD 和月流量额度，
+    按月计费。和 EC2 是完全不同的资源体系，实例、镜像、IP 都不通用。
+  </p>
+
+  {% if not accounts %}
+  <div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div>
+  {% else %}
+  <div class="grid g4">
+    <label class="f">
+      <span>账号</span>
+      <select id="account_id">
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域</span>
+      <select id="region">
+        {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <button class="primary" style="width:100%" onclick="refresh()">刷新列表</button>
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <a href="/lightsail/create" class="mono" style="display:block;text-align:center;padding:9px">
+        去创建实例 →
+      </a>
+    </label>
+  </div>
+
+  <div class="row mt">
+    <button class="sm" onclick="power('start')">启动</button>
+    <button class="sm" onclick="power('stop')">停止</button>
+    <button class="sm" onclick="power('reboot')">重启</button>
+    <button class="sm danger" onclick="power('delete')">删除</button>
+    <span style="flex:1"></span>
+    <span class="hint" id="count" style="margin:0"></span>
+  </div>
+  {% endif %}
+</div>
+
+{% if accounts %}
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th style="width:34px"><input type="checkbox" id="all" onclick="toggleAll(this)"></th>
+        <th>名称</th><th>状态</th><th>蓝图</th><th>套餐</th>
+        <th>公网 IP</th><th>规格</th><th>月流量</th><th>登录用户</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td colspan="9" class="empty">点「刷新列表」加载</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card" id="sip-card" style="display:none">
+  <h2>静态 IP</h2>
+  <p class="hint">未附加的静态 IP 按月计费。删除实例时工具会自动释放其上的静态 IP。</p>
+  <table>
+    <thead><tr><th>名称</th><th>地址</th><th>附加到</th><th>状态</th></tr></thead>
+    <tbody id="sip-rows"></tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+let INSTANCES = [];
+
+function sel() {
+  return {
+    account_id: parseInt(document.getElementById('account_id').value, 10),
+    region: document.getElementById('region').value
+  };
+}
+
+async function refresh() {
+  const s = sel();
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = '<tr><td colspan="9" class="empty">加载中…</td></tr>';
+  try {
+    const d = await api(`/api/lightsail/instances?account_id=${s.account_id}&region=${s.region}`);
+    INSTANCES = d.instances;
+    render();
+    renderStaticIps(d.static_ips);
+    toast(`找到 ${INSTANCES.length} 台轻量实例`, 'ok');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">${escapeHtml(e.message)}</td></tr>`;
+    toast(e.message, 'err');
+  }
+}
+
+function render() {
+  const tbody = document.getElementById('rows');
+  document.getElementById('count').textContent = `共 ${INSTANCES.length} 台`;
+  if (!INSTANCES.length) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">该区域没有轻量实例</td></tr>';
+    return;
+  }
+  tbody.innerHTML = INSTANCES.map(i => {
+    const cls = i.state === 'running' ? 'ok' : (i.state === 'stopped' ? 'err' : 'warn');
+    const ipTag = i.is_static_ip ? ' <span class="tag">静态</span>' : '';
+    return `<tr>
+      <td><input type="checkbox" class="pick" value="${escapeHtml(i.name)}"></td>
+      <td>${escapeHtml(i.name)}</td>
+      <td><span class="tag ${cls}">${escapeHtml(i.state)}</span></td>
+      <td>${escapeHtml(i.blueprint || '-')}</td>
+      <td class="mono">${escapeHtml(i.bundle_id || '-')}</td>
+      <td class="mono">${escapeHtml(i.public_ip || '-')}${ipTag}</td>
+      <td class="mono">${i.vcpu} vCPU / ${i.ram_gb} GB</td>
+      <td class="mono">${i.transfer_gb} GB</td>
+      <td class="mono">${escapeHtml(i.username || '-')}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderStaticIps(list) {
+  if (!list || !list.length) {
+    document.getElementById('sip-card').style.display = 'none';
+    return;
+  }
+  document.getElementById('sip-card').style.display = 'block';
+  document.getElementById('sip-rows').innerHTML = list.map(x => `
+    <tr>
+      <td class="mono">${escapeHtml(x.name)}</td>
+      <td class="mono">${escapeHtml(x.ip)}</td>
+      <td class="mono">${escapeHtml(x.attached_to || '-')}</td>
+      <td>${x.idle
+        ? '<span class="tag warn">未附加，计费中</span>'
+        : '<span class="tag ok">已附加</span>'}</td>
+    </tr>`).join('');
+}
+
+function toggleAll(box) {
+  document.querySelectorAll('.pick').forEach(c => c.checked = box.checked);
+}
+
+function picked() {
+  return [...document.querySelectorAll('.pick:checked')].map(c => c.value);
+}
+
+async function power(action) {
+  const names = picked();
+  if (!names.length) return toast('请先勾选实例', 'err');
+  const labels = { start: '启动', stop: '停止', reboot: '重启', delete: '删除' };
+
+  if (action === 'delete') {
+    const msg = `确认删除 ${names.length} 台轻量实例？\n\n`
+      + '会永久删除，无法恢复。同时释放这些实例上的静态 IP（未附加的静态 IP 按月计费）。';
+    if (!confirm(msg)) return;
+  }
+
+  try {
+    const d = await api('/api/lightsail/power', {
+      method: 'POST', json: { ...sel(), action, names }
+    });
+    let msg = `${labels[action]} 完成（${d.done.length} 台）`;
+    if (d.released_static_ips && d.released_static_ips.length) {
+      msg += `，释放静态 IP ${d.released_static_ips.length} 个`;
+    }
+    if (d.failed && d.failed.length) msg += `；失败 ${d.failed.length} 个`;
+    toast(msg, d.failed && d.failed.length ? 'err' : 'ok');
+    setTimeout(refresh, 2500);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+</script>
+{% endblock %}

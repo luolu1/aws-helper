@@ -23,7 +23,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .. import __version__, auth
 from ..autoip import Monitor, probe, run_once
-from ..core import aws, ipchange, launch
+from ..core import aws, bedrock, ipchange, launch, lightsail
 from ..core.userdata import ScriptOptions, ScriptError, render
 from ..store import Store
 from ..tasks import manager
@@ -179,9 +179,23 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=302)
 
 
+# 页面归属哪个服务，决定主导航高亮和二级导航内容
+_SECTIONS: dict[str, str] = {
+    "instances": "ec2",
+    "launch": "ec2",
+    "scripts": "ec2",
+    "autoip": "ec2",
+    "ls-instances": "lightsail",
+    "ls-create": "lightsail",
+    "bd-models": "bedrock",
+    "bd-play": "bedrock",
+}
+
+
 def _page_ctx(active: str) -> dict[str, Any]:
     return {
         "active": active,
+        "section": _SECTIONS.get(active, ""),
         "version": __version__,
         "accounts": store.list_accounts(),
         "regions": aws.REGIONS,
@@ -302,6 +316,187 @@ def accounts_page(request: Request, _: None = Guard):
     return templates.TemplateResponse(
         request, "accounts.html", {**_page_ctx("accounts"), "logs": store.list_logs(50)}
     )
+
+
+@app.get("/lightsail", response_class=HTMLResponse)
+def lightsail_page(request: Request, _: None = Guard):
+    return templates.TemplateResponse(
+        request, "lightsail.html", _page_ctx("ls-instances")
+    )
+
+
+@app.get("/lightsail/create", response_class=HTMLResponse)
+def lightsail_create_page(request: Request, _: None = Guard):
+    return templates.TemplateResponse(
+        request, "lightsail_create.html", _page_ctx("ls-create")
+    )
+
+
+@app.get("/bedrock", response_class=HTMLResponse)
+def bedrock_page(request: Request, _: None = Guard):
+    return templates.TemplateResponse(
+        request,
+        "bedrock.html",
+        {**_page_ctx("bd-models"), "bedrock_regions": bedrock.REGIONS},
+    )
+
+
+@app.get("/bedrock/playground", response_class=HTMLResponse)
+def bedrock_play_page(request: Request, _: None = Guard):
+    return templates.TemplateResponse(
+        request,
+        "bedrock_play.html",
+        {**_page_ctx("bd-play"), "bedrock_regions": bedrock.REGIONS},
+    )
+
+
+# ---------------- Lightsail API ----------------
+
+
+@app.get("/api/lightsail/catalog")
+def api_ls_catalog(account_id: int, region: str, _: None = Guard):
+    """Lightsail 的套餐与蓝图。区域支持范围比 EC2 窄，要单独校验。"""
+    creds = store.credentials(account_id, region)
+    try:
+        regions = lightsail.available_regions(creds, region)
+    except lightsail.LightsailError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    if region not in regions:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"{region} 不支持 Lightsail。可用区域：{', '.join(regions[:6])} 等",
+            },
+            status_code=400,
+        )
+
+    try:
+        bundles = lightsail.list_bundles(creds, region)
+        blueprints = lightsail.list_blueprints(creds, region)
+    except lightsail.LightsailError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    return {
+        "ok": True,
+        "region": region,
+        "supported_regions": regions,
+        "bundles": bundles,
+        "blueprints": blueprints,
+    }
+
+
+@app.get("/api/lightsail/instances")
+def api_ls_instances(account_id: int, region: str, _: None = Guard):
+    creds = store.credentials(account_id, region)
+    try:
+        return {
+            "ok": True,
+            "instances": lightsail.list_instances(creds, region),
+            "static_ips": lightsail.list_static_ips(creds, region),
+        }
+    except lightsail.LightsailError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/lightsail/create")
+async def api_ls_create(request: Request, _: None = Guard):
+    body = await request.json()
+    account_id = int(body["account_id"])
+    region = body["region"]
+    creds = store.credentials(account_id, region)
+
+    def job(progress: Any) -> dict[str, Any]:
+        result = lightsail.create_instance(
+            creds,
+            region,
+            name=str(body.get("name", "")).strip(),
+            bundle_id=body.get("bundle_id", ""),
+            blueprint_id=body.get("blueprint_id", ""),
+            user_data=body.get("user_data", ""),
+            progress=progress,
+        )
+        store.log(
+            "lightsail",
+            result["name"],
+            True,
+            f"{result['bundle_id']} / {result['blueprint_id']} → {result['public_ip']}",
+        )
+        return result
+
+    task_id = manager.submit(
+        "lightsail", f"创建轻量实例 {body.get('name', '')}", job
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.post("/api/lightsail/power")
+async def api_ls_power(request: Request, _: None = Guard):
+    body = await request.json()
+    creds = store.credentials(int(body["account_id"]), body["region"])
+    names = body.get("names") or []
+    action = body["action"]
+    try:
+        result = lightsail.power(creds, body["region"], action, names)
+    except lightsail.LightsailError as exc:
+        store.log("lightsail", ",".join(names), False, f"{action} 失败: {exc}")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    detail = f"{action} 完成"
+    if result.get("released_static_ips"):
+        detail += f"，释放静态 IP {len(result['released_static_ips'])} 个"
+    store.log("lightsail", ",".join(names), not result["failed"], detail)
+    return {"ok": True, **result}
+
+
+# ---------------- Bedrock API ----------------
+
+
+@app.get("/api/bedrock/models")
+def api_bd_models(account_id: int, region: str, _: None = Guard):
+    creds = store.credentials(account_id, region)
+    try:
+        return {"ok": True, **bedrock.list_models(creds, region)}
+    except bedrock.BedrockError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.get("/api/bedrock/probe")
+def api_bd_probe(account_id: int, region: str, _: None = Guard):
+    creds = store.credentials(account_id, region)
+    result = bedrock.probe(creds, region)
+    store.log(
+        "bedrock",
+        region,
+        result["available"],
+        f"{result.get('total', 0)} 个模型" if result["available"] else "服务不可用",
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/api/bedrock/invoke")
+async def api_bd_invoke(request: Request, _: None = Guard):
+    body = await request.json()
+    creds = store.credentials(int(body["account_id"]), body["region"])
+    try:
+        result = bedrock.invoke_text(
+            creds,
+            body["region"],
+            body.get("model_id", ""),
+            body.get("prompt", ""),
+            int(body.get("max_tokens", 256)),
+        )
+    except bedrock.BedrockError as exc:
+        store.log("bedrock", body.get("model_id", ""), False, str(exc)[:200])
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    store.log(
+        "bedrock",
+        result["model_id"],
+        True,
+        f"输入 {result['input_tokens']} / 输出 {result['output_tokens']} tokens",
+    )
+    return {"ok": True, **result}
 
 
 @app.get("/profile", response_class=HTMLResponse)

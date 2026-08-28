@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block title %}创建轻量实例 — AWS 小助手{% endblock %}
+
+{% block body %}
+{% if not accounts %}
+<div class="card"><div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div></div>
+{% else %}
+<div class="card">
+  <h2>创建 Lightsail 实例</h2>
+  <p class="hint">
+    按「系统类别 → 蓝图 → 套餐」选择。套餐和蓝图都是
+    <strong>实时从该区域拉取</strong>；Lightsail 支持的区域比 EC2 少，选到不支持的会直接提示。
+  </p>
+
+  <div class="grid g3">
+    <label class="f">
+      <span>账号</span>
+      <select id="account_id" onchange="loadCatalog()">
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域</span>
+      <select id="region" onchange="loadCatalog()">
+        {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>实例名称（必填）</span>
+      <input type="text" id="name" placeholder="my-lightsail">
+    </label>
+  </div>
+
+  <div class="grid g3 mt">
+    <label class="f">
+      <span>① 蓝图类别</span>
+      <select id="bp_type" onchange="renderBlueprints()">
+        <option value="os">纯操作系统</option>
+        <option value="app">预装应用</option>
+      </select>
+    </label>
+    <label class="f">
+      <span>② 蓝图（系统 / 应用）</span>
+      <select id="blueprint_id" onchange="filterBundles()"><option value="">加载中…</option></select>
+    </label>
+    <label class="f">
+      <span>③ 套餐<span id="bundle_count" class="hint"></span></span>
+      <select id="bundle_id"><option value="">加载中…</option></select>
+    </label>
+  </div>
+
+  <p class="hint" id="catalog-hint"></p>
+
+  <label class="f mt">
+    <span>启动脚本（选填，Linux 蓝图首次启动执行）</span>
+    <textarea id="user_data" rows="6" placeholder="apt-get update -y
+apt-get install -y docker.io"></textarea>
+  </label>
+  <p class="hint" id="win-note" style="display:none">
+    <span class="tag warn">Windows</span>
+    Windows 蓝图不执行 Linux 启动脚本，密码需在 Lightsail 控制台获取，用 RDP 登录。
+  </p>
+
+  <div class="row mt">
+    <span class="hint" id="price-note" style="margin:0"></span>
+    <span style="flex:1"></span>
+    <button class="primary" onclick="doCreate()">创建实例</button>
+  </div>
+</div>
+
+<div class="card" id="result-card" style="display:none">
+  <h2>创建结果</h2>
+  <table>
+    <thead><tr><th>名称</th><th>状态</th><th>公网 IP</th><th>登录用户</th><th>套餐</th></tr></thead>
+    <tbody id="result-rows"></tbody>
+  </table>
+  <p class="hint mt" style="margin-bottom:0">
+    SSH 密钥在 Lightsail 控制台的「账户 → SSH 密钥」下载，或用控制台内置的浏览器 SSH。
+  </p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+let CATALOG = null;
+
+async function loadCatalog() {
+  const accountId = document.getElementById('account_id').value;
+  const region = document.getElementById('region').value;
+  const bpSel = document.getElementById('blueprint_id');
+  const bundleSel = document.getElementById('bundle_id');
+  bpSel.innerHTML = '<option value="">加载中…</option>';
+  bundleSel.innerHTML = '<option value="">加载中…</option>';
+  document.getElementById('catalog-hint').innerHTML = '';
+
+  try {
+    CATALOG = await api(`/api/lightsail/catalog?account_id=${accountId}&region=${region}`);
+    renderBlueprints();
+  } catch (e) {
+    CATALOG = null;
+    bpSel.innerHTML = '<option value="">加载失败</option>';
+    bundleSel.innerHTML = '<option value="">加载失败</option>';
+    document.getElementById('catalog-hint').innerHTML =
+      '<span class="tag err">' + escapeHtml(e.message) + '</span>';
+  }
+}
+
+function renderBlueprints() {
+  if (!CATALOG) return;
+  const kind = document.getElementById('bp_type').value;
+  const list = CATALOG.blueprints[kind] || [];
+  const sel = document.getElementById('blueprint_id');
+  sel.innerHTML = list.length
+    ? list.map(b => `<option value="${escapeHtml(b.blueprint_id)}" data-platform="${escapeHtml(b.platform)}">${escapeHtml(b.label)}</option>`).join('')
+    : '<option value="">该类别下没有蓝图</option>';
+  filterBundles();
+}
+
+// Windows 蓝图只能配 Windows 套餐（含 _win_），价格也不同
+function filterBundles() {
+  if (!CATALOG) return;
+  const opt = document.getElementById('blueprint_id').selectedOptions[0];
+  const platform = opt ? opt.dataset.platform : 'linux_unix';
+  const isWin = platform === 'windows';
+
+  const list = CATALOG.bundles.filter(b => (b.platform === 'windows') === isWin);
+  const sel = document.getElementById('bundle_id');
+  sel.innerHTML = list.length
+    ? list.map(b => `<option value="${escapeHtml(b.bundle_id)}" data-price="${b.price}">${escapeHtml(b.label)}</option>`).join('')
+    : '<option value="">没有匹配的套餐</option>';
+
+  document.getElementById('bundle_count').textContent =
+    list.length ? `（${list.length} 个）` : '';
+  document.getElementById('win-note').style.display = isWin ? '' : 'none';
+  document.getElementById('user_data').disabled = isWin;
+  updatePrice();
+  sel.onchange = updatePrice;
+}
+
+function updatePrice() {
+  const opt = document.getElementById('bundle_id').selectedOptions[0];
+  const price = opt ? opt.dataset.price : null;
+  document.getElementById('price-note').innerHTML = price
+    ? `该套餐 <strong>$${escapeHtml(price)}/月</strong>，创建后即开始计费`
+    : '';
+}
+
+document.addEventListener('DOMContentLoaded', loadCatalog);
+
+async function doCreate() {
+  const isWin = document.getElementById('win-note').style.display !== 'none';
+  const payload = {
+    account_id: parseInt(document.getElementById('account_id').value, 10),
+    region: document.getElementById('region').value,
+    name: document.getElementById('name').value.trim(),
+    blueprint_id: document.getElementById('blueprint_id').value,
+    bundle_id: document.getElementById('bundle_id').value,
+    user_data: isWin ? '' : document.getElementById('user_data').value
+  };
+  if (!payload.name) return toast('实例名称必填', 'err');
+  if (!payload.blueprint_id || !payload.bundle_id) return toast('请选择蓝图和套餐', 'err');
+
+  const opt = document.getElementById('bundle_id').selectedOptions[0];
+  const price = opt ? opt.dataset.price : '?';
+  if (!confirm(`确认创建 ${payload.name}？\n套餐 ${payload.bundle_id}（$${price}/月）\n创建后立即开始计费。`)) return;
+
+  try {
+    const r = await api('/api/lightsail/create', { method: 'POST', json: payload });
+    const task = await watchTask(r.task_id, `创建轻量实例 ${payload.name}`);
+    const i = task.result;
+    document.getElementById('result-card').style.display = 'block';
+    document.getElementById('result-rows').innerHTML = `
+      <tr>
+        <td>${escapeHtml(i.name)}</td>
+        <td><span class="tag ok">${escapeHtml(i.state)}</span></td>
+        <td class="mono">${escapeHtml(i.public_ip || '-')}</td>
+        <td class="mono">${escapeHtml(i.username || '-')}</td>
+        <td class="mono">${escapeHtml(i.bundle_id)}</td>
+      </tr>`;
+    Progress.finish();
+    toast('创建成功', 'ok');
+  } catch (e) {
+    Progress.finish();
+    toast(e.message, 'err');
+  }
+}
+
+function onProgressClose() {}
+</script>
+{% endblock %}

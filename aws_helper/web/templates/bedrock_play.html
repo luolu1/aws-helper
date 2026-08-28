@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Bedrock 调用测试 — AWS 小助手{% endblock %}
+
+{% block body %}
+{% if not accounts %}
+<div class="card"><div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div></div>
+{% else %}
+<div class="card">
+  <h2>调用测试</h2>
+  <p class="hint">
+    用 Converse 统一接口试跑一次文本推理，验证模型访问权限是否已开通。
+    <strong>会产生实际 token 费用。</strong>
+    只列支持按需调用（ON_DEMAND）的文本模型 —— 其余需要推理配置文件或预置吞吐量。
+  </p>
+
+  <div class="grid g4">
+    <label class="f">
+      <span>账号</span>
+      <select id="account_id" onchange="loadModels()">
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域</span>
+      <select id="region" onchange="loadModels()">
+        {% for code, name in bedrock_regions.items() %}
+        <option value="{{ code }}">{{ code }} — {{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>模型<span id="model_count" class="hint"></span></span>
+      <select id="model_id"><option value="">加载中…</option></select>
+    </label>
+    <label class="f">
+      <span>最大输出 tokens</span>
+      <input type="number" id="max_tokens" value="256" min="1" max="4096">
+    </label>
+  </div>
+
+  <label class="f mt">
+    <span>提示词</span>
+    <textarea id="prompt" rows="4">用一句话说明 AWS Bedrock 是什么。</textarea>
+  </label>
+
+  <div class="row mt">
+    <span class="hint" id="hint" style="margin:0"></span>
+    <span style="flex:1"></span>
+    <button class="primary" onclick="invoke()">发送请求</button>
+  </div>
+</div>
+
+<div class="card" id="result-card" style="display:none">
+  <h2>响应</h2>
+  <pre class="out" id="output"></pre>
+  <p class="hint mt" id="meta" style="margin-bottom:0"></p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+async function loadModels() {
+  const accountId = document.getElementById('account_id').value;
+  const region = document.getElementById('region').value;
+  const sel = document.getElementById('model_id');
+  sel.innerHTML = '<option value="">加载中…</option>';
+  document.getElementById('hint').innerHTML = '';
+
+  try {
+    const d = await api(`/api/bedrock/models?account_id=${accountId}&region=${region}`);
+    // 只保留能直接按需调用的文本模型，避免选了之后报 ValidationException
+    const usable = d.models.filter(m =>
+      m.inference_types.includes('ON_DEMAND') && m.text_capable && !m.legacy);
+    sel.innerHTML = usable.length
+      ? usable.map(m => `<option value="${escapeHtml(m.model_id)}">${escapeHtml(m.provider)} · ${escapeHtml(m.model_id)}</option>`).join('')
+      : '<option value="">该区域没有按需可调用的文本模型</option>';
+    document.getElementById('model_count').textContent =
+      usable.length ? `（${usable.length} 个可用）` : '';
+  } catch (e) {
+    sel.innerHTML = '<option value="">加载失败</option>';
+    document.getElementById('hint').innerHTML =
+      '<span class="tag err">' + escapeHtml(e.message) + '</span>';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', loadModels);
+
+async function invoke() {
+  const modelId = document.getElementById('model_id').value;
+  const prompt = document.getElementById('prompt').value.trim();
+  if (!modelId) return toast('请选择模型', 'err');
+  if (!prompt) return toast('请输入提示词', 'err');
+
+  document.getElementById('hint').innerHTML = '<span class="hint">正在请求…</span>';
+  try {
+    const d = await api('/api/bedrock/invoke', {
+      method: 'POST',
+      json: {
+        account_id: parseInt(document.getElementById('account_id').value, 10),
+        region: document.getElementById('region').value,
+        model_id: modelId,
+        prompt,
+        max_tokens: parseInt(document.getElementById('max_tokens').value, 10) || 256
+      }
+    });
+    document.getElementById('result-card').style.display = 'block';
+    document.getElementById('output').textContent = d.text || '(空响应)';
+    document.getElementById('meta').textContent =
+      `${d.model_id} · 输入 ${d.input_tokens} tokens / 输出 ${d.output_tokens} tokens`
+      + ` · 延迟 ${d.latency_ms}ms · 停止原因 ${d.stop_reason}`;
+    document.getElementById('hint').innerHTML = '';
+    toast('调用成功', 'ok');
+  } catch (e) {
+    document.getElementById('hint').innerHTML =
+      '<span class="tag err">' + escapeHtml(e.message) + '</span>';
+    toast(e.message, 'err');
+  }
+}
+</script>
+{% endblock %}

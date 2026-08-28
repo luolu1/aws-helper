@@ -266,6 +266,16 @@ ec2:DescribeAddresses        ec2:CreateTags               ec2:DescribeVolumes
 | `servicequotas:GetServiceQuota` | 账号探测里查 vCPU 配额 | 探测的配额一项标为未通过，其余不受影响 |
 | `sts:GetCallerIdentity` | 账号探测里确认身份、提示 root 凭据风险 | 身份检查一项失败 |
 
+Lightsail 栏需要：`lightsail:GetRegions` `lightsail:GetBundles` `lightsail:GetBlueprints`
+`lightsail:GetInstances` `lightsail:GetInstance` `lightsail:CreateInstances`
+`lightsail:StartInstance` `lightsail:StopInstance` `lightsail:RebootInstance`
+`lightsail:DeleteInstance` `lightsail:GetStaticIps` `lightsail:DetachStaticIp`
+`lightsail:ReleaseStaticIp`
+
+Bedrock 栏需要：`bedrock:ListFoundationModels`，调用测试还要
+`bedrock:InvokeModel`（Converse 走同一权限），且需在 Bedrock 控制台的
+「模型访问」里为具体模型申请开通。
+
 终止实例的连带清理还需要：`ec2:DeleteVolume` `ec2:DeleteSecurityGroup`
 `ec2:DeleteKeyPair` `ec2:ReleaseAddress`，以及删自建 VPC 时的
 `ec2:DeleteVpc` `ec2:DeleteSubnet` `ec2:DeleteInternetGateway`

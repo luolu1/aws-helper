@@ -1,3 +1,10 @@
 """core 包：AWS 操作原语。"""
 
-from . import aws, ipchange, launch, userdata  # noqa: F401
+from . import (  # noqa: F401
+    aws,
+    bedrock,
+    ipchange,
+    launch,
+    lightsail,
+    userdata,
+)

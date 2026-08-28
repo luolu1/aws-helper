@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block title %}Bedrock 模型清单 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2>Bedrock 基础模型</h2>
+  <p class="hint">
+    Bedrock 是纯 API 服务，没有实例概念 —— 不需要开机、换 IP、清理资源。
+    这里做的是看有哪些模型、确认权限是否开通。
+    <strong>区域差异很大</strong>：实测 us-east-1 有 121 个模型，而香港（ap-east-1）
+    完全没有 Bedrock 端点，所以区域列表和 EC2 是分开的。
+  </p>
+
+  {% if not accounts %}
+  <div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div>
+  {% else %}
+  <div class="grid g4">
+    <label class="f">
+      <span>账号</span>
+      <select id="account_id">
+        {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域（仅 Bedrock 可用区域）</span>
+      <select id="region">
+        {% for code, name in bedrock_regions.items() %}
+        <option value="{{ code }}">{{ code }} — {{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <button class="primary" style="width:100%" onclick="loadModels()">加载模型</button>
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <button style="width:100%" onclick="probe()">可用性探测</button>
+    </label>
+  </div>
+
+  <div class="row mt">
+    <label class="chk"><input type="checkbox" id="only_ondemand" onchange="render()"> 只看支持按需调用的</label>
+    <label class="chk"><input type="checkbox" id="only_text" onchange="render()"> 只看文本模型</label>
+    <label class="chk"><input type="checkbox" id="hide_legacy" onchange="render()"> 隐藏已标记下线的</label>
+    <span style="flex:1"></span>
+    <span class="hint" id="count" style="margin:0"></span>
+  </div>
+  {% endif %}
+</div>
+
+{% if accounts %}
+<div class="card" id="probe-card" style="display:none">
+  <h2>探测结果</h2>
+  <table><tbody id="probe-rows"></tbody></table>
+  <p class="hint mt" style="margin-bottom:0" id="provider-summary"></p>
+</div>
+
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th>模型 ID</th><th>厂商</th><th style="width:110px">输入</th>
+        <th style="width:110px">输出</th><th style="width:150px">调用方式</th>
+        <th style="width:70px">流式</th><th style="width:80px">状态</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td colspan="7" class="empty">点「加载模型」获取该区域的模型清单</td></tr>
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+let MODELS = [];
+
+function sel() {
+  return {
+    account_id: parseInt(document.getElementById('account_id').value, 10),
+    region: document.getElementById('region').value
+  };
+}
+
+async function loadModels() {
+  const s = sel();
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = '<tr><td colspan="7" class="empty">加载中…</td></tr>';
+  try {
+    const d = await api(`/api/bedrock/models?account_id=${s.account_id}&region=${s.region}`);
+    MODELS = d.models;
+    render();
+    toast(`${d.region} 有 ${d.total} 个基础模型`, 'ok');
+  } catch (e) {
+    MODELS = [];
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">${escapeHtml(e.message)}</td></tr>`;
+    toast(e.message, 'err');
+  }
+}
+
+function render() {
+  let list = MODELS;
+  if (document.getElementById('only_ondemand').checked) {
+    list = list.filter(m => m.inference_types.includes('ON_DEMAND'));
+  }
+  if (document.getElementById('only_text').checked) {
+    list = list.filter(m => m.text_capable);
+  }
+  if (document.getElementById('hide_legacy').checked) {
+    list = list.filter(m => !m.legacy);
+  }
+
+  document.getElementById('count').textContent =
+    MODELS.length ? `显示 ${list.length} / 共 ${MODELS.length}` : '';
+
+  const tbody = document.getElementById('rows');
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">没有符合条件的模型</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(m => {
+    const onDemand = m.inference_types.includes('ON_DEMAND');
+    const types = m.inference_types.map(t =>
+      `<span class="tag ${t === 'ON_DEMAND' ? 'ok' : ''}" style="font-size:11px">${escapeHtml(t)}</span>`
+    ).join(' ');
+    return `<tr>
+      <td class="mono" style="font-size:12px">${escapeHtml(m.model_id)}</td>
+      <td>${escapeHtml(m.provider)}</td>
+      <td class="mono" style="font-size:11px">${escapeHtml(m.input_modalities.join(','))}</td>
+      <td class="mono" style="font-size:11px">${escapeHtml(m.output_modalities.join(','))}</td>
+      <td>${types || '-'}</td>
+      <td>${m.streaming ? '✓' : '—'}</td>
+      <td>${m.legacy
+        ? '<span class="tag warn">LEGACY</span>'
+        : '<span class="tag ok">ACTIVE</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function probe() {
+  const s = sel();
+  try {
+    const d = await api(`/api/bedrock/probe?account_id=${s.account_id}&region=${s.region}`);
+    document.getElementById('probe-card').style.display = 'block';
+    document.getElementById('probe-rows').innerHTML = d.checks.map(c => `
+      <tr>
+        <td style="width:150px">${escapeHtml(c.name)}</td>
+        <td style="width:70px"><span class="tag ${c.ok ? 'ok' : 'err'}">${c.ok ? '通过' : '未通过'}</span></td>
+        <td class="mono" style="font-size:12px">${escapeHtml(c.detail)}</td>
+      </tr>`).join('');
+
+    const providers = d.by_provider || {};
+    document.getElementById('provider-summary').textContent = Object.keys(providers).length
+      ? '厂商分布：' + Object.entries(providers).map(([k, v]) => `${k} ${v}`).join('，')
+      : '';
+    toast(d.available ? `${d.region} 可用，${d.total} 个模型` : `${d.region} 不可用`,
+          d.available ? 'ok' : 'err');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+</script>
+{% endblock %}
