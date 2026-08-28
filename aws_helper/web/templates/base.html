@@ -8,45 +8,58 @@
 </head>
 <body>
 <header>
+  <button class="menu-toggle" onclick="toggleSidebar()" aria-label="切换目录">☰</button>
   <div class="brand">AWS 小助手</div>
-  <nav class="services">
-    <a href="/" class="svc {% if section == 'ec2' %}on{% endif %}">EC2</a>
-    <a href="/lightsail" class="svc {% if section == 'lightsail' %}on{% endif %}">Lightsail</a>
-    <a href="/bedrock" class="svc {% if section == 'bedrock' %}on{% endif %}">Bedrock</a>
-    <span class="nav-sep"></span>
-    <a href="/accounts" class="{% if active == 'accounts' %}on{% endif %}">账号 / 日志</a>
-    <a href="/profile" class="{% if active == 'profile' %}on{% endif %}">用户面板</a>
-  </nav>
+  <span style="flex:1"></span>
+  <span class="hint version-tag">v{{ version }}</span>
   <form method="post" action="/logout" style="margin:0">
     <button class="sm">退出</button>
   </form>
 </header>
 
-{% if section == 'ec2' %}
-<div class="subnav">
-  <a href="/" class="{% if active == 'instances' %}on{% endif %}">实例</a>
-  <a href="/launch" class="{% if active == 'launch' %}on{% endif %}">一键开机</a>
-  <a href="/scripts" class="{% if active == 'scripts' %}on{% endif %}">开机脚本</a>
-  <a href="/autoip" class="{% if active == 'autoip' %}on{% endif %}">自动换 IP</a>
-</div>
-{% elif section == 'lightsail' %}
-<div class="subnav">
-  <a href="/lightsail" class="{% if active == 'ls-instances' %}on{% endif %}">轻量实例</a>
-  <a href="/lightsail/create" class="{% if active == 'ls-create' %}on{% endif %}">创建实例</a>
-</div>
-{% elif section == 'bedrock' %}
-<div class="subnav">
-  <a href="/bedrock" class="{% if active == 'bd-models' %}on{% endif %}">模型清单</a>
-  <a href="/bedrock/playground" class="{% if active == 'bd-play' %}on{% endif %}">调用测试</a>
-</div>
-{% endif %}
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <nav>
+      <div class="nav-group">
+        <div class="nav-group-title">EC2<span class="nav-note">按需虚拟机</span></div>
+        <a href="/" class="{% if active == 'instances' %}on{% endif %}">实例</a>
+        <a href="/launch" class="{% if active == 'launch' %}on{% endif %}">一键开机</a>
+        <a href="/scripts" class="{% if active == 'scripts' %}on{% endif %}">开机脚本</a>
+        <a href="/autoip" class="{% if active == 'autoip' %}on{% endif %}">自动换 IP</a>
+      </div>
 
-<main>
+      <div class="nav-group">
+        <div class="nav-group-title">Lightsail<span class="nav-note">轻量服务器</span></div>
+        <a href="/lightsail" class="{% if active == 'ls-instances' %}on{% endif %}">轻量实例</a>
+        <a href="/lightsail/create" class="{% if active == 'ls-create' %}on{% endif %}">创建实例</a>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">Bedrock<span class="nav-note">托管大模型</span></div>
+        <a href="/bedrock" class="{% if active == 'bd-models' %}on{% endif %}">模型清单</a>
+        <a href="/bedrock/playground" class="{% if active == 'bd-play' %}on{% endif %}">调用测试</a>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">通用</div>
+        <a href="/accounts" class="{% if active == 'accounts' %}on{% endif %}">账号 / 日志</a>
+        <a href="/profile" class="{% if active == 'profile' %}on{% endif %}">用户面板</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
 {% block body %}{% endblock %}
-</main>
+  </main>
+</div>
 
 <div id="toast"></div>
 <script src="/static/app.js"></script>
+<script>
+  function toggleSidebar() {
+    document.getElementById('sidebar').classList.toggle('open');
+  }
+</script>
 
 {% if accounts is defined %}
 <script>

@@ -179,7 +179,7 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=302)
 
 
-# 页面归属哪个服务，决定主导航高亮和二级导航内容
+# 页面归属哪个服务。侧边栏按 active 高亮，这里供页面自身判断服务上下文
 _SECTIONS: dict[str, str] = {
     "instances": "ec2",
     "launch": "ec2",

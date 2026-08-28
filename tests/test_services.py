@@ -25,60 +25,77 @@ def panel(mock_ec2, ubuntu_ami, monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "path,section",
+    "path,label",
     [
-        ("/", "ec2"),
-        ("/launch", "ec2"),
-        ("/scripts", "ec2"),
-        ("/autoip", "ec2"),
-        ("/lightsail", "lightsail"),
-        ("/lightsail/create", "lightsail"),
-        ("/bedrock", "bedrock"),
-        ("/bedrock/playground", "bedrock"),
+        ("/", "实例"),
+        ("/launch", "一键开机"),
+        ("/scripts", "开机脚本"),
+        ("/autoip", "自动换 IP"),
+        ("/lightsail", "轻量实例"),
+        ("/lightsail/create", "创建实例"),
+        ("/bedrock", "模型清单"),
+        ("/bedrock/playground", "调用测试"),
+        ("/accounts", "账号 / 日志"),
+        ("/profile", "用户面板"),
     ],
 )
-def test_pages_belong_to_right_section(panel, path, section):
-    """每个页面要正确归属到三个服务栏之一，主导航才能高亮对应项。"""
+def test_current_page_highlighted_in_sidebar(panel, path, label):
+    """当前页在侧边栏要高亮，否则用户不知道自己在哪一栏。"""
+    import re
+
     c, _, _ = panel
     html = c.get(path).text
-    assert f'class="svc on">' in html or f'class="svc {" "}on"' in html or "svc on" in html
-    marker = {"ec2": ">EC2<", "lightsail": ">Lightsail<", "bedrock": ">Bedrock<"}[section]
-    assert marker in html
+    pattern = re.compile(
+        r'<a href="[^"]*"\s+class="[^"]*\bon\b[^"]*">' + re.escape(label) + r"</a>"
+    )
+    assert pattern.search(html), f"{path} 的「{label}」未高亮"
 
 
-def test_nav_has_three_services(panel):
+def test_sidebar_groups_three_services(panel):
+    """三个服务作为大类分组标题，功能作为子项挂在下面。"""
     c, _, _ = panel
     html = c.get("/").text
-    assert ">EC2<" in html
-    assert ">Lightsail<" in html
-    assert ">Bedrock<" in html
+
+    for title in ("EC2", "Lightsail", "Bedrock", "通用"):
+        assert f'class="nav-group-title">{title}' in html, title
+
+    assert html.count('class="nav-group"') == 4
 
 
-def test_subnav_differs_per_service(panel):
-    """二级导航要按服务切换，不能三栏共用一套。"""
+def test_sidebar_shows_all_entries_on_every_page(panel):
+    """侧边栏是全局目录，任何页面都能直接跳到其他服务。
+
+    原来的二级导航只显示当前服务的子项，跨服务要先点主栏再点子项。
+    """
     c, _, _ = panel
-
-    ec2 = c.get("/").text
-    assert "一键开机" in ec2
-    assert "轻量实例" not in ec2
-    assert "模型清单" not in ec2
-
-    ls = c.get("/lightsail").text
-    assert "轻量实例" in ls
-    assert "自动换 IP" not in ls
-
-    bd = c.get("/bedrock").text
-    assert "模型清单" in bd
-    assert "调用测试" in bd
-    assert "开机脚本" not in bd
-
-
-def test_account_pages_have_no_section(panel):
-    """账号和用户面板是跨服务的，不归属任何一栏。"""
-    c, _, _ = panel
-    for path in ("/accounts", "/profile"):
+    entries = [
+        "实例", "一键开机", "开机脚本", "自动换 IP",
+        "轻量实例", "创建实例",
+        "模型清单", "调用测试",
+        "账号 / 日志", "用户面板",
+    ]
+    for path in ("/", "/lightsail", "/bedrock", "/accounts"):
         html = c.get(path).text
-        assert 'class="subnav"' not in html, path
+        for entry in entries:
+            assert f">{entry}</a>" in html, f"{path} 缺少 {entry}"
+
+
+def test_layout_uses_sidebar_not_topnav(panel):
+    """布局要是左侧目录 + 右侧内容，旧的顶部服务栏和二级导航条应已移除。"""
+    c, _, _ = panel
+    html = c.get("/").text
+
+    assert 'class="layout"' in html
+    assert 'class="sidebar"' in html
+    assert 'class="subnav"' not in html
+    assert 'class="svc ' not in html
+
+
+def test_sidebar_collapsible_on_narrow_screen(panel):
+    c, _, _ = panel
+    html = c.get("/").text
+    assert "menu-toggle" in html
+    assert "toggleSidebar" in html
 
 
 def test_service_pages_require_login(mock_ec2, monkeypatch, tmp_path):
