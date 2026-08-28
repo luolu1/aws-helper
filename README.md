@@ -1,9 +1,18 @@
 # AWS 小助手
 
-AWS EC2 管理面板。一键开机、换 IP、开机脚本注入，附带按账号独立的 SOCKS 代理和自动换 IP 监控。
+AWS 管理面板，覆盖 **EC2 / Lightsail / Bedrock** 三类服务。
+一键开机、换 IP、开机脚本注入、终止清理，按账号独立 SOCKS 代理，自动换 IP 监控。
 
 现有的多云面板里 AWS 基本都是"顺带支持"：能列实例但注入不了开机脚本，能开机但换不了 IP，
 更没有 IP 被墙后自动更换。这个工具只做 AWS，把这几件事做完整。
+
+支持 **systemd（Python 虚拟环境隔离）** 和 **Docker Compose** 两种一键部署，可并存于不同端口。
+
+```bash
+git clone https://github.com/luolu1/aws-helper.git
+cd aws-helper
+sudo bash deploy/install.sh          # 交互选择部署方式
+```
 
 ---
 
@@ -523,19 +532,25 @@ bash aws_helper/demo/start.sh 127.0.0.1 8765
 
 ```
 aws_helper/
-  auth.py            密码哈希、强度校验、登录锁定
-  cli.py             密码重置 / 状态查看 / 下线会话
-  core/aws.py        boto3 客户端工厂、SOCKS 代理支持、区域与镜像元数据
-  core/userdata.py   开机脚本渲染与校验
-  core/launch.py     一键开机、实例列表、电源操作
-  core/ipchange.py   换 IP 两种策略、弹性 IP 清理
-  store.py           SQLite 持久层（加密凭据、会话、规则、日志）
-  autoip.py          自动换 IP 监控循环
-  web/               FastAPI 路由与六个页面
-  demo/              演示环境
-deploy/install.sh    一键部署脚本
-Dockerfile           容器镜像
-docker-compose.yml   compose 服务定义
+  auth.py             密码哈希、强度校验、登录锁定
+  cli.py              密码重置 / 状态查看 / 下线会话
+  store.py            SQLite 持久层（加密凭据、会话、规则、日志）
+  autoip.py           自动换 IP 监控循环
+  tasks.py            后台任务与进度跟踪
+  core/aws.py         boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
+  core/userdata.py    开机脚本渲染与校验
+  core/launch.py      EC2 一键开机、实例列表、电源操作、终止清理
+  core/ipchange.py    换 IP 两种策略、弹性 IP 清理
+  core/lightsail.py   Lightsail 套餐、蓝图、实例、静态 IP
+  core/bedrock.py     Bedrock 模型清单、可用性探测、Converse 调用
+  web/app.py          FastAPI 路由
+  web/templates/      左侧目录布局 + 十个页面
+  demo/               演示环境（moto 后端 + 预置数据）
+deploy/install.sh     一键部署（systemd / docker 两种方式）
+Dockerfile            容器镜像（非 root + healthcheck）
+docker-compose.yml    compose 服务定义
+requirements.txt      固定版本的运行时依赖
+tests/                406 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。
