@@ -16,20 +16,80 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 
 from . import aws
 
-# Bedrock 未在所有区域开放，列出实测可用的主力区域
-REGIONS: dict[str, str] = {
+# 区域中文名。仅用于展示，是否列出由 botocore 的 endpoint 数据决定 ——
+# 手写清单会随 AWS 开新区域而过期，实测也只能反映当次账号的可见范围。
+_REGION_LABELS: dict[str, str] = {
     "us-east-1": "美国东部（弗吉尼亚北部）",
+    "us-east-2": "美国东部（俄亥俄）",
+    "us-west-1": "美国西部（加利福尼亚北部）",
     "us-west-2": "美国西部（俄勒冈）",
+    "af-south-1": "非洲（开普敦）",
+    "ap-east-1": "亚太（香港）",
+    "ap-east-2": "亚太（台北）",
     "ap-northeast-1": "亚太（东京）",
+    "ap-northeast-2": "亚太（首尔）",
+    "ap-northeast-3": "亚太（大阪）",
+    "ap-south-1": "亚太（孟买）",
+    "ap-south-2": "亚太（海得拉巴）",
     "ap-southeast-1": "亚太（新加坡）",
     "ap-southeast-2": "亚太（悉尼）",
-    "ap-south-1": "亚太（孟买）",
-    "eu-central-1": "欧洲（法兰克福）",
-    "eu-west-1": "欧洲（爱尔兰）",
-    "eu-west-3": "欧洲（巴黎）",
+    "ap-southeast-3": "亚太（雅加达）",
+    "ap-southeast-4": "亚太（墨尔本）",
+    "ap-southeast-5": "亚太（马来西亚）",
+    "ap-southeast-6": "亚太（新西兰）",
+    "ap-southeast-7": "亚太（泰国）",
     "ca-central-1": "加拿大（中部）",
+    "ca-west-1": "加拿大西部（卡尔加里）",
+    "eu-central-1": "欧洲（法兰克福）",
+    "eu-central-2": "欧洲（苏黎世）",
+    "eu-north-1": "欧洲（斯德哥尔摩）",
+    "eu-south-1": "欧洲（米兰）",
+    "eu-south-2": "欧洲（西班牙）",
+    "eu-west-1": "欧洲（爱尔兰）",
+    "eu-west-2": "欧洲（伦敦）",
+    "eu-west-3": "欧洲（巴黎）",
+    "il-central-1": "以色列（特拉维夫）",
+    "me-central-1": "中东（阿联酋）",
+    "me-south-1": "中东（巴林）",
+    "mx-central-1": "墨西哥（中部）",
     "sa-east-1": "南美（圣保罗）",
 }
+
+
+# AWS 官方文档《Amazon Bedrock endpoints and quotas》列出的商业区域。
+# 之所以不能只靠 botocore：它的 endpoints.json 会滞后，实测
+# af-south-1 / eu-north-1 / ap-northeast-3 能正常返回模型清单，
+# 但当前 botocore 版本并未收录。两者取并集。
+_DOC_REGIONS: frozenset[str] = frozenset(_REGION_LABELS) - {"ap-east-1"}
+
+
+def supported_regions() -> dict[str, str]:
+    """Bedrock 支持的区域 = 官方文档清单 ∪ botocore endpoint 数据。
+
+    官方文档保证覆盖已发布区域，botocore 数据保证升级 SDK 后能自动跟上
+    新区域。GovCloud 需单独准入，排除。
+
+    注意：能列出不等于当前账号能用。同一区域的模型数量差异也很大
+    （实测 us-east-1 有 121 个、af-south-1 只有 11 个），部分区域账号
+    可能完全无权访问 —— 用页面上的「可用性探测」实际确认。
+    """
+    names = set(_DOC_REGIONS)
+    try:
+        import botocore.session
+
+        names |= set(botocore.session.get_session().get_available_regions("bedrock"))
+    except Exception:
+        pass
+
+    return {
+        name: _REGION_LABELS.get(name, name)
+        for name in sorted(names)
+        if not name.startswith("us-gov-")
+    }
+
+
+# 兼容既有引用；实际列表由 supported_regions() 动态给出
+REGIONS: dict[str, str] = supported_regions()
 
 
 class BedrockError(RuntimeError):

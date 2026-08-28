@@ -21,7 +21,7 @@
       </select>
     </label>
     <label class="f">
-      <span>区域</span>
+      <span>区域（官方支持清单）</span>
       <select id="region" onchange="loadModels()">
         {% for code, name in bedrock_regions.items() %}
         <option value="{{ code }}">{{ code }} — {{ name }}</option>

@@ -337,7 +337,7 @@ def bedrock_page(request: Request, _: None = Guard):
     return templates.TemplateResponse(
         request,
         "bedrock.html",
-        {**_page_ctx("bd-models"), "bedrock_regions": bedrock.REGIONS},
+        {**_page_ctx("bd-models"), "bedrock_regions": bedrock.supported_regions()},
     )
 
 
@@ -346,7 +346,7 @@ def bedrock_play_page(request: Request, _: None = Guard):
     return templates.TemplateResponse(
         request,
         "bedrock_play.html",
-        {**_page_ctx("bd-play"), "bedrock_regions": bedrock.REGIONS},
+        {**_page_ctx("bd-play"), "bedrock_regions": bedrock.supported_regions()},
     )
 
 

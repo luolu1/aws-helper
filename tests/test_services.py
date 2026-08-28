@@ -250,10 +250,50 @@ def test_lightsail_static_ip_marks_idle():
 # ---------- Bedrock ----------
 
 
-def test_bedrock_regions_exclude_unavailable():
-    """ap-east-1 实测没有 Bedrock 端点，不能列进去让用户选。"""
-    assert "ap-east-1" not in bedrock.REGIONS
-    assert "us-east-1" in bedrock.REGIONS
+def test_bedrock_regions_from_official_and_sdk():
+    """区域清单要取官方文档与 SDK endpoint 数据的并集。
+
+    只靠手写会随 AWS 开新区域过期；只靠 botocore 会滞后 ——
+    实测 af-south-1 / eu-north-1 / ap-northeast-3 能返回模型清单，
+    但当前 botocore 版本未收录。
+    """
+    regions = bedrock.supported_regions()
+
+    assert len(regions) >= 30, f"官方文档有 30+ 商业区域，实际 {len(regions)}"
+    for name in ("us-east-1", "us-west-2", "eu-central-1", "sa-east-1"):
+        assert name in regions, name
+    # botocore 未收录但实测可用的，不能漏
+    for name in ("af-south-1", "eu-north-1", "ap-northeast-3"):
+        assert name in regions, f"{name} 实测可用却未列出"
+
+
+def test_bedrock_regions_exclude_hongkong():
+    """香港没有 Bedrock 端点，列出来只会让用户选了报错。"""
+    assert "ap-east-1" not in bedrock.supported_regions()
+
+
+def test_bedrock_regions_exclude_govcloud():
+    """GovCloud 需要单独准入流程，普通账号选了必然失败。"""
+    assert not [r for r in bedrock.supported_regions() if r.startswith("us-gov-")]
+
+
+def test_bedrock_regions_all_have_chinese_labels():
+    for name, label in bedrock.supported_regions().items():
+        assert label != name, f"{name} 缺中文名"
+        assert any("\u4e00" <= ch <= "\u9fff" for ch in label), name
+
+
+def test_bedrock_regions_survive_botocore_failure(monkeypatch):
+    """botocore 取不到数据时要退回官方文档清单，不能返回空。"""
+    import botocore.session
+
+    def boom():
+        raise RuntimeError("no endpoint data")
+
+    monkeypatch.setattr(botocore.session, "get_session", boom)
+    regions = bedrock.supported_regions()
+    assert len(regions) >= 30
+    assert "us-east-1" in regions
 
 
 def test_bedrock_models_parsed():

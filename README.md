@@ -128,18 +128,29 @@ Lightsail 的资源模型和 EC2 完全不同，所以是独立一栏而非复�
 
 **Bedrock 的区域差异**
 
-Bedrock 未在所有区域开放，差异比想象中大。实测：
+Bedrock 未在所有区域开放，且同一区域的模型数量相差数倍。用真实账号实测：
 
 ```
-us-east-1        121 个模型
-us-west-2        114 个模型
-ap-northeast-1    68 个模型
-eu-central-1      42 个模型
-ap-southeast-1    29 个模型
-ap-east-1        没有 Bedrock 端点
+us-east-1        121 个模型      eu-west-2         71 个模型
+us-west-2        114 个模型      ap-northeast-1    68 个模型
+us-east-2         90 个模型      sa-east-1         60 个模型
+ap-south-1        73 个模型      af-south-1        11 个模型
+ap-east-1（香港）  没有 Bedrock 端点
 ```
 
-所以 Bedrock 栏的区域下拉是独立的，只列实测可用的区域。
+区域清单的来源是 **AWS 官方文档《Amazon Bedrock endpoints and quotas》∪ botocore
+内置的 endpoint 数据**，不是靠实测账号推断：
+
+- 只靠手写清单会随 AWS 开新区域而过期
+- 只靠 botocore 会滞后 —— 实测 `af-south-1` / `eu-north-1` / `ap-northeast-3`
+  能正常返回模型清单，但当前 botocore 版本并未收录
+- 只靠实测更不行 —— 那只反映当次账号的可见范围，换个账号结论就变
+
+GovCloud 需单独准入流程，已排除；香港没有端点，也排除。
+
+要强调的是：**能列出不等于你的账号能用。** 部分区域可能完全无权访问
+（实测 `eu-central-2` / `eu-south-1` / `il-central-1` 返回 AccessDenied）。
+页面上的「可用性探测」会实际调一次 API 确认，这才是账号维度的结论。
 
 模型清单会标出调用方式：`ON_DEMAND` 可直接按需调用，`INFERENCE_PROFILE`
 需要推理配置文件或预置吞吐量。调用测试只列前者的文本模型，避免选了才报
@@ -511,7 +522,7 @@ pip install "moto[ec2,server]==5.0.28" pytest httpx PyYAML
 python3 -m pytest tests/ -q
 ```
 
-406 个测试，全部用 moto 模拟 EC2，不碰真实 AWS 账号。覆盖开机全链路、UserData 注入与顺序、
+410 个测试，全部用 moto 模拟 EC2，不碰真实 AWS 账号。覆盖开机全链路、UserData 注入与顺序、
 安全组端口、换 IP 两种策略、弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、
 密码哈希与登录锁定、CLI 重置、部署脚本静态检查。
 
@@ -550,7 +561,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                406 项测试
+tests/                410 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

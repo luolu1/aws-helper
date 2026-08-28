@@ -7,8 +7,9 @@
   <p class="hint">
     Bedrock 是纯 API 服务，没有实例概念 —— 不需要开机、换 IP、清理资源。
     这里做的是看有哪些模型、确认权限是否开通。
-    <strong>区域差异很大</strong>：实测 us-east-1 有 121 个模型，而香港（ap-east-1）
-    完全没有 Bedrock 端点，所以区域列表和 EC2 是分开的。
+    <strong>区域差异很大</strong>：香港（ap-east-1）没有 Bedrock 端点，
+    其他区域的模型数量也相差数倍。区域清单取自 AWS 官方文档与 SDK endpoint 数据，
+    但<strong>能列出不等于你的账号能用</strong> —— 点「可用性探测」实际确认。
   </p>
 
   {% if not accounts %}
@@ -22,7 +23,7 @@
       </select>
     </label>
     <label class="f">
-      <span>区域（仅 Bedrock 可用区域）</span>
+      <span>区域（Bedrock 官方支持清单）</span>
       <select id="region">
         {% for code, name in bedrock_regions.items() %}
         <option value="{{ code }}">{{ code }} — {{ name }}</option>
