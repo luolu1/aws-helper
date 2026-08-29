@@ -20,6 +20,8 @@ CONFIG_DIR="/etc/aws-helper"
 ENV_FILE="$CONFIG_DIR/aws-helper.env"
 SERVICE_USER="awshelper"
 MANAGE_BIN="/usr/local/bin/aws-helper"
+PG_DB="awshelper"
+PG_USER="awshelper"
 
 MODE=""
 BIND_HOST="127.0.0.1"
@@ -245,21 +247,19 @@ gen_secret() {
 }
 
 # 库里已经有密码时，安装脚本不应再宣称"初始密码是 X"
+# 从已有 env 文件里读一个值，用于重装时沿用数据库密码等不该重新生成的配置
+read_env_value() {
+    local key="$1" file="${2:-$ENV_FILE}"
+    [ -f "$file" ] || return 0
+    sed -n "s/^${key}=//p" "$file" | head -1
+}
+
+# 库里已经有密码时，安装脚本不应再宣称"初始密码是 X"
 db_has_password() {
-    local db="$1"
-    [ -f "$db" ] || return 1
-    command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$db" <<'PY' 2>/dev/null
-import sqlite3, sys
-try:
-    conn = sqlite3.connect(sys.argv[1])
-    row = conn.execute(
-        "SELECT 1 FROM settings WHERE key='admin_password_hash' AND value<>''"
-    ).fetchone()
-    sys.exit(0 if row else 1)
-except Exception:
-    sys.exit(1)
-PY
+    command -v sudo >/dev/null 2>&1 || return 1
+    sudo -u postgres psql -tAd "$PG_DB" -c \
+        "SELECT 1 FROM settings WHERE key='admin_password_hash' AND value<>''" \
+        2>/dev/null | grep -q 1
 }
 
 gen_password() {
@@ -280,30 +280,35 @@ print(generate_password())
 }
 
 write_env_file() {
-    local session_key="$1" password="$2"
+    local session_key="$1" password="$2" pg_password="$3"
     mkdir -p "$CONFIG_DIR"
     if [ -f "$ENV_FILE" ]; then
-        info "配置已存在，保留原有密码和会话密钥：$ENV_FILE"
+        info "配置已存在，保留原有密码、会话密钥和数据库连接：$ENV_FILE"
         # 端口和监听地址允许更新，密钥类不动
         sed -i "s|^AWS_HELPER_HOST=.*|AWS_HELPER_HOST=$BIND_HOST|" "$ENV_FILE"
         sed -i "s|^AWS_HELPER_PORT=.*|AWS_HELPER_PORT=$PORT|" "$ENV_FILE"
         return 0
     fi
 
-    cat > "$ENV_FILE" <<EOF
+    cat > "$ENV_FILE" <<ENVEOF
 # AWS 小助手 运行配置（由 install.sh 生成）
 #
 # AWS_HELPER_PASSWORD 仅作为首次启动的初始密码，
 # 密码写入数据库后此项不再生效 —— 改密码请用面板或
 #   aws-helper reset-password
+#
+# AWS_HELPER_DB_PASSWORD 是数据库角色密码，重装时会沿用此值，
+# 不要手工改动，否则连不上已有数据库。
 
 AWS_HELPER_HOST=$BIND_HOST
 AWS_HELPER_PORT=$PORT
 AWS_HELPER_DATA=$DATA_DIR
+AWS_HELPER_DATABASE_URL=$DATABASE_URL
+AWS_HELPER_DB_PASSWORD=$pg_password
 AWS_HELPER_PASSWORD=$password
 AWS_HELPER_SESSION_KEY=$session_key
 AWS_HELPER_SESSION_TTL=86400
-EOF
+ENVEOF
     chmod 600 "$ENV_FILE"
     ok "已写入配置 $ENV_FILE（权限 600）"
 }
@@ -323,6 +328,89 @@ sync_source() {
     fi
     cp "$SOURCE_DIR/requirements.txt" "$INSTALL_DIR/requirements.txt"
     ok "程序文件就位"
+}
+
+# ---------------------------------------------------------------- Postgres
+
+pg_running() {
+    command -v pg_isready >/dev/null 2>&1 && pg_isready -q 2>/dev/null
+}
+
+# 找出发行版的 postgresql 服务名（Debian 系是 postgresql，RHEL 系带版本号）
+pg_service_name() {
+    for name in postgresql postgresql.service postgresql-16 postgresql-15 postgresql-14; do
+        if systemctl list-unit-files "$name*" 2>/dev/null | grep -q "$name"; then
+            echo "$name"
+            return
+        fi
+    done
+    echo "postgresql"
+}
+
+install_postgres() {
+    if pg_running; then
+        ok "检测到已运行的 Postgres"
+    else
+        info "安装 Postgres 服务"
+        local pm pkgs=()
+        pm="$(detect_pkg_manager)"
+        case "$pm" in
+            apt-get) pkgs=(postgresql postgresql-client) ;;
+            dnf|yum) pkgs=(postgresql-server postgresql) ;;
+            apk)     pkgs=(postgresql postgresql-client) ;;
+            zypper)  pkgs=(postgresql-server postgresql) ;;
+            *) die "无法识别包管理器，请手动安装 Postgres 后重试" ;;
+        esac
+        install_packages "${pkgs[@]}"
+
+        # RHEL 系装完需要手工 initdb
+        if [ ! -d /var/lib/pgsql/data/base ] && [ -x /usr/bin/postgresql-setup ]; then
+            /usr/bin/postgresql-setup --initdb >/dev/null 2>&1 || true
+        fi
+
+        local svc
+        svc="$(pg_service_name)"
+        systemctl enable --now "$svc" >/dev/null 2>&1 || systemctl start "$svc" || true
+
+        local i
+        for i in $(seq 1 30); do
+            pg_running && break
+            sleep 1
+        done
+        pg_running || die "Postgres 启动失败，请检查 systemctl status $(pg_service_name)"
+        ok "Postgres 已启动"
+    fi
+}
+
+# 数据库和角色都幂等创建：重装不会覆盖已有数据
+setup_database() {
+    local password="$1"
+
+    info "初始化数据库 $PG_DB"
+    if ! sudo -u postgres psql -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname='$PG_USER'" 2>/dev/null | grep -q 1; then
+        sudo -u postgres psql -q -c \
+            "CREATE ROLE $PG_USER LOGIN PASSWORD '$password'" >/dev/null \
+            || die "创建数据库角色失败"
+        ok "已创建角色 $PG_USER"
+    else
+        # 角色已存在：把密码同步成本次配置里的值，否则连不上
+        sudo -u postgres psql -q -c \
+            "ALTER ROLE $PG_USER WITH PASSWORD '$password'" >/dev/null || true
+        info "角色 $PG_USER 已存在，已同步密码"
+    fi
+
+    if ! sudo -u postgres psql -tAc \
+        "SELECT 1 FROM pg_database WHERE datname='$PG_DB'" 2>/dev/null | grep -q 1; then
+        sudo -u postgres createdb -O "$PG_USER" "$PG_DB" >/dev/null \
+            || die "创建数据库失败"
+        ok "已创建数据库 $PG_DB"
+    else
+        info "数据库 $PG_DB 已存在，保留原有数据"
+    fi
+
+    sudo -u postgres psql -q -d "$PG_DB" -c \
+        "GRANT ALL ON SCHEMA public TO $PG_USER" >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------- systemd
@@ -366,21 +454,44 @@ install_systemd() {
 
     info "安装 Python 依赖（较慢，请稍候）"
     "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
+    # 这一步只验证依赖装全了。web.app 在导入时就会连数据库，
+    # 所以完整自检要等库建好之后再做。
     "$INSTALL_DIR/venv/bin/python" -c "
 import sys
 sys.path.insert(0, '$INSTALL_DIR')
-import aws_helper.web.app  # noqa
-print('导入自检通过')
-" >/dev/null || die "依赖装好但程序导入失败，请检查上面的错误"
+import fastapi, uvicorn, boto3, psycopg, psycopg_pool  # noqa
+import aws_helper.core.aws, aws_helper.auth  # noqa
+" >/dev/null || die "依赖装好但导入失败，请检查上面的错误"
     ok "依赖安装完成"
+
+    install_postgres
 
     mkdir -p "$DATA_DIR"
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$DATA_DIR"
     chmod 700 "$DATA_DIR"
-    ok "数据目录 $DATA_DIR"
+    ok "数据目录 $DATA_DIR（仅存加密密钥，业务数据在 Postgres）"
+
+    # 数据库密码存在 env 文件里，重装时沿用，避免连不上已有库
+    local pg_password
+    pg_password="$(read_env_value AWS_HELPER_DB_PASSWORD)"
+    [ -n "$pg_password" ] || pg_password="$(gen_secret)"
+    setup_database "$pg_password"
+    DATABASE_URL="postgresql://${PG_USER}:${pg_password}@127.0.0.1:5432/${PG_DB}"
+
+    info "验证数据库连接并建表"
+    sudo -u "$SERVICE_USER" env \
+        AWS_HELPER_DATA="$DATA_DIR" \
+        AWS_HELPER_DATABASE_URL="$DATABASE_URL" \
+        PYTHONPATH="$INSTALL_DIR" \
+        "$INSTALL_DIR/venv/bin/python" -c "
+from aws_helper.store import Store
+s = Store()
+s.close()
+" >/dev/null || die "无法连接数据库或建表失败，请检查 Postgres 状态"
+    ok "数据库连接正常"
 
     local password session_key
-    if db_has_password "$DATA_DIR/aws-helper.db"; then
+    if db_has_password; then
         # 已有密码时不能再打印新生成的值 —— 它不会生效，只会误导用户
         password=""
         info "检测到已有数据，沿用原密码（忘记了用 aws-helper reset-password）"
@@ -388,7 +499,7 @@ print('导入自检通过')
         password="${PASSWORD:-$(gen_password)}"
     fi
     session_key="$(gen_secret)"
-    write_env_file "$session_key" "${password:-$(gen_password)}"
+    write_env_file "$session_key" "${password:-$(gen_password)}" "$pg_password"
     chown root:"$SERVICE_USER" "$ENV_FILE"
     chmod 640 "$ENV_FILE"
 
@@ -397,8 +508,9 @@ print('导入自检通过')
 [Unit]
 Description=AWS 小助手 — 一键开机 / 换 IP / 开机脚本
 Documentation=file://$INSTALL_DIR/aws_helper/README.md
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
+Requires=postgresql.service
 
 [Service]
 Type=simple
@@ -526,31 +638,63 @@ install_docker() {
 
     local password session_key
     session_key="$(gen_secret)"
-    if docker volume inspect aws-helper-data >/dev/null 2>&1; then
+    if docker volume inspect aws-helper-db >/dev/null 2>&1; then
         password=""
-        info "检测到已有数据卷，沿用原密码（忘记了用 aws-helper reset-password）"
+        info "检测到已有数据库卷，沿用原密码（忘记了用 aws-helper reset-password）"
     else
         password="${PASSWORD:-$(gen_password)}"
     fi
 
-    # compose 读取同目录 .env；密钥类不覆盖已有值
+    # compose 读取同目录 .env；数据库口令不能覆盖（卷已按它初始化）
     if [ -f "$INSTALL_DIR/.env" ]; then
-        info "保留已有 $INSTALL_DIR/.env 中的密码与会话密钥"
+        info "保留已有 $INSTALL_DIR/.env 中的会话密钥与数据库口令"
         sed -i "s|^AWS_HELPER_BIND=.*|AWS_HELPER_BIND=$BIND_HOST|" "$INSTALL_DIR/.env"
         sed -i "s|^AWS_HELPER_PORT=.*|AWS_HELPER_PORT=$PORT|" "$INSTALL_DIR/.env"
+
+        # 数据库卷是新的（库里还没密码）时，初始密码必须同步进 .env，
+        # 否则摘要打印的是本次生成的值、容器读到的却是上一轮遗留的旧值
+        if [ -n "$password" ]; then
+            if grep -q "^AWS_HELPER_PASSWORD=" "$INSTALL_DIR/.env"; then
+                sed -i "s|^AWS_HELPER_PASSWORD=.*|AWS_HELPER_PASSWORD=$password|" \
+                    "$INSTALL_DIR/.env"
+            else
+                echo "AWS_HELPER_PASSWORD=$password" >> "$INSTALL_DIR/.env"
+            fi
+        fi
+
+        # 从旧版本（SQLite 时代）升级上来的 .env 没有数据库配置，
+        # 缺了 compose 会直接报 required variable is missing 而无法启动
+        local key
+        for key in POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD; do
+            grep -q "^${key}=" "$INSTALL_DIR/.env" && continue
+            case "$key" in
+                POSTGRES_DB)       echo "${key}=${PG_DB}" ;;
+                POSTGRES_USER)     echo "${key}=${PG_USER}" ;;
+                POSTGRES_PASSWORD) echo "${key}=$(gen_secret)" ;;
+            esac >> "$INSTALL_DIR/.env"
+            info "已补齐缺失的 $key"
+        done
     else
-        # 卷已存在但 .env 丢了：env 里的值不会生效，随便填个占位即可
+        # 卷已存在但 .env 丢了：env 里的面板密码不会生效，随便填个占位即可；
+        # 但数据库口令必须与卷里已初始化的一致，丢了就连不上，只能重建卷
         local env_password="${password:-$(gen_password)}"
-        cat > "$INSTALL_DIR/.env" <<EOF
+        cat > "$INSTALL_DIR/.env" <<ENVEOF
 # AWS 小助手 Docker 部署配置（由 install.sh 生成）
+#
+# POSTGRES_PASSWORD 在数据库卷首次初始化时写入库中，之后不可更改。
+# 丢失此值将无法连接已有数据卷。
+
 AWS_HELPER_BIND=$BIND_HOST
 AWS_HELPER_PORT=$PORT
+POSTGRES_DB=$PG_DB
+POSTGRES_USER=$PG_USER
+POSTGRES_PASSWORD=$(gen_secret)
 AWS_HELPER_PASSWORD=$env_password
 AWS_HELPER_SESSION_KEY=$session_key
 AWS_HELPER_SESSION_TTL=86400
-EOF
+ENVEOF
         chmod 600 "$INSTALL_DIR/.env"
-        ok "已写入 $INSTALL_DIR/.env（权限 600）"
+        ok "已写入 $INSTALL_DIR/.env（权限 600，含数据库口令）"
     fi
 
     info "构建镜像（首次较慢）"
@@ -587,6 +731,8 @@ ENV_FILE="$ENV_FILE"
 SERVICE_NAME="$SERVICE_NAME"
 SERVICE_USER="$SERVICE_USER"
 COMPOSE_BIN="${COMPOSE_BIN:-docker compose}"
+PG_DB="$PG_DB"
+PG_USER="$PG_USER"
 EOF
 
     cat >> "$target" <<'EOF'
@@ -616,8 +762,13 @@ app_cli() {
     if [ "$MODE" = "docker" ]; then
         compose exec -T aws-helper python -m aws_helper.cli "$@"
     else
+        # CLI 直连数据库，连接串从服务的 env 文件里取
+        local dsn
+        dsn="$(sed -n 's/^AWS_HELPER_DATABASE_URL=//p' "$ENV_FILE" | head -1)"
         sudo -u "$SERVICE_USER" \
-            env AWS_HELPER_DATA="$DATA_DIR" PYTHONPATH="$INSTALL_DIR" \
+            env AWS_HELPER_DATA="$DATA_DIR" \
+                AWS_HELPER_DATABASE_URL="$dsn" \
+                PYTHONPATH="$INSTALL_DIR" \
             "$INSTALL_DIR/venv/bin/python" -m aws_helper.cli "$@"
     fi
 }
@@ -680,18 +831,23 @@ case "${1:-}" in
         case "${yn,,}" in
             y|yes)
                 if [ "$MODE" = "docker" ]; then
+                    # -v 同时删掉数据库卷和加密密钥卷
                     compose down -v || true
                 else
+                    # 数据在 Postgres 里，光删目录不够
+                    sudo -u postgres dropdb --if-exists "$PG_DB" 2>/dev/null || true
+                    sudo -u postgres psql -q -c "DROP ROLE IF EXISTS $PG_USER" \
+                        >/dev/null 2>&1 || true
                     rm -rf "$DATA_DIR"
                 fi
                 rm -rf "$CONFIG_DIR"
-                echo "数据已删除"
+                echo "数据已删除（含数据库）"
                 ;;
             *)
                 if [ "$MODE" = "docker" ]; then
-                    echo "数据保留在 docker 卷中（docker volume ls 可查看）"
+                    echo "数据保留在 docker 卷 aws-helper-db / aws-helper-data 中"
                 else
-                    echo "数据保留在 $DATA_DIR"
+                    echo "数据保留在 Postgres 数据库 $PG_DB 与 $DATA_DIR"
                 fi
                 ;;
         esac
@@ -794,10 +950,12 @@ print_summary() {
     fi
     if [ "$MODE" = "systemd" ]; then
         echo "  虚拟环境  : $INSTALL_DIR/venv"
-        echo "  数据目录  : $DATA_DIR"
+        echo "  数据库    : Postgres 本机 ${PG_DB}（角色 ${PG_USER}）"
+        echo "  加密密钥  : $DATA_DIR/secret.key"
         echo "  配置文件  : $ENV_FILE"
     else
-        echo "  数据卷    : docker volume（aws-helper-data）"
+        echo "  数据库    : docker volume aws-helper-db（Postgres 16）"
+        echo "  加密密钥  : docker volume aws-helper-data"
         echo "  配置文件  : $INSTALL_DIR/.env"
     fi
     echo "----------------------------------------------------------------------"

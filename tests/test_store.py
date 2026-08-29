@@ -7,21 +7,35 @@ import pytest
 from aws_helper.store import Store
 
 
-def test_secret_key_is_encrypted_at_rest(store):
-    """落盘的任何文件里都不能出现明文 Secret Key。
+def _raw_column(store, sql: str, args=()):
+    """绕过 Store 的解密逻辑，直接读库里存的原始值。"""
+    with store.pool.connection() as conn:
+        return conn.execute(sql, args).fetchone()
 
-    SQLite 处于 WAL 模式，新写入先进 .db-wal，所以要扫整个数据目录，
-    只看主库文件会漏检。
-    """
+
+def test_secret_key_is_encrypted_at_rest(store):
+    """库里存的必须是密文，明文 Secret Key 不能落库。"""
     store.add_account("acct", "AKIAEXAMPLE", "SUPERSECRETVALUE", "us-east-1")
 
-    on_disk = [p for p in store.dir.iterdir() if p.is_file()]
-    assert on_disk
-    for path in on_disk:
-        assert b"SUPERSECRETVALUE" not in path.read_bytes(), f"明文泄漏于 {path.name}"
+    row = _raw_column(
+        store, "SELECT access_key, secret_blob FROM accounts WHERE label=%s", ("acct",)
+    )
+    assert "SUPERSECRETVALUE" not in row["secret_blob"], "明文泄漏到数据库"
+    assert row["secret_blob"].startswith("gAAAAA"), "应为 Fernet 密文"
 
     # Access Key 不是机密，按设计明文存储以便展示掩码
-    assert any(b"AKIAEXAMPLE" in p.read_bytes() for p in on_disk)
+    assert row["access_key"] == "AKIAEXAMPLE"
+
+
+def test_secret_key_not_written_to_data_dir(store):
+    """数据目录只放加密密钥，不该出现任何业务数据。"""
+    store.add_account("acct2", "AKIAEXAMPLE2", "ANOTHERSECRET", "us-east-1")
+
+    for path in store.dir.iterdir():
+        if path.is_file():
+            raw = path.read_bytes()
+            assert b"ANOTHERSECRET" not in raw, f"明文泄漏于 {path.name}"
+            assert b"AKIAEXAMPLE2" not in raw, f"业务数据泄漏于 {path.name}"
 
 
 def test_credentials_roundtrip(store):
@@ -67,7 +81,12 @@ def test_keypair_encrypted_and_retrievable(store):
     aid = store.add_account("a", "AKIA1", "sk", "us-east-1")
     store.save_keypair(aid, "us-east-1", "k1", "-----BEGIN PRIVATE KEY-----xyz")
     assert store.get_private_key(aid, "us-east-1", "k1").endswith("xyz")
-    assert b"BEGIN PRIVATE KEY" not in store.db_path.read_bytes()
+
+    row = _raw_column(
+        store, "SELECT private_key FROM keypairs WHERE key_name=%s", ("k1",)
+    )
+    assert "BEGIN PRIVATE KEY" not in row["private_key"], "私钥明文落库"
+    assert row["private_key"].startswith("gAAAAA")
 
 
 def test_keypair_missing_returns_none(store):

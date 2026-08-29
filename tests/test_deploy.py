@@ -261,6 +261,111 @@ def test_dockerfile_copies_app_after_deps():
     assert text.index("requirements.txt") < text.index("COPY aws_helper")
 
 
+# ---------- Postgres 集成 ----------
+
+
+def test_requirements_include_postgres_driver():
+    text = REQUIREMENTS.read_text().lower()
+    assert "psycopg" in text
+    assert "psycopg-pool" in text
+
+
+def test_install_sets_up_postgres():
+    """systemd 模式要自动装并初始化 Postgres，否则装完连不上库。"""
+    text = INSTALL_SH.read_text()
+    assert "install_postgres()" in text
+    assert "setup_database()" in text
+    assert "AWS_HELPER_DATABASE_URL=" in text
+
+
+def test_database_setup_is_idempotent():
+    """重装不能覆盖已有数据库，角色和库都要先查再建。"""
+    text = INSTALL_SH.read_text()
+    assert "FROM pg_roles WHERE rolname" in text
+    assert "FROM pg_database WHERE datname" in text
+    assert "保留原有数据" in text
+
+
+def test_db_password_reused_on_reinstall():
+    """数据库口令必须从已有 env 沿用 —— 重新生成会连不上已初始化的库。"""
+    text = INSTALL_SH.read_text()
+    assert "read_env_value AWS_HELPER_DB_PASSWORD" in text
+
+
+def test_unit_depends_on_postgres():
+    """服务必须在 Postgres 之后启动，否则首次建表失败。"""
+    text = INSTALL_SH.read_text()
+    assert "Requires=postgresql.service" in text
+    assert "After=network-online.target postgresql.service" in text
+
+
+def test_schema_check_runs_after_database_ready():
+    """完整导入自检要排在建库之后。
+
+    web.app 在导入时就会连数据库，放在建库之前必然失败。
+    """
+    text = INSTALL_SH.read_text()
+    assert text.index("setup_database") < text.index("验证数据库连接并建表")
+
+
+def test_uninstall_drops_database():
+    """卸载删数据时要连数据库一起删，光删目录会残留全部业务数据。"""
+    text = INSTALL_SH.read_text()
+    assert "dropdb --if-exists" in text
+    assert "DROP ROLE IF EXISTS" in text
+
+
+def test_legacy_env_gets_postgres_keys():
+    """从 SQLite 时代升级上来的 .env 缺 POSTGRES_*，compose 会拒绝启动。"""
+    text = INSTALL_SH.read_text()
+    assert "已补齐缺失的" in text
+    assert "POSTGRES_PASSWORD" in text
+
+
+def test_new_volume_syncs_initial_password():
+    """数据库卷是新的时候，初始密码要同步进 .env。
+
+    否则摘要打印本次生成的密码、容器却读到上一轮遗留的旧值，登录必然失败。
+    """
+    text = INSTALL_SH.read_text()
+    idx = text.index("数据库卷是新的")
+    assert "AWS_HELPER_PASSWORD=$password" in text[idx : idx + 600]
+
+
+def test_compose_has_postgres_service():
+    text = COMPOSE.read_text()
+    assert "postgres:16-alpine" in text
+    assert "aws-helper-db:/var/lib/postgresql/data" in text
+
+
+def test_compose_waits_for_healthy_database():
+    """必须等库 ready 再起面板，否则首次建表会失败。"""
+    import yaml
+
+    data = yaml.safe_load(COMPOSE.read_text())
+    depends = data["services"]["aws-helper"]["depends_on"]
+    assert depends["postgres"]["condition"] == "service_healthy"
+    assert "healthcheck" in data["services"]["postgres"]
+
+
+def test_compose_database_not_exposed():
+    """数据库不该映射到主机端口，只允许 compose 网络内访问。"""
+    data = __import__("yaml").safe_load(COMPOSE.read_text())
+    assert "ports" not in data["services"]["postgres"]
+
+
+def test_compose_requires_db_password():
+    """POSTGRES_PASSWORD 必须显式配置，不能悄悄用空密码建库。"""
+    text = COMPOSE.read_text()
+    assert "POSTGRES_PASSWORD:?" in text
+
+
+def test_compose_separates_data_volumes():
+    """数据库和加密密钥分开放：密钥丢了数据也解不开，不该同卷。"""
+    data = __import__("yaml").safe_load(COMPOSE.read_text())
+    assert set(data["volumes"]) == {"aws-helper-db", "aws-helper-data"}
+
+
 # ---------- docker-compose.yml ----------
 
 

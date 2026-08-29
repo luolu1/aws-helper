@@ -194,7 +194,12 @@ class Monitor:
             try:
                 run_once(self.store)
             except Exception as exc:
-                self.store.log("autoip", "", False, f"监控循环异常: {exc}")
+                # 记日志本身也要连数据库。库短暂不可用时这一句会二次抛出，
+                # 未捕获就会让监控线程直接死掉、之后永不恢复。
+                try:
+                    self.store.log("autoip", "", False, f"监控循环异常: {exc}")
+                except Exception:
+                    pass
             self._stop.wait(self.tick)
 
 

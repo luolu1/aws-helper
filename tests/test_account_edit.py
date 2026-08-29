@@ -127,8 +127,12 @@ def test_credentials_region_override_keeps_proxy(store):
     assert creds.proxy == "socks5h://1.1.1.1:1080"
 
 
-def test_migration_adds_proxy_column(tmp_path):
-    """旧库（没有 proxy_blob 列）打开后应自动补列，且原数据完好。"""
+def test_migration_from_legacy_sqlite_without_proxy_column(tmp_path):
+    """旧 SQLite 缺 proxy_blob 列时也要能迁移，且原数据完好。
+
+    proxy_blob 是后加的列，更早版本的库没有它 —— 迁移必须按实际存在的
+    列取交集，不能假定 schema 一致。
+    """
     import sqlite3
     import time
 

@@ -1,4 +1,39 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aws-helper-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-awshelper}
+      POSTGRES_USER: ${POSTGRES_USER:-awshelper}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?需在 .env 里设置 POSTGRES_PASSWORD}
+      # 数据目录放在卷的子目录，避免卷根目录被 initdb 判为非空
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - aws-helper-db:/var/lib/postgresql/data
+
+    # 不映射端口：只允许同一 compose 网络内的面板访问
+    expose:
+      - "5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-awshelper} -d ${POSTGRES_DB:-awshelper}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   aws-helper:
     build:
       context: .
@@ -7,12 +42,20 @@ services:
     container_name: aws-helper
     restart: unless-stopped
 
+    # 必须等库真正 ready 再启动，否则首次建表会失败
+    depends_on:
+      postgres:
+        condition: service_healthy
+
     # 默认只绑本机。要对外暴露把 AWS_HELPER_BIND 改成 0.0.0.0，
     # 并务必在前面加 HTTPS 反代 —— 面板持有 AWS 凭据。
     ports:
       - "${AWS_HELPER_BIND:-127.0.0.1}:${AWS_HELPER_PORT:-8765}:8765"
 
     environment:
+      AWS_HELPER_DATABASE_URL: >-
+        postgresql://${POSTGRES_USER:-awshelper}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-awshelper}
+      # 只放加密密钥，业务数据都在 Postgres
       AWS_HELPER_DATA: /data
       AWS_HELPER_HOST: 0.0.0.0
       AWS_HELPER_PORT: 8765
@@ -28,7 +71,7 @@ services:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/healthz"]
       interval: 30s
       timeout: 5s
-      start_period: 15s
+      start_period: 20s
       retries: 3
 
     security_opt:
@@ -41,5 +84,7 @@ services:
         max-file: "3"
 
 volumes:
+  aws-helper-db:
+    name: aws-helper-db
   aws-helper-data:
     name: aws-helper-data

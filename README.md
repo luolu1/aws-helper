@@ -6,7 +6,8 @@ AWS 管理面板，覆盖 **EC2 / Lightsail / Bedrock** 三类服务。
 现有的多云面板里 AWS 基本都是"顺带支持"：能列实例但注入不了开机脚本，能开机但换不了 IP，
 更没有 IP 被墙后自动更换。这个工具只做 AWS，把这几件事做完整。
 
-支持 **systemd（Python 虚拟环境隔离）** 和 **Docker Compose** 两种一键部署，可并存于不同端口。
+数据存 **Postgres**，两种一键部署都会自动装好并初始化数据库：
+**systemd（Python 虚拟环境隔离）** 和 **Docker Compose**，可并存于不同端口。
 
 ```bash
 git clone https://github.com/luolu1/aws-helper.git
@@ -320,27 +321,45 @@ sudo bash deploy/install.sh --mode docker --host 0.0.0.0 --port 8080 --password 
 ### 方式一：systemd + Python 虚拟环境
 
 依赖装在 `/opt/aws-helper/venv`，**完全不碰系统 Python**，避免环境冲突。
-以专用系统用户 `awshelper` 运行，非 root。
+以专用系统用户 `awshelper` 运行，非 root。Postgres 由脚本自动安装并初始化。
 
 | 项目 | 路径 |
 |---|---|
 | 程序 | `/opt/aws-helper/aws_helper` |
 | 虚拟环境 | `/opt/aws-helper/venv` |
-| 数据 | `/var/lib/aws-helper`（权限 700） |
+| 数据库 | 本机 Postgres，库 `awshelper`、角色 `awshelper` |
+| 加密密钥 | `/var/lib/aws-helper/secret.key`（权限 700 目录） |
 | 配置 | `/etc/aws-helper/aws-helper.env`（权限 640） |
 | 服务单元 | `/etc/systemd/system/aws-helper.service` |
 
-单元里开了 `ProtectSystem=strict`、`NoNewPrivileges`、`PrivateTmp`，只有数据目录可写。
-开机自启，异常退出 5 秒后自动重启。
+单元里开了 `ProtectSystem=strict`、`NoNewPrivileges`、`PrivateTmp`，只有数据目录可写，
+并声明 `Requires=postgresql.service` 保证启动顺序。开机自启，异常退出 5 秒后自动重启。
 
-缺 `python3-venv` 时脚本会自动安装。要求 **Python 3.10+**。
+建库和建角色都是**幂等**的：重装会保留已有数据，数据库口令也从
+`/etc/aws-helper/aws-helper.env` 沿用（重新生成就连不上已初始化的库了）。
+
+缺 `python3-venv` 或 Postgres 时脚本会自动安装。要求 **Python 3.10+**。
 
 ### 方式二：Docker Compose
 
-构建镜像后用 compose 运行，数据存命名卷 `aws-helper-data`。
+两个容器：`aws-helper`（面板）+ `aws-helper-db`（Postgres 16），
+用 `depends_on: service_healthy` 保证面板在库 ready 之后才启动 ——
+否则首次建表会失败。
 
-容器内以 uid 999 的 `awshelper` 用户运行，带 `no-new-privileges`，内置 healthcheck。
+| 卷 | 内容 |
+|---|---|
+| `aws-helper-db` | Postgres 数据 |
+| `aws-helper-data` | Fernet 加密密钥 |
+
+**两个卷都要备份。** 密钥和数据分开存放是有意的：库泄漏时凭据仍解不开，
+但反过来说，密钥丢了数据也无法恢复。
+
+数据库不映射主机端口，只允许 compose 网络内访问。面板容器内以 uid 999 的
+`awshelper` 用户运行，带 `no-new-privileges`，内置 healthcheck。
 端口默认只映射到 `127.0.0.1`，日志轮转限制 10MB × 3 份。
+
+`POSTGRES_PASSWORD` 在 `.env` 里，卷首次初始化时写入库中，**之后不可更改**。
+丢了这个值就连不上已有数据卷。
 
 脚本会先验证 compose **真的能连上 docker 守护进程**，而不只是检查命令存在 ——
 `docker-compose` 1.29 在新版 requests 环境下会抛
@@ -454,8 +473,11 @@ aws-helper logout-all    # 只下线所有会话，不改密码
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `AWS_HELPER_DATABASE_URL` | `postgresql://awshelper@127.0.0.1:5432/awshelper` | Postgres 连接串 |
+| `AWS_HELPER_DB_SCHEMA` | `public` | 数据库 schema，多环境共库时可分开 |
+| `AWS_HELPER_DB_POOL` | `8` | 连接池上限 |
 | `AWS_HELPER_PASSWORD` | 随机生成 | **仅**用作首次启动的初始密码，库里已有密码后不再生效 |
-| `AWS_HELPER_DATA` | `~/.aws-helper` | 数据目录 |
+| `AWS_HELPER_DATA` | `~/.aws-helper` | 加密密钥存放目录（业务数据在数据库） |
 | `AWS_HELPER_HOST` | `127.0.0.1` | 监听地址 |
 | `AWS_HELPER_PORT` | `8765` | 监听端口 |
 | `AWS_HELPER_SESSION_TTL` | `86400` | 会话有效期（秒） |
@@ -465,6 +487,50 @@ aws-helper logout-all    # 只下线所有会话，不改密码
 
 `AWS_HELPER_PASSWORD` 只在库里还没有密码时用作初始值 —— 否则你在面板改了密码，
 重启又被环境变量覆盖回去。
+
+---
+
+## 数据存储
+
+业务数据全部在 **Postgres**，`AWS_HELPER_DATA` 目录只放一个文件：`secret.key`。
+
+| 位置 | 内容 |
+|---|---|
+| Postgres | AWS 账号（密文）、密钥对（密文）、代理（密文）、脚本模板、换 IP 规则、会话、日志 |
+| `secret.key` | Fernet 加密密钥 |
+
+**两者都要备份，且缺一不可**：库里的凭据用这把密钥加密，密钥丢了数据解不开；
+密钥在手但库没了同样什么都没有。分开存放的意义是数据库被拖走时凭据仍然安全。
+
+### 从旧版本（SQLite）升级
+
+早期版本用 SQLite。升级后**首次启动会自动迁移** —— 检测到数据库为空且
+数据目录里存在 `aws-helper.db` 时，把 9 张表的数据全部导入，包括加密字段
+（密钥没变所以照样能解密）、密码哈希、日志。
+
+迁移完成后旧文件改名为 `aws-helper.db.migrated`，下次启动不再处理。
+如果库里已有数据，绝不会导入 —— 避免误覆盖。
+
+`SERIAL` 序列会在迁移后校正到当前最大 id，否则下一次插入会撞主键。
+
+### 备份
+
+**systemd 部署：**
+
+```bash
+sudo -u postgres pg_dump awshelper > awshelper-$(date +%F).sql
+sudo cp /var/lib/aws-helper/secret.key ./secret.key.bak
+```
+
+**Docker 部署：**
+
+```bash
+cd /opt/aws-helper-docker
+docker compose exec -T postgres pg_dump -U awshelper awshelper > awshelper-$(date +%F).sql
+docker compose exec -T aws-helper cat /data/secret.key > secret.key.bak
+```
+
+恢复时先建空库导入 SQL，再把 `secret.key` 放回数据目录。
 
 ---
 
@@ -517,14 +583,26 @@ python3 -m aws_helper                    # 直接运行，默认 127.0.0.1:8765
 
 跑测试：
 
+测试需要一个可用的 Postgres（数据库层不做 mock，直接跑真实 SQL）：
+
 ```bash
+docker run -d --name pgtest -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_DB=awshelper -p 15432:5432 postgres:16-alpine
+
 pip install "moto[ec2,server]==5.0.28" pytest httpx PyYAML
 python3 -m pytest tests/ -q
 ```
 
-410 个测试，全部用 moto 模拟 EC2，不碰真实 AWS 账号。覆盖开机全链路、UserData 注入与顺序、
-安全组端口、换 IP 两种策略、弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、
-密码哈希与登录锁定、CLI 重置、部署脚本静态检查。
+连接串默认 `postgresql://postgres:test@127.0.0.1:15432/awshelper`，
+可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖。库不可达时相关测试自动 skip。
+
+每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
+upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
+
+443 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
+弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
+CLI 重置、SQLite 迁移与序列校正、并发写入、部署脚本静态检查。
 
 代理相关测试会起一个真实的 SOCKS5 服务器（支持 RFC 1929 认证），
 断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -545,7 +623,7 @@ bash aws_helper/demo/start.sh 127.0.0.1 8765
 aws_helper/
   auth.py             密码哈希、强度校验、登录锁定
   cli.py              密码重置 / 状态查看 / 下线会话
-  store.py            SQLite 持久层（加密凭据、会话、规则、日志）
+  store.py            Postgres 持久层（加密凭据、会话、规则、日志、SQLite 迁移）
   autoip.py           自动换 IP 监控循环
   tasks.py            后台任务与进度跟踪
   core/aws.py         boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
@@ -561,7 +639,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                410 项测试
+tests/                443 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

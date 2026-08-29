@@ -83,18 +83,29 @@ aws-helper uninstall         # 卸载，会分别询问是否删除数据
 
 ## 手动运行（开发用）
 
+需要一个可用的 Postgres。最省事的方式：
+
 ```bash
+docker run -d --name awshelper-pg -e POSTGRES_PASSWORD=dev \
+    -e POSTGRES_DB=awshelper -p 5432:5432 postgres:16-alpine
+
 pip install -r requirements.txt
+export AWS_HELPER_DATABASE_URL='postgresql://postgres:dev@127.0.0.1:5432/awshelper'
 python3 -m aws_helper
 ```
 
-首次启动会生成随机初始密码并打印到控制台，打开 http://127.0.0.1:8765 登录，
-之后在「用户面板」里改成自己的密码。
+建表是自动的，不需要手工执行 DDL。首次启动会生成随机初始密码并打印到控制台，
+打开 http://127.0.0.1:8765 登录，之后在「用户面板」里改成自己的密码。
+
+用 `deploy/install.sh` 部署时不需要这些 —— 脚本会自动装好数据库并写好连接串。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `AWS_HELPER_PASSWORD` | 随机生成 | **仅**用作首次启动的初始密码，库里已有密码后不再生效 |
-| `AWS_HELPER_DATA` | `~/.aws-helper` | 数据目录（SQLite + 加密密钥） |
+| `AWS_HELPER_DATABASE_URL` | `postgresql://awshelper@127.0.0.1:5432/awshelper` | Postgres 连接串 |
+| `AWS_HELPER_DB_SCHEMA` | `public` | 数据库 schema |
+| `AWS_HELPER_DB_POOL` | `8` | 连接池上限 |
+| `AWS_HELPER_DATA` | `~/.aws-helper` | 加密密钥目录（业务数据在数据库） |
 | `AWS_HELPER_HOST` | `127.0.0.1` | 监听地址 |
 | `AWS_HELPER_PORT` | `8765` | 监听端口 |
 | `AWS_HELPER_SESSION_TTL` | `86400` | 会话有效期（秒） |
@@ -285,9 +296,30 @@ Bedrock 栏需要：`bedrock:ListFoundationModels`，调用测试还要
 两者都是可选的，缺失时功能降级但不中断。Windows 镜像强依赖 `ssm:GetParameter` ——
 Windows AMI 在 `DescribeImages` 里不可靠（实测 ap-east-1 返回 0 条）。
 
+## 数据存储
+
+业务数据全部在 Postgres，`AWS_HELPER_DATA` 目录只放 `secret.key` 一个文件。
+
+从旧版本（SQLite）升级时首次启动会自动迁移：检测到数据库为空且数据目录里存在
+`aws-helper.db`，就把 9 张表全部导入（含加密字段、密码哈希、日志），
+然后把旧文件改名为 `.db.migrated`。库里已有数据时绝不导入，避免误覆盖。
+
+备份要同时备份数据库和 `secret.key`，缺一不可 —— 库里的凭据用这把密钥加密。
+
+```bash
+# systemd 部署
+sudo -u postgres pg_dump awshelper > awshelper.sql
+sudo cp /var/lib/aws-helper/secret.key ./secret.key.bak
+
+# Docker 部署
+cd /opt/aws-helper-docker
+docker compose exec -T postgres pg_dump -U awshelper awshelper > awshelper.sql
+docker compose exec -T aws-helper cat /data/secret.key > secret.key.bak
+```
+
 ## 凭据存储
 
-AWS Secret Access Key 和代理地址用 Fernet 加密后存 SQLite，页面只显示掩码。
+AWS Secret Access Key 和代理地址用 Fernet 加密后存 Postgres，页面只显示掩码。
 加密密钥取 `AWS_HELPER_SECRET`，未设置时在数据目录生成 `secret.key`（权限 0600）。
 
 换掉密钥会导致已存凭据无法解密——工具会明确报错，不会静默失败。
@@ -300,14 +332,24 @@ Access Key ID 按设计明文存储，用于展示掩码。
 
 ## 测试
 
+数据库层不做 mock，直接跑真实 SQL，所以需要一个可用的 Postgres：
+
 ```bash
-pip install "moto[ec2,server]==5.0.28" pytest httpx PySocks
+docker run -d --name pgtest -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_DB=awshelper -p 15432:5432 postgres:16-alpine
+
+pip install "moto[ec2,server]==5.0.28" pytest httpx PySocks PyYAML
 python3 -m pytest tests/ -q
 ```
 
-240 个测试，不碰真实 AWS 账号。覆盖开机全链路、UserData 注入与顺序、安全组端口、
-换 IP 两种策略、EIP 泄漏与孤儿回收、IP 段规则、凭据与代理加密、账号编辑、
-密码哈希与强度、会话生命周期、登录锁定、CLI 密码重置、自动换 IP 触发与恢复。
+连接串默认 `postgresql://postgres:test@127.0.0.1:15432/awshelper`，
+可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
+每个测试独占一个随机 schema，跑完自动 DROP。
+
+443 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
+IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
+登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、并发写入。
 
 代理相关测试用 [tests/socks_server.py](tests/socks_server.py) 起真实 SOCKS5 服务器
 （支持 RFC 1929 认证），断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -320,15 +362,17 @@ python3 -m pytest tests/ -q
 aws_helper/
   auth.py            密码哈希、强度校验、登录锁定判定
   cli.py             密码重置 / 状态查看 / 下线全部会话
-  core/aws.py        boto3 客户端工厂、SOCKS 代理支持、区域与镜像元数据
+  core/aws.py        boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
   core/userdata.py   开机脚本渲染与校验
   core/launch.py     一键开机、实例列表、电源操作
   core/ipchange.py   换 IP 两种策略、EIP 清理
-  store.py           SQLite 持久层（加密凭据、会话、脚本模板、规则、日志）
+  core/lightsail.py  Lightsail 套餐、蓝图、实例、静态 IP
+  core/bedrock.py    Bedrock 模型清单、可用性探测、Converse 调用
+  store.py           Postgres 持久层（加密凭据、会话、规则、日志、SQLite 迁移）
   tasks.py           后台任务与进度跟踪
   autoip.py          自动换 IP 监控循环
   web/app.py         FastAPI 路由
-  web/templates/     六个页面
+  web/templates/     左侧目录布局 + 十个页面
   demo/              演示环境（moto 后端 + 预置数据）
 
 deploy/install.sh    一键部署（systemd / docker 两种方式）

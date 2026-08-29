@@ -1,8 +1,11 @@
-"""SQLite 持久层：登录凭据、账号、脚本模板、换 IP 规则、会话、日志。
+"""Postgres 持久层：登录凭据、AWS 账号、脚本模板、换 IP 规则、会话、日志。
 
-AWS Secret Key 与代理地址用 Fernet 对称加密后落盘，密钥取自 AWS_HELPER_SECRET；
+AWS Secret Key 与代理地址用 Fernet 对称加密后落库，密钥取自 AWS_HELPER_SECRET；
 未设置时自动生成并存到数据目录下 secret.key（权限 0600）。
 面板登录密码走单向哈希，会话令牌只存 SHA-256 摘要，两者都不可逆。
+
+连接串取自 AWS_HELPER_DATABASE_URL。首次启动若发现库是空的、而数据目录里
+还有旧版遗留的 SQLite 文件，会自动把数据迁移过来。
 """
 
 from __future__ import annotations
@@ -15,58 +18,64 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
+import psycopg
 from cryptography.fernet import Fernet, InvalidToken
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from . import auth
 from .core.aws import Credentials, mask_proxy, normalize_proxy
 
+DEFAULT_DSN = "postgresql://awshelper@127.0.0.1:5432/awshelper"
+
+
+class DatabaseError(RuntimeError):
+    """数据库不可用。"""
+
+
 def default_dir() -> Path:
-    """数据目录。每次调用都重读环境变量，便于测试隔离和运行时切换。"""
+    """数据目录，只用于放加密密钥。每次调用都重读环境变量，便于测试隔离。"""
     return Path(os.environ.get("AWS_HELPER_DATA", "~/.aws-helper")).expanduser()
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def database_url() -> str:
+    return os.environ.get("AWS_HELPER_DATABASE_URL", DEFAULT_DSN)
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     label TEXT NOT NULL UNIQUE,
     access_key TEXT NOT NULL,
     secret_blob TEXT NOT NULL,
     region TEXT NOT NULL DEFAULT 'us-east-1',
     proxy_blob TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL
+    created_at BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS scripts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     body TEXT NOT NULL,
     packages TEXT NOT NULL DEFAULT '[]',
-    created_at INTEGER NOT NULL
+    created_at BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS keypairs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     region TEXT NOT NULL,
     key_name TEXT NOT NULL,
     private_key TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
+    created_at BIGINT NOT NULL,
     UNIQUE(account_id, region, key_name)
 );
 
 CREATE TABLE IF NOT EXISTS ip_rules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     region TEXT NOT NULL,
     instance_id TEXT NOT NULL,
@@ -80,14 +89,14 @@ CREATE TABLE IF NOT EXISTS ip_rules (
     deny_cidrs TEXT NOT NULL DEFAULT '[]',
     max_attempts INTEGER NOT NULL DEFAULT 3,
     fail_count INTEGER NOT NULL DEFAULT 0,
-    last_check INTEGER NOT NULL DEFAULT 0,
-    last_change INTEGER NOT NULL DEFAULT 0,
+    last_check BIGINT NOT NULL DEFAULT 0,
+    last_change BIGINT NOT NULL DEFAULT 0,
     UNIQUE(account_id, region, instance_id)
 );
 
 CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at INTEGER NOT NULL,
+    id SERIAL PRIMARY KEY,
+    created_at BIGINT NOT NULL,
     kind TEXT NOT NULL,
     target TEXT NOT NULL DEFAULT '',
     ok INTEGER NOT NULL DEFAULT 1,
@@ -99,14 +108,14 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at DESC);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL,
-    last_seen INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
+    created_at BIGINT NOT NULL,
+    last_seen BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
     ip TEXT NOT NULL DEFAULT '',
     user_agent TEXT NOT NULL DEFAULT ''
 );
@@ -116,12 +125,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS login_attempts (
     source TEXT PRIMARY KEY,
     fail_count INTEGER NOT NULL DEFAULT 0,
-    last_failed_at INTEGER NOT NULL DEFAULT 0
+    last_failed_at BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS login_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at INTEGER NOT NULL,
+    id SERIAL PRIMARY KEY,
+    created_at BIGINT NOT NULL,
     ok INTEGER NOT NULL,
     ip TEXT NOT NULL DEFAULT '',
     user_agent TEXT NOT NULL DEFAULT '',
@@ -131,6 +140,38 @@ CREATE TABLE IF NOT EXISTS login_history (
 CREATE INDEX IF NOT EXISTS idx_login_history_created
     ON login_history(created_at DESC);
 """
+
+# 迁移用：表名 → 列名。顺序有依赖，accounts 必须先导入
+_MIGRATION_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "accounts",
+        ("id", "label", "access_key", "secret_blob", "region", "proxy_blob",
+         "note", "created_at"),
+    ),
+    ("scripts", ("id", "name", "body", "packages", "created_at")),
+    (
+        "keypairs",
+        ("id", "account_id", "region", "key_name", "private_key", "created_at"),
+    ),
+    (
+        "ip_rules",
+        ("id", "account_id", "region", "instance_id", "enabled", "strategy",
+         "check_mode", "check_port", "interval_sec", "fail_threshold",
+         "allow_cidrs", "deny_cidrs", "max_attempts", "fail_count",
+         "last_check", "last_change"),
+    ),
+    ("logs", ("id", "created_at", "kind", "target", "ok", "detail")),
+    ("settings", ("key", "value", "updated_at")),
+    (
+        "sessions",
+        ("token_hash", "created_at", "last_seen", "expires_at", "ip", "user_agent"),
+    ),
+    ("login_attempts", ("source", "fail_count", "last_failed_at")),
+    (
+        "login_history",
+        ("id", "created_at", "ok", "ip", "user_agent", "detail"),
+    ),
+)
 
 
 @dataclass
@@ -153,28 +194,163 @@ class Account:
 
 
 class Store:
-    """所有持久化操作的入口。线程安全依赖 SQLite 自身的锁。"""
+    """所有持久化操作的入口。并发安全由 Postgres 和连接池保证。"""
 
-    def __init__(self, data_dir: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        data_dir: Path | str | None = None,
+        dsn: str | None = None,
+        schema: str | None = None,
+    ) -> None:
         self.dir = Path(data_dir).expanduser() if data_dir else default_dir()
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.dir / "aws-helper.db"
+        self.dsn = dsn or database_url()
+        self.schema = schema or os.environ.get("AWS_HELPER_DB_SCHEMA", "public")
         self._fernet = Fernet(self._load_secret())
-        self.conn = _connect(self.db_path)
-        self.conn.executescript(SCHEMA)
-        self._migrate()
-        self.conn.commit()
 
-    def _migrate(self) -> None:
-        """为已存在的旧库补齐后加的列，让升级不需要删库。"""
-        cols = {
-            row["name"]
-            for row in self.conn.execute("PRAGMA table_info(accounts)").fetchall()
-        }
-        if "proxy_blob" not in cols:
-            self.conn.execute(
-                "ALTER TABLE accounts ADD COLUMN proxy_blob TEXT NOT NULL DEFAULT ''"
+        try:
+            self.pool = ConnectionPool(
+                self.dsn,
+                min_size=1,
+                max_size=int(os.environ.get("AWS_HELPER_DB_POOL", "8")),
+                open=True,
+                timeout=15,
+                kwargs={"row_factory": dict_row, "options": f"-c search_path={self.schema}"},
             )
+            self.pool.wait(timeout=20)
+        except Exception as exc:
+            raise DatabaseError(
+                f"无法连接 Postgres（{self._safe_dsn()}）: {exc}\n"
+                "请确认数据库已启动、AWS_HELPER_DATABASE_URL 正确"
+            ) from exc
+
+        self._init_schema()
+        self._migrate_from_sqlite()
+
+    def _safe_dsn(self) -> str:
+        """隐去连接串里的密码，用于报错和日志。"""
+        try:
+            info = psycopg.conninfo.conninfo_to_dict(self.dsn)
+        except Exception:
+            return "<dsn>"
+        user = info.get("user", "")
+        host = info.get("host", "")
+        port = info.get("port", "")
+        db = info.get("dbname", "")
+        auth_part = f"{user}:***@" if info.get("password") else (f"{user}@" if user else "")
+        return f"postgresql://{auth_part}{host}:{port}/{db}"
+
+    def _init_schema(self) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema}")
+            conn.execute(f"SET search_path TO {self.schema}")
+            conn.execute(SCHEMA)
+            conn.commit()
+
+    # ---------- SQLite 迁移 ----------
+
+    def _legacy_sqlite_path(self) -> Path:
+        return self.dir / "aws-helper.db"
+
+    def _migrate_from_sqlite(self) -> None:
+        """库为空且存在旧 SQLite 文件时，自动导入。
+
+        只在 accounts 和 settings 都为空时才导入，避免重复迁移覆盖新数据。
+        导入完成后给旧文件改名加 .migrated 后缀，下次启动不再处理。
+        """
+        legacy = self._legacy_sqlite_path()
+        if not legacy.is_file():
+            return
+        if self._row_count("accounts") or self._row_count("settings"):
+            return
+
+        try:
+            imported = self._import_sqlite(legacy)
+        except Exception as exc:
+            self.log("migrate", str(legacy), False, f"迁移失败: {exc}")
+            return
+
+        if imported:
+            legacy.rename(legacy.with_suffix(".db.migrated"))
+            summary = "，".join(f"{name} {n}" for name, n in imported.items() if n)
+            self.log("migrate", "sqlite", True, f"已从 SQLite 迁移: {summary or '空库'}")
+
+    def _import_sqlite(self, path: Path) -> dict[str, int]:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        existing = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        imported: dict[str, int] = {}
+        try:
+            with self.pool.connection() as pg:
+                for table, columns in _MIGRATION_TABLES:
+                    if table not in existing:
+                        continue
+                    available = {
+                        row[1]
+                        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    }
+                    cols = [c for c in columns if c in available]
+                    if not cols:
+                        continue
+
+                    rows = conn.execute(
+                        f"SELECT {','.join(cols)} FROM {table}"
+                    ).fetchall()
+                    if not rows:
+                        continue
+
+                    placeholders = ",".join(["%s"] * len(cols))
+                    pg.cursor().executemany(
+                        f"INSERT INTO {table}({','.join(cols)}) VALUES({placeholders})"
+                        " ON CONFLICT DO NOTHING",
+                        [tuple(row[c] for c in cols) for row in rows],
+                    )
+                    imported[table] = len(rows)
+
+                # SERIAL 序列不会随手工插入的 id 前进，必须校正
+                for table, columns in _MIGRATION_TABLES:
+                    if "id" in columns and table in imported:
+                        pg.execute(
+                            f"SELECT setval(pg_get_serial_sequence('{table}', 'id'),"
+                            f" COALESCE((SELECT MAX(id) FROM {table}), 1))"
+                        )
+                pg.commit()
+        finally:
+            conn.close()
+        return imported
+
+    def _row_count(self, table: str) -> int:
+        with self.pool.connection() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+        return int(row["n"]) if row else 0
+
+    # ---------- 查询辅助 ----------
+
+    def _fetchone(self, sql: str, args: Iterable[Any] = ()) -> dict[str, Any] | None:
+        with self.pool.connection() as conn:
+            return conn.execute(sql, tuple(args)).fetchone()
+
+    def _fetchall(self, sql: str, args: Iterable[Any] = ()) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn:
+            return conn.execute(sql, tuple(args)).fetchall()
+
+    def _execute(self, sql: str, args: Iterable[Any] = ()) -> int:
+        with self.pool.connection() as conn:
+            cur = conn.execute(sql, tuple(args))
+            conn.commit()
+            return cur.rowcount
+
+    def _returning_id(self, sql: str, args: Iterable[Any] = ()) -> int:
+        with self.pool.connection() as conn:
+            row = conn.execute(sql, tuple(args)).fetchone()
+            conn.commit()
+        return int(row["id"]) if row else 0
 
     # ---------- 加密 ----------
 
@@ -215,10 +391,10 @@ class Store:
         note: str = "",
         proxy: str | None = None,
     ) -> int:
-        cur = self.conn.execute(
+        return self._returning_id(
             "INSERT INTO accounts"
             "(label, access_key, secret_blob, region, note, proxy_blob, created_at)"
-            " VALUES(?,?,?,?,?,?,?)",
+            " VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (
                 label,
                 access_key,
@@ -229,8 +405,6 @@ class Store:
                 int(time.time()),
             ),
         )
-        self.conn.commit()
-        return int(cur.lastrowid or 0)
 
     def update_account(
         self,
@@ -248,9 +422,7 @@ class Store:
         secret_key 传 None 保留原密钥，方便编辑时不必重新输入。
         代理清空需显式传 clear_proxy=True，避免与"不修改"混淆。
         """
-        if self.conn.execute(
-            "SELECT 1 FROM accounts WHERE id=?", (account_id,)
-        ).fetchone() is None:
+        if self._fetchone("SELECT 1 FROM accounts WHERE id=%s", (account_id,)) is None:
             raise LookupError(f"账号 {account_id} 不存在")
 
         sets: list[str] = []
@@ -262,27 +434,24 @@ class Store:
             ("note", note),
         ):
             if value is not None:
-                sets.append(f"{column}=?")
+                sets.append(f"{column}=%s")
                 args.append(value)
 
         if secret_key is not None:
-            sets.append("secret_blob=?")
+            sets.append("secret_blob=%s")
             args.append(self._encrypt(secret_key))
 
         if clear_proxy:
-            sets.append("proxy_blob=?")
+            sets.append("proxy_blob=%s")
             args.append("")
         elif proxy is not None:
-            sets.append("proxy_blob=?")
+            sets.append("proxy_blob=%s")
             args.append(self._encrypt_proxy(proxy))
 
         if not sets:
             return
         args.append(account_id)
-        self.conn.execute(
-            f"UPDATE accounts SET {','.join(sets)} WHERE id=?", args
-        )
-        self.conn.commit()
+        self._execute(f"UPDATE accounts SET {','.join(sets)} WHERE id=%s", args)
 
     def _encrypt_proxy(self, proxy: str | None) -> str:
         normalized = normalize_proxy(proxy)
@@ -291,31 +460,30 @@ class Store:
     def _decrypt_proxy(self, blob: str) -> str | None:
         return self._decrypt(blob) if blob else None
 
-    def _to_account(self, row: sqlite3.Row) -> Account:
+    def _to_account(self, row: dict[str, Any]) -> Account:
         data = dict(row)
         proxy_blob = data.pop("proxy_blob", "")
         return Account(**data, proxy=self._decrypt_proxy(proxy_blob))
 
     def list_accounts(self) -> list[Account]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             f"SELECT {self._ACCOUNT_COLS} FROM accounts ORDER BY id DESC"
-        ).fetchall()
+        )
         return [self._to_account(r) for r in rows]
 
     def get_account(self, account_id: int) -> Account:
-        row = self.conn.execute(
-            f"SELECT {self._ACCOUNT_COLS} FROM accounts WHERE id=?",
-            (account_id,),
-        ).fetchone()
+        row = self._fetchone(
+            f"SELECT {self._ACCOUNT_COLS} FROM accounts WHERE id=%s", (account_id,)
+        )
         if row is None:
             raise LookupError(f"账号 {account_id} 不存在")
         return self._to_account(row)
 
     def credentials(self, account_id: int, region: str | None = None) -> Credentials:
-        row = self.conn.execute(
-            "SELECT access_key,secret_blob,region,proxy_blob FROM accounts WHERE id=?",
+        row = self._fetchone(
+            "SELECT access_key,secret_blob,region,proxy_blob FROM accounts WHERE id=%s",
             (account_id,),
-        ).fetchone()
+        )
         if row is None:
             raise LookupError(f"账号 {account_id} 不存在")
         return Credentials(
@@ -326,28 +494,22 @@ class Store:
         )
 
     def delete_account(self, account_id: int) -> None:
-        self.conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-        self.conn.commit()
+        self._execute("DELETE FROM accounts WHERE id=%s", (account_id,))
 
     # ---------- 脚本模板 ----------
 
     def save_script(self, name: str, body: str, packages: list[str] | None = None) -> int:
-        cur = self.conn.execute(
-            "INSERT INTO scripts(name, body, packages, created_at) VALUES(?,?,?,?)"
+        return self._returning_id(
+            "INSERT INTO scripts(name, body, packages, created_at) VALUES(%s,%s,%s,%s)"
             " ON CONFLICT(name) DO UPDATE SET body=excluded.body,"
-            " packages=excluded.packages",
+            " packages=excluded.packages RETURNING id",
             (name, body, json.dumps(packages or []), int(time.time())),
         )
-        self.conn.commit()
-        if cur.lastrowid:
-            return int(cur.lastrowid)
-        row = self.conn.execute("SELECT id FROM scripts WHERE name=?", (name,)).fetchone()
-        return int(row["id"])
 
     def list_scripts(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT id,name,body,packages,created_at FROM scripts ORDER BY id DESC"
-        ).fetchall()
+        )
         return [
             {
                 "id": r["id"],
@@ -360,35 +522,34 @@ class Store:
         ]
 
     def delete_script(self, script_id: int) -> None:
-        self.conn.execute("DELETE FROM scripts WHERE id=?", (script_id,))
-        self.conn.commit()
+        self._execute("DELETE FROM scripts WHERE id=%s", (script_id,))
 
     # ---------- 密钥对 ----------
 
     def save_keypair(
         self, account_id: int, region: str, key_name: str, private_key: str
     ) -> None:
-        self.conn.execute(
+        self._execute(
             "INSERT INTO keypairs(account_id, region, key_name, private_key, created_at)"
-            " VALUES(?,?,?,?,?)"
+            " VALUES(%s,%s,%s,%s,%s)"
             " ON CONFLICT(account_id, region, key_name) DO UPDATE SET"
             " private_key=excluded.private_key",
             (account_id, region, key_name, self._encrypt(private_key), int(time.time())),
         )
-        self.conn.commit()
 
     def get_private_key(self, account_id: int, region: str, key_name: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT private_key FROM keypairs WHERE account_id=? AND region=? AND key_name=?",
+        row = self._fetchone(
+            "SELECT private_key FROM keypairs"
+            " WHERE account_id=%s AND region=%s AND key_name=%s",
             (account_id, region, key_name),
-        ).fetchone()
+        )
         return self._decrypt(row["private_key"]) if row else None
 
     def list_keypairs(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT id,account_id,region,key_name,created_at FROM keypairs ORDER BY id DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return self._fetchall(
+            "SELECT id,account_id,region,key_name,created_at FROM keypairs"
+            " ORDER BY id DESC"
+        )
 
     # ---------- 换 IP 规则 ----------
 
@@ -418,32 +579,25 @@ class Store:
         for key in ("allow_cidrs", "deny_cidrs"):
             if isinstance(data[key], list):
                 data[key] = json.dumps(data[key])
-        placeholders = ",".join("?" for _ in fields)
+
+        placeholders = ",".join(["%s"] * len(fields))
         updates = ",".join(
-            f"{f}=excluded.{f}" for f in fields if f not in ("account_id", "region", "instance_id")
+            f"{f}=excluded.{f}" for f in fields if f not in required
         )
-        cur = self.conn.execute(
+        return self._returning_id(
             f"INSERT INTO ip_rules({','.join(fields)}) VALUES({placeholders})"
-            f" ON CONFLICT(account_id, region, instance_id) DO UPDATE SET {updates}",
+            f" ON CONFLICT(account_id, region, instance_id) DO UPDATE SET {updates}"
+            " RETURNING id",
             tuple(data[f] for f in fields),
         )
-        self.conn.commit()
-        if cur.lastrowid:
-            return int(cur.lastrowid)
-        row = self.conn.execute(
-            "SELECT id FROM ip_rules WHERE account_id=? AND region=? AND instance_id=?",
-            (data["account_id"], data["region"], data["instance_id"]),
-        ).fetchone()
-        return int(row["id"])
 
     def list_ip_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT * FROM ip_rules"
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY id DESC"
-        rows = self.conn.execute(sql).fetchall()
         out = []
-        for r in rows:
+        for r in self._fetchall(sql):
             item = dict(r)
             item["allow_cidrs"] = json.loads(item["allow_cidrs"])
             item["deny_cidrs"] = json.loads(item["deny_cidrs"])
@@ -459,62 +613,54 @@ class Store:
     ) -> None:
         sets, args = [], []
         if fail_count is not None:
-            sets.append("fail_count=?")
+            sets.append("fail_count=%s")
             args.append(fail_count)
         if last_check is not None:
-            sets.append("last_check=?")
+            sets.append("last_check=%s")
             args.append(last_check)
         if last_change is not None:
-            sets.append("last_change=?")
+            sets.append("last_change=%s")
             args.append(last_change)
         if not sets:
             return
         args.append(rule_id)
-        self.conn.execute(f"UPDATE ip_rules SET {','.join(sets)} WHERE id=?", args)
-        self.conn.commit()
+        self._execute(f"UPDATE ip_rules SET {','.join(sets)} WHERE id=%s", args)
 
     def delete_ip_rule(self, rule_id: int) -> None:
-        self.conn.execute("DELETE FROM ip_rules WHERE id=?", (rule_id,))
-        self.conn.commit()
+        self._execute("DELETE FROM ip_rules WHERE id=%s", (rule_id,))
 
     # ---------- 日志 ----------
 
     def log(self, kind: str, target: str = "", ok: bool = True, detail: str = "") -> None:
-        self.conn.execute(
-            "INSERT INTO logs(created_at, kind, target, ok, detail) VALUES(?,?,?,?,?)",
+        self._execute(
+            "INSERT INTO logs(created_at, kind, target, ok, detail)"
+            " VALUES(%s,%s,%s,%s,%s)",
             (int(time.time()), kind, target, 1 if ok else 0, detail[:4000]),
         )
-        self.conn.commit()
 
     def list_logs(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+        return self._fetchall(
             "SELECT id,created_at,kind,target,ok,detail FROM logs"
-            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            " ORDER BY created_at DESC, id DESC LIMIT %s",
             (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     # ---------- 设置 ----------
 
     def set_setting(self, key: str, value: str) -> None:
-        self.conn.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)"
+        self._execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES(%s,%s,%s)"
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
             " updated_at=excluded.updated_at",
             (key, value, int(time.time())),
         )
-        self.conn.commit()
 
     def get_setting(self, key: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT value FROM settings WHERE key=?", (key,)
-        ).fetchone()
+        row = self._fetchone("SELECT value FROM settings WHERE key=%s", (key,))
         return row["value"] if row else None
 
     def setting_updated_at(self, key: str) -> int:
-        row = self.conn.execute(
-            "SELECT updated_at FROM settings WHERE key=?", (key,)
-        ).fetchone()
+        row = self._fetchone("SELECT updated_at FROM settings WHERE key=%s", (key,))
         return int(row["updated_at"]) if row else 0
 
     # ---------- 登录密码 ----------
@@ -557,44 +703,39 @@ class Store:
     ) -> str:
         token = secrets.token_urlsafe(32)
         now = int(time.time())
-        self.conn.execute(
-            "INSERT INTO sessions(token_hash, created_at, last_seen, expires_at, ip, user_agent)"
-            " VALUES(?,?,?,?,?,?)",
+        self._execute(
+            "INSERT INTO sessions"
+            "(token_hash, created_at, last_seen, expires_at, ip, user_agent)"
+            " VALUES(%s,%s,%s,%s,%s,%s)",
             (self._hash_token(token), now, now, now + ttl, ip, user_agent[:300]),
         )
-        self.conn.commit()
         return token
 
     def touch_session(self, token: str) -> bool:
         """校验会话是否有效，同时刷新 last_seen。过期会话立即删除。"""
         now = int(time.time())
         token_hash = self._hash_token(token)
-        row = self.conn.execute(
-            "SELECT expires_at FROM sessions WHERE token_hash=?", (token_hash,)
-        ).fetchone()
+        row = self._fetchone(
+            "SELECT expires_at FROM sessions WHERE token_hash=%s", (token_hash,)
+        )
         if row is None:
             return False
         if int(row["expires_at"]) <= now:
-            self.conn.execute(
-                "DELETE FROM sessions WHERE token_hash=?", (token_hash,)
-            )
-            self.conn.commit()
+            self._execute("DELETE FROM sessions WHERE token_hash=%s", (token_hash,))
             return False
-        self.conn.execute(
-            "UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, token_hash)
+        self._execute(
+            "UPDATE sessions SET last_seen=%s WHERE token_hash=%s", (now, token_hash)
         )
-        self.conn.commit()
         return True
 
     def list_sessions(self, current_token: str | None = None) -> list[dict[str, Any]]:
         now = int(time.time())
-        self.conn.execute("DELETE FROM sessions WHERE expires_at<=?", (now,))
-        self.conn.commit()
+        self._execute("DELETE FROM sessions WHERE expires_at<=%s", (now,))
         current_hash = self._hash_token(current_token) if current_token else None
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT token_hash,created_at,last_seen,expires_at,ip,user_agent"
             " FROM sessions ORDER BY last_seen DESC"
-        ).fetchall()
+        )
         out = []
         for row in rows:
             item = dict(row)
@@ -605,36 +746,30 @@ class Store:
         return out
 
     def revoke_session(self, session_id: str) -> bool:
-        cur = self.conn.execute(
-            "DELETE FROM sessions WHERE substr(token_hash,1,12)=?", (session_id,)
-        )
-        self.conn.commit()
-        return cur.rowcount > 0
+        return self._execute(
+            "DELETE FROM sessions WHERE left(token_hash, 12)=%s", (session_id,)
+        ) > 0
 
     def revoke_session_token(self, token: str) -> None:
-        self.conn.execute(
-            "DELETE FROM sessions WHERE token_hash=?", (self._hash_token(token),)
+        self._execute(
+            "DELETE FROM sessions WHERE token_hash=%s", (self._hash_token(token),)
         )
-        self.conn.commit()
 
     def clear_sessions(self, keep_token: str | None = None) -> int:
         if keep_token:
-            cur = self.conn.execute(
-                "DELETE FROM sessions WHERE token_hash<>?",
+            return self._execute(
+                "DELETE FROM sessions WHERE token_hash<>%s",
                 (self._hash_token(keep_token),),
             )
-        else:
-            cur = self.conn.execute("DELETE FROM sessions")
-        self.conn.commit()
-        return cur.rowcount
+        return self._execute("DELETE FROM sessions")
 
     # ---------- 登录失败限流 ----------
 
     def lock_state(self, source: str) -> auth.LockState:
-        row = self.conn.execute(
-            "SELECT fail_count,last_failed_at FROM login_attempts WHERE source=?",
+        row = self._fetchone(
+            "SELECT fail_count,last_failed_at FROM login_attempts WHERE source=%s",
             (source,),
-        ).fetchone()
+        )
         if row is None:
             return auth.evaluate_lock(0, 0, int(time.time()))
         state = auth.evaluate_lock(
@@ -646,39 +781,36 @@ class Store:
 
     def record_failure(self, source: str) -> auth.LockState:
         now = int(time.time())
-        self.conn.execute(
+        self._execute(
             "INSERT INTO login_attempts(source, fail_count, last_failed_at)"
-            " VALUES(?,1,?)"
+            " VALUES(%s,1,%s)"
             " ON CONFLICT(source) DO UPDATE SET"
-            " fail_count=login_attempts.fail_count+1, last_failed_at=excluded.last_failed_at",
+            " fail_count=login_attempts.fail_count+1,"
+            " last_failed_at=excluded.last_failed_at",
             (source, now),
         )
-        self.conn.commit()
         return self.lock_state(source)
 
     def reset_attempts(self, source: str) -> None:
-        self.conn.execute("DELETE FROM login_attempts WHERE source=?", (source,))
-        self.conn.commit()
+        self._execute("DELETE FROM login_attempts WHERE source=%s", (source,))
 
     # ---------- 登录历史 ----------
 
     def record_login(
         self, ok: bool, ip: str = "", user_agent: str = "", detail: str = ""
     ) -> None:
-        self.conn.execute(
+        self._execute(
             "INSERT INTO login_history(created_at, ok, ip, user_agent, detail)"
-            " VALUES(?,?,?,?,?)",
+            " VALUES(%s,%s,%s,%s,%s)",
             (int(time.time()), 1 if ok else 0, ip, user_agent[:300], detail[:500]),
         )
-        self.conn.commit()
 
     def list_login_history(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
+        return self._fetchall(
             "SELECT id,created_at,ok,ip,user_agent,detail FROM login_history"
-            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            " ORDER BY created_at DESC, id DESC LIMIT %s",
             (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     def close(self) -> None:
-        self.conn.close()
+        self.pool.close()

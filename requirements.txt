@@ -7,3 +7,5 @@ itsdangerous==2.2.0
 cryptography==44.0.0
 pyOpenSSL==25.0.0
 PySocks==1.7.1
+psycopg[binary]==3.2.4
+psycopg-pool==3.2.4
