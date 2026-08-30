@@ -65,7 +65,8 @@ python3 -m aws_helper.cli logout-all                  # 下线全部会话</pre>
       <tr>
         <td class="mono">{{ s.id }}{% if s.current %} <span class="tag ok">当前</span>{% endif %}</td>
         <td class="mono">{{ s.ip or '-' }}</td>
-        <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s.user_agent or '-' }}</td>
+        <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="{{ s.user_agent or '-' }}">{{ s.user_agent or '-' }}</td>
         <td class="mono" data-ts="{{ s.created_at }}">{{ s.created_at }}</td>
         <td class="mono" data-ts="{{ s.last_seen }}">{{ s.last_seen }}</td>
         <td>
@@ -99,7 +100,8 @@ python3 -m aws_helper.cli logout-all                  # 下线全部会话</pre>
         <td class="mono" data-ts="{{ h.created_at }}">{{ h.created_at }}</td>
         <td><span class="tag {{ 'ok' if h.ok else 'err' }}">{{ '成功' if h.ok else '失败' }}</span></td>
         <td class="mono">{{ h.ip or '-' }}</td>
-        <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ h.user_agent or '-' }}</td>
+        <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="{{ h.user_agent or '-' }}">{{ h.user_agent or '-' }}</td>
         <td>{{ h.detail }}</td>
       </tr>
       {% endfor %}

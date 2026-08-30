@@ -198,6 +198,32 @@ def test_session_records_ip_and_agent(panel):
     assert sessions[0]["user_agent"]
 
 
+def test_truncated_user_agent_has_full_value_in_title(panel):
+    """被 ellipsis 截断的客户端列必须能悬停看到全文。
+
+    单元格设了 max-width + text-overflow:ellipsis，User-Agent 普遍比它长
+    （实测 870px 内容塞进 325px 格子）。没有 title 属性时全文就彻底不可读，
+    审计"谁登录过"这件事直接失效。
+
+    「登录会话」和「登录记录」两张表各自断言 —— 两处渲染同一个 User-Agent，
+    整页搜索会让其中一处漏掉 title 也照样通过。
+    """
+    c, _ = panel
+    long_agent = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "HeadlessChrome/141.0.0.0 Safari/537.36"
+    )
+    other = TestClient(c.app, headers={"user-agent": long_agent})
+    login(other)
+
+    html = c.get("/profile").text
+    sessions_html, _, history_html = html.partition("<h2>登录记录</h2>")
+    assert long_agent in sessions_html and long_agent in history_html, "两张表都应出现该 User-Agent"
+
+    for name, part in (("登录会话", sessions_html), ("登录记录", history_html)):
+        assert f'title="{long_agent}"' in part, f"「{name}」表的 User-Agent 单元格缺少 title，全文无法查看"
+
+
 def test_revoke_other_session(panel):
     c, app_module = panel
     other = TestClient(app_module.app)

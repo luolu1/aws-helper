@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from html import escape
 
 import pytest
 from fastapi.testclient import TestClient
@@ -234,6 +235,26 @@ def test_script_crud(client):
     assert "tpl-a" in c.get("/scripts").text
     assert c.request("DELETE", f"/api/scripts/{sid}").status_code == 200
     assert "tpl-a" not in c.get("/scripts").text
+
+
+def test_truncated_script_preview_has_full_body_in_title(client):
+    """被 ellipsis 截断的脚本预览列必须能悬停看到全文。
+
+    单元格设了 max-width:420px + text-overflow:ellipsis，且模板只渲染 body[:90]。
+    没有 title 属性时长脚本的后半段在页面上彻底不可见 —— 想确认某个模板到底
+    装了什么，只能点「载入」把它灌进表单，绕一大圈。
+    """
+    c, _, _ = client
+    long_body = "\n".join(f"echo 第{i}步-verify-long-script-line" for i in range(1, 21))
+    resp = c.post(
+        "/api/scripts",
+        data={"name": "tpl-long", "body": long_body, "packages": "curl"},
+    )
+    assert resp.status_code == 200
+
+    html = c.get("/scripts").text
+    assert "tpl-long" in html
+    assert f'title="{escape(long_body)}"' in html, "截断的脚本预览单元格缺少完整 body 的 title"
 
 
 def test_script_preview(client):

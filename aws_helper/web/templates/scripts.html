@@ -48,7 +48,8 @@ sysctl -p"></textarea>
       <tr>
         <td>{{ s.name }}</td>
         <td class="mono">{{ s.packages | join(' ') or '-' }}</td>
-        <td class="mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        <td class="mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="{{ s.body or '（空）' }}">
           {{ s.body[:90] or '（空）' }}
         </td>
         <td>
