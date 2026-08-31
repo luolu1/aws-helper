@@ -283,9 +283,14 @@ Lightsail 栏需要：`lightsail:GetRegions` `lightsail:GetBundles` `lightsail:G
 `lightsail:DeleteInstance` `lightsail:GetStaticIps` `lightsail:DetachStaticIp`
 `lightsail:ReleaseStaticIp`
 
-Bedrock 栏需要：`bedrock:ListFoundationModels`，调用测试还要
-`bedrock:InvokeModel`（Converse 走同一权限），且需在 Bedrock 控制台的
+Bedrock 栏需要：`bedrock:ListFoundationModels`、`bedrock:ListInferenceProfiles`，
+调用测试还要 `bedrock:InvokeModel`（Converse 走同一权限），且需在 Bedrock 控制台的
 「模型访问」里为具体模型申请开通。
+
+`ListInferenceProfiles` 用来解析只支持推理配置文件的模型（Claude Opus 4/4.1、
+Sonnet 4.x 等）：它们的 `inferenceTypesSupported` 里没有 `ON_DEMAND`，
+必须换成带地理前缀的配置文件 id（`us.` / `eu.` / `apac.` / `global.`）才能调用。
+缺这个权限时按区域前缀猜一个，猜错会在调用时报错，不影响其他模型。
 
 终止实例的连带清理还需要：`ec2:DeleteVolume` `ec2:DeleteSecurityGroup`
 `ec2:DeleteKeyPair` `ec2:ReleaseAddress`，以及删自建 VPC 时的

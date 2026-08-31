@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import patch
 
 import pytest
@@ -384,18 +385,314 @@ def test_bedrock_model_access_error_is_actionable():
 
 
 def test_bedrock_on_demand_error_explains_alternative():
+    """解析不到配置文件时要说清是「该区域没有对应配置文件」，而不是笼统报错。"""
     from botocore.exceptions import ClientError
 
-    with patch.object(bedrock, "runtime_client") as factory:
-        factory.return_value.converse.side_effect = ClientError(
+    with patch.object(bedrock, "runtime_client") as runtime, patch.object(
+        bedrock, "control_client"
+    ) as control:
+        runtime.return_value.converse.side_effect = ClientError(
             {"Error": {"Code": "ValidationException",
-                       "Message": "not supported for on-demand throughput"}},
+                       "Message": "Invocation of model ID m with on-demand throughput isn't supported."}},
             "Converse",
         )
-        with pytest.raises(bedrock.BedrockError, match="推理配置文件"):
+        control.return_value.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": []
+        }
+        with pytest.raises(bedrock.BedrockError, match="没有它对应的配置文件"):
             bedrock.invoke_text(
-                aws.Credentials("a", "b", "us-east-1"), "us-east-1", "m", "q"
+                aws.Credentials("a", "b", "sa-east-1"), "sa-east-1", "m", "q"
             )
+
+
+def _profile_page(pairs, next_token=None):
+    summaries = [
+        {
+            "inferenceProfileId": profile_id,
+            "inferenceProfileArn": f"arn:aws:bedrock:us-east-1:1:inference-profile/{profile_id}",
+            "type": "SYSTEM_DEFINED",
+            "status": "ACTIVE",
+            "models": [
+                {"modelArn": f"arn:aws:bedrock:us-east-1::foundation-model/{base}"}
+            ],
+        }
+        for profile_id, base in pairs
+    ]
+    page = {"inferenceProfileSummaries": summaries}
+    if next_token:
+        page["nextToken"] = next_token
+    return page
+
+
+OPUS = "anthropic.claude-opus-4-1-20250805-v1:0"
+
+
+def test_inference_profiles_indexes_base_model_to_profile_ids():
+    """list_inference_profiles 的 models[].modelArn 要正确切出基础模型 id。"""
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_inference_profiles.return_value = _profile_page(
+            [(f"us.{OPUS}", OPUS), (f"global.{OPUS}", OPUS)]
+        )
+        index = bedrock.inference_profiles(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+
+    assert index == {OPUS: [f"us.{OPUS}", f"global.{OPUS}"]}
+
+
+def test_inference_profiles_follows_pagination():
+    """配置文件清单是分页的，只读第一页会漏掉后面的模型。"""
+    pages = [
+        _profile_page([(f"us.{OPUS}", OPUS)], next_token="t1"),
+        _profile_page([("us.meta.llama-x", "meta.llama-x")]),
+    ]
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_inference_profiles.side_effect = pages
+        index = bedrock.inference_profiles(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+
+    assert set(index) == {OPUS, "meta.llama-x"}
+
+
+def test_inference_profiles_requests_only_system_defined():
+    """APPLICATION 类型是用户自建的计量配置文件，不该混进模型选择列表。"""
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_inference_profiles.return_value = _profile_page([])
+        bedrock.inference_profiles(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+        kwargs = control.return_value.list_inference_profiles.call_args.kwargs
+
+    assert kwargs["typeEquals"] == "SYSTEM_DEFINED"
+
+
+def test_inference_profiles_survives_missing_permission():
+    """缺 ListInferenceProfiles 权限时返回空索引，不能让模型清单页整个挂掉。"""
+    from botocore.exceptions import ClientError
+
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_inference_profiles.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListInferenceProfiles",
+        )
+        assert bedrock.inference_profiles(aws.Credentials("a", "b", "us-east-1"), "us-east-1") == {}
+
+
+def test_inference_profiles_stops_on_repeated_token():
+    """服务端回同一个 nextToken 时必须停下。
+
+    照着 token 一直翻页会无限循环，把处理请求的线程钉死 —— 页面永远转圈。
+    """
+    page = _profile_page([(f"us.{OPUS}", OPUS)], next_token="same")
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_inference_profiles.return_value = page
+        index = bedrock.inference_profiles(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+
+    assert index == {OPUS: [f"us.{OPUS}"]}
+    assert control.return_value.list_inference_profiles.call_count == 2
+
+
+def test_inference_profiles_ignores_non_dict_response():
+    """SDK 返回非字典（旧版本、被 mock 掉）时安全退出，而不是拿它当分页游标。"""
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_inference_profiles.return_value = None
+        assert bedrock.inference_profiles(aws.Credentials("a", "b", "us-east-1"), "us-east-1") == {}
+
+
+def test_resolve_invoke_id_prefers_caller_region_geo():
+    """同一模型有多个配置文件时，优先用与调用区域同地理组的，避免绕远。"""
+    index = {OPUS: [f"apac.{OPUS}", f"eu.{OPUS}", f"us.{OPUS}"]}
+    model = {"model_id": OPUS, "inference_types": ["INFERENCE_PROFILE"]}
+
+    assert bedrock.resolve_invoke_id(model, "us-west-2", index) == f"us.{OPUS}"
+    assert bedrock.resolve_invoke_id(model, "eu-west-1", index) == f"eu.{OPUS}"
+    assert bedrock.resolve_invoke_id(model, "ap-northeast-1", index) == f"apac.{OPUS}"
+
+
+def test_resolve_invoke_id_falls_back_to_global_profile():
+    """本地理组没有配置文件时用 global —— 它覆盖全部商业区域。"""
+    index = {OPUS: [f"global.{OPUS}"]}
+    model = {"model_id": OPUS, "inference_types": ["INFERENCE_PROFILE"]}
+
+    assert bedrock.resolve_invoke_id(model, "sa-east-1", index) == f"global.{OPUS}"
+
+
+def test_resolve_invoke_id_keeps_base_id_for_on_demand():
+    model = {"model_id": "anthropic.claude-3-haiku", "inference_types": ["ON_DEMAND"]}
+    assert (
+        bedrock.resolve_invoke_id(model, "us-east-1", {})
+        == "anthropic.claude-3-haiku"
+    )
+
+
+def test_resolve_invoke_id_guesses_prefix_without_index():
+    """没有配置文件索引时按区域前缀猜一个。
+
+    猜错只是 converse 报错；直接把模型藏起来不让测才是真的没法用。
+    """
+    model = {"model_id": OPUS, "inference_types": ["INFERENCE_PROFILE"]}
+    assert bedrock.resolve_invoke_id(model, "us-east-1", {}) == f"us.{OPUS}"
+
+
+def test_resolve_invoke_id_empty_when_region_has_no_geo():
+    """南美等区域没有对应地理前缀，猜不出来就明确返回空，别编一个假 id。"""
+    model = {"model_id": OPUS, "inference_types": ["INFERENCE_PROFILE"]}
+    assert bedrock.resolve_invoke_id(model, "sa-east-1", {}) == ""
+
+
+def test_list_models_marks_profile_only_model_invokable():
+    """只支持推理配置文件的模型必须标成可调用，并带上配置文件 id。
+
+    这是用户报的问题：Claude Opus 4/4.1 这类模型被过滤掉了，根本测不了。
+    """
+    fake = {"modelSummaries": [
+        {"modelId": OPUS, "modelName": "Claude Opus 4.1",
+         "providerName": "Anthropic", "inputModalities": ["TEXT"],
+         "outputModalities": ["TEXT"], "responseStreamingSupported": True,
+         "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+         "modelLifecycle": {"status": "ACTIVE"}},
+    ]}
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_foundation_models.return_value = fake
+        control.return_value.list_inference_profiles.return_value = _profile_page(
+            [(f"us.{OPUS}", OPUS)]
+        )
+        out = bedrock.list_models(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+
+    model = out["models"][0]
+    assert model["invokable"] is True
+    assert model["via_profile"] is True
+    assert model["invoke_id"] == f"us.{OPUS}"
+
+
+def test_list_models_skips_profile_lookup_when_all_on_demand():
+    """全是按需模型时不该白调一次 ListInferenceProfiles。"""
+    fake = {"modelSummaries": [
+        {"modelId": "anthropic.claude-3-haiku", "modelName": "Haiku",
+         "providerName": "Anthropic", "inputModalities": ["TEXT"],
+         "outputModalities": ["TEXT"],
+         "inferenceTypesSupported": ["ON_DEMAND"],
+         "modelLifecycle": {"status": "ACTIVE"}},
+    ]}
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_foundation_models.return_value = fake
+        out = bedrock.list_models(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+        assert control.return_value.list_inference_profiles.call_count == 0
+
+    assert out["models"][0]["invoke_id"] == "anthropic.claude-3-haiku"
+    assert out["models"][0]["via_profile"] is False
+
+
+def test_invoke_retries_with_profile_id_on_on_demand_rejection():
+    """用户粘贴裸的基础 id 时，自动换成配置文件 id 重试一次。"""
+    from botocore.exceptions import ClientError
+
+    ok = {
+        "output": {"message": {"content": [{"text": "来自 Opus"}]}},
+        "usage": {"inputTokens": 7, "outputTokens": 3},
+        "stopReason": "end_turn",
+        "metrics": {"latencyMs": 900},
+    }
+    rejection = ClientError(
+        {"Error": {"Code": "ValidationException",
+                   "Message": f"Invocation of model ID {OPUS} with on-demand "
+                              "throughput isn't supported."}},
+        "Converse",
+    )
+    with patch.object(bedrock, "runtime_client") as runtime, patch.object(
+        bedrock, "control_client"
+    ) as control:
+        runtime.return_value.converse.side_effect = [rejection, ok]
+        control.return_value.list_inference_profiles.return_value = _profile_page(
+            [(f"us.{OPUS}", OPUS)]
+        )
+        out = bedrock.invoke_text(
+            aws.Credentials("a", "b", "us-east-1"), "us-east-1", OPUS, "问题"
+        )
+
+    assert out["text"] == "来自 Opus"
+    assert out["model_id"] == f"us.{OPUS}"
+    assert out["requested_model_id"] == OPUS
+    assert out["via_profile"] is True
+    second_call = runtime.return_value.converse.call_args_list[1]
+    assert second_call.kwargs["modelId"] == f"us.{OPUS}"
+
+
+def test_invoke_retries_when_error_code_is_http_status():
+    """botocore 有时把错误码报成 "400" 而不是 ValidationException。
+
+    真机验证时就是这样：只按 code == "ValidationException" 判断会漏掉重试，
+    用户拿裸 id 测 Opus 直接报错。所以以报文文案为主、错误码为辅。
+    """
+    from botocore.exceptions import ClientError
+
+    ok = {
+        "output": {"message": {"content": [{"text": "成功"}]}},
+        "usage": {"inputTokens": 1, "outputTokens": 1},
+        "stopReason": "end_turn",
+        "metrics": {"latencyMs": 10},
+    }
+    rejection = ClientError(
+        {"Error": {"Code": "400",
+                   "Message": f"An error occurred (400) when calling the Converse "
+                              f"operation: Invocation of model ID {OPUS} with "
+                              "on-demand throughput isn't supported."}},
+        "Converse",
+    )
+    with patch.object(bedrock, "runtime_client") as runtime, patch.object(
+        bedrock, "control_client"
+    ) as control:
+        runtime.return_value.converse.side_effect = [rejection, ok]
+        control.return_value.list_inference_profiles.return_value = _profile_page(
+            [(f"us.{OPUS}", OPUS)]
+        )
+        out = bedrock.invoke_text(
+            aws.Credentials("a", "b", "us-east-1"), "us-east-1", OPUS, "问题"
+        )
+
+    assert out["model_id"] == f"us.{OPUS}"
+    assert out["via_profile"] is True
+
+
+def test_invoke_reports_retry_failure_with_profile_id():
+    """换配置文件后仍失败时，报错要带上实际用的那个 id，方便排查。"""
+    from botocore.exceptions import ClientError
+
+    rejection = ClientError(
+        {"Error": {"Code": "ValidationException",
+                   "Message": "with on-demand throughput isn't supported."}},
+        "Converse",
+    )
+    denied = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "not subscribed"}},
+        "Converse",
+    )
+    with patch.object(bedrock, "runtime_client") as runtime, patch.object(
+        bedrock, "control_client"
+    ) as control:
+        runtime.return_value.converse.side_effect = [rejection, denied]
+        control.return_value.list_inference_profiles.return_value = _profile_page(
+            [(f"us.{OPUS}", OPUS)]
+        )
+        with pytest.raises(bedrock.BedrockError, match=f"us.{re.escape(OPUS)}"):
+            bedrock.invoke_text(
+                aws.Credentials("a", "b", "us-east-1"), "us-east-1", OPUS, "问题"
+            )
+
+
+def test_probe_reports_profile_only_models():
+    """探测要说明有多少只支持配置文件的模型、解析到几个可调用。"""
+    fake = {"modelSummaries": [
+        {"modelId": OPUS, "modelName": "Opus", "providerName": "Anthropic",
+         "inputModalities": ["TEXT"], "outputModalities": ["TEXT"],
+         "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+         "modelLifecycle": {"status": "ACTIVE"}},
+    ]}
+    with patch.object(bedrock, "control_client") as control:
+        control.return_value.list_foundation_models.return_value = fake
+        control.return_value.list_inference_profiles.return_value = _profile_page(
+            [(f"us.{OPUS}", OPUS)]
+        )
+        result = bedrock.probe(aws.Credentials("a", "b", "us-east-1"), "us-east-1")
+
+    check = [c for c in result["checks"] if c["name"] == "推理配置文件"]
+    assert check and check[0]["ok"] is True
+    assert "1 个可直接调用" in check[0]["detail"]
 
 
 def test_bedrock_probe_reports_unavailable():

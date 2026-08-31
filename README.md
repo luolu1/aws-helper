@@ -154,11 +154,34 @@ GovCloud 需单独准入流程，已排除；香港没有端点，也排除。
 页面上的「可用性探测」会实际调一次 API 确认，这才是账号维度的结论。
 
 模型清单会标出调用方式：`ON_DEMAND` 可直接按需调用，`INFERENCE_PROFILE`
-需要推理配置文件或预置吞吐量。调用测试只列前者的文本模型，避免选了才报
-`ValidationException`。`LEGACY` 状态的模型 AWS 已计划下线，会单独标记。
+必须通过推理配置文件。`LEGACY` 状态的模型 AWS 已计划下线，会单独标记。
+
+**两类模型都能测。** Claude Opus 4/4.1、Sonnet 4.x 这些新模型 AWS 只通过
+跨区域推理配置文件开放，`inferenceTypesSupported` 里没有 `ON_DEMAND` ——
+直接拿基础模型 id 调会被拒：
+
+```
+ValidationException: Invocation of model ID anthropic.claude-opus-4-1-20250805-v1:0
+with on-demand throughput isn't supported.
+```
+
+所以面板会先调 `ListInferenceProfiles` 建一张「基础模型 → 配置文件 id」映射表，
+选到这类模型时自动换成带地理前缀的 id（`us.` / `eu.` / `apac.` / `global.`）：
+
+```
+anthropic.claude-opus-4-1-20250805-v1:0     ->  us.anthropic.claude-opus-4-1-20250805-v1:0
+```
+
+前缀不能硬算。同一个模型可能同时有 `us.` 和 `global.` 两个配置文件，也可能只有其中一个
+（实测 Opus 4.1 就没有 `global.`），所以只认 API 返回的实际清单，优先挑与当前区域同地理组的，
+没有则退到 `global.`。缺 `bedrock:ListInferenceProfiles` 权限时按前缀猜一个并由调用报错兜底 ——
+猜错只是报错，把模型直接藏起来才是真的没法测。
+
+手动粘贴裸的基础模型 id 也能用：收到上面那个 `ValidationException` 后会自动解析配置文件重试一次。
 
 调用走 Converse 统一接口 —— 各厂商模型的原生请求体格式不同
 （Anthropic 要 `anthropic_version`、Amazon 要 `inputText`），Converse 免去逐家维护模板。
+`modelId` 同时接受基础模型 id、配置文件 id/ARN 和预置吞吐量 ARN，所以换 id 不用换调用路径。
 
 **终止实例会连带清理，防止残留计费**
 

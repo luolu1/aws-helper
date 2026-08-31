@@ -10,7 +10,8 @@
   <p class="hint">
     用 Converse 统一接口试跑一次文本推理，验证模型访问权限是否已开通。
     <strong>会产生实际 token 费用。</strong>
-    只列支持按需调用（ON_DEMAND）的文本模型 —— 其余需要推理配置文件或预置吞吐量。
+    列出所有可调用的文本模型：按需（ON_DEMAND）的直接调，只支持推理配置文件的
+    （Claude Opus 4/4.1、Sonnet 4.x 等）自动换成跨区域配置文件 id 调用。
   </p>
 
   <div class="grid g4">
@@ -69,14 +70,19 @@ async function loadModels() {
 
   try {
     const d = await api(`/api/bedrock/models?account_id=${accountId}&region=${region}`);
-    // 只保留能直接按需调用的文本模型，避免选了之后报 ValidationException
-    const usable = d.models.filter(m =>
-      m.inference_types.includes('ON_DEMAND') && m.text_capable && !m.legacy);
+    // invoke_id 由后端解析：ON_DEMAND 用基础 id，只支持推理配置文件的换成 us./eu./apac./global. 前缀的配置文件 id
+    const usable = d.models.filter(m => m.invokable && !m.legacy);
+    const viaProfile = usable.filter(m => m.via_profile).length;
     sel.innerHTML = usable.length
-      ? usable.map(m => `<option value="${escapeHtml(m.model_id)}">${escapeHtml(m.provider)} · ${escapeHtml(m.model_id)}</option>`).join('')
-      : '<option value="">该区域没有按需可调用的文本模型</option>';
+      ? usable.map(m => {
+          const tag = m.via_profile ? ' 〔推理配置文件〕' : '';
+          return `<option value="${escapeHtml(m.invoke_id)}">${escapeHtml(m.provider)} · ${escapeHtml(m.model_id)}${tag}</option>`;
+        }).join('')
+      : '<option value="">该区域没有可调用的文本模型</option>';
     document.getElementById('model_count').textContent =
-      usable.length ? `（${usable.length} 个可用）` : '';
+      usable.length
+        ? `（${usable.length} 个可用${viaProfile ? `，其中 ${viaProfile} 个走推理配置文件` : ''}）`
+        : '';
   } catch (e) {
     sel.innerHTML = '<option value="">加载失败</option>';
     document.getElementById('hint').innerHTML =
@@ -107,7 +113,8 @@ async function invoke() {
     document.getElementById('result-card').style.display = 'block';
     document.getElementById('output').textContent = d.text || '(空响应)';
     document.getElementById('meta').textContent =
-      `${d.model_id} · 输入 ${d.input_tokens} tokens / 输出 ${d.output_tokens} tokens`
+      `${d.model_id}${d.via_profile ? '（推理配置文件）' : ''}`
+      + ` · 输入 ${d.input_tokens} tokens / 输出 ${d.output_tokens} tokens`
       + ` · 延迟 ${d.latency_ms}ms · 停止原因 ${d.stop_reason}`;
     document.getElementById('hint').innerHTML = '';
     toast('调用成功', 'ok');

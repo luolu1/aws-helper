@@ -42,6 +42,7 @@
 
   <div class="row mt">
     <label class="chk"><input type="checkbox" id="only_ondemand" onchange="render()"> 只看支持按需调用的</label>
+    <label class="chk"><input type="checkbox" id="only_invokable" onchange="render()"> 只看可调用的（含推理配置文件）</label>
     <label class="chk"><input type="checkbox" id="only_text" onchange="render()"> 只看文本模型</label>
     <label class="chk"><input type="checkbox" id="hide_legacy" onchange="render()"> 隐藏已标记下线的</label>
     <span style="flex:1"></span>
@@ -106,6 +107,9 @@ function render() {
   if (document.getElementById('only_ondemand').checked) {
     list = list.filter(m => m.inference_types.includes('ON_DEMAND'));
   }
+  if (document.getElementById('only_invokable').checked) {
+    list = list.filter(m => m.invokable);
+  }
   if (document.getElementById('only_text').checked) {
     list = list.filter(m => m.text_capable);
   }
@@ -122,16 +126,18 @@ function render() {
     return;
   }
   tbody.innerHTML = list.map(m => {
-    const onDemand = m.inference_types.includes('ON_DEMAND');
     const types = m.inference_types.map(t =>
       `<span class="tag ${t === 'ON_DEMAND' ? 'ok' : ''}" style="font-size:11px">${escapeHtml(t)}</span>`
     ).join(' ');
+    const profileTag = m.via_profile
+      ? `<span class="tag ok" style="font-size:11px" title="${escapeHtml(m.invoke_id)}">配置文件可调</span>`
+      : '';
     return `<tr>
       <td class="mono" style="font-size:12px">${escapeHtml(m.model_id)}</td>
       <td>${escapeHtml(m.provider)}</td>
       <td class="mono" style="font-size:11px">${escapeHtml(m.input_modalities.join(','))}</td>
       <td class="mono" style="font-size:11px">${escapeHtml(m.output_modalities.join(','))}</td>
-      <td>${types || '-'}</td>
+      <td>${[types, profileTag].filter(Boolean).join(' ') || '-'}</td>
       <td>${m.streaming ? '✓' : '—'}</td>
       <td>${m.legacy
         ? '<span class="tag warn">LEGACY</span>'
