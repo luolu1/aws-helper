@@ -81,6 +81,60 @@
   </div>
 </div>
 
+<!-- 重装系统弹窗 -->
+<div class="mask" id="ri-mask">
+  <div class="box">
+    <h2>重装系统</h2>
+    <p class="hint" id="ri-target"></p>
+
+    <div class="grid g2">
+      <label class="f">
+        <span>装成哪个系统</span>
+        <select id="ri-image" onchange="riPreflight()">
+          <option value="">保持原系统（恢复出厂）</option>
+        </select>
+      </label>
+      <label class="f">
+        <span>或直接填 AMI ID</span>
+        <input type="text" id="ri-ami" placeholder="ami-xxxxxxxx，填了优先" onchange="riPreflight()">
+      </label>
+    </div>
+
+    <div class="row mt">
+      <label class="chk"><input type="checkbox" id="ri-delete-old" checked> 删除被替换的旧根卷</label>
+    </div>
+    <p class="hint">
+      不删的话旧卷会留在账号里<strong>继续按 EBS 容量计费</strong>，需要自己去清。
+      想留一份数据做取证再删就取消勾选。
+    </p>
+
+    <div id="ri-check" class="hint">正在检查…</div>
+
+    <table class="mt" style="font-size:13px">
+      <tbody>
+        <tr>
+          <td style="width:70px"><span class="tag ok">保留</span></td>
+          <td>实例 ID、私有 IP、公网/弹性 IP、安全组、网卡、<span id="ri-keep-vol">挂载的数据卷</span>、IAM 角色、实例类型</td>
+        </tr>
+        <tr>
+          <td><span class="tag err">清空</span></td>
+          <td>根卷上的一切 —— 系统、已装软件、<code>/root</code> 与 <code>/home</code>、所有配置</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p class="hint mt">
+      过程中实例会重启，实测 3-5 分钟不可用。SSH 主机密钥会变，
+      下次连接会提示 host key 变更，按提示清掉旧记录即可。
+    </p>
+
+    <div class="row end mt">
+      <button onclick="document.getElementById('ri-mask').classList.remove('on')">取消</button>
+      <button class="danger" id="ri-go" onclick="doReinstall()">确认重装</button>
+    </div>
+  </div>
+</div>
+
 <!-- 重置密码弹窗 -->
 <div class="mask" id="pw-mask">
   <div class="box">
@@ -238,6 +292,7 @@ function rowHtml(i) {
       <td>
         <button class="sm" onclick="openIp('${escapeHtml(i.instance_id)}','${escapeHtml(i.public_ip || '')}')">换 IP</button>
         <button class="sm" onclick="openResetPw('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}','${i.platform === 'windows' ? 1 : 0}')">重置密码</button>
+        <button class="sm danger" onclick="openReinstall('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}')">重装</button>
       </td>`;
 }
 
@@ -340,6 +395,112 @@ async function terminateWithCleanup(ids) {
     html += '</span>';
     Progress.finish(html);
     toast('终止并清理完成', 'ok');
+  } catch (e) {
+    Progress.finish();
+    toast(e.message, 'err');
+  }
+}
+
+let RI_TARGET = null;
+let RI_IMAGES_LOADED = false;
+
+async function openReinstall(id, name) {
+  RI_TARGET = { instance_id: id };
+  document.getElementById('ri-target').textContent = `${name || id}（${id}）`;
+  document.getElementById('ri-ami').value = '';
+  document.getElementById('ri-image').value = '';
+  document.getElementById('ri-mask').classList.add('on');
+
+  if (!RI_IMAGES_LOADED) {
+    // 镜像清单是本地静态数据，一次拿到就够；用当前区域的 catalog 接口取标签
+    const s = sel();
+    try {
+      const d = await api(`/api/catalog?account_id=${s.account_id}&region=${s.region}`);
+      const sel_el = document.getElementById('ri-image');
+      d.images.forEach(img => {
+        const o = document.createElement('option');
+        o.value = img.key;
+        o.textContent = img.label;
+        sel_el.appendChild(o);
+      });
+      RI_IMAGES_LOADED = true;
+    } catch (e) {
+      // 拿不到清单不影响"恢复出厂"和手填 AMI 两条路
+    }
+  }
+  riPreflight();
+}
+
+async function riPreflight() {
+  if (!RI_TARGET) return;
+  const box = document.getElementById('ri-check');
+  const go = document.getElementById('ri-go');
+  box.textContent = '正在检查…';
+  go.disabled = true;
+
+  const s = sel();
+  const q = new URLSearchParams({
+    account_id: s.account_id,
+    region: s.region,
+    instance_id: RI_TARGET.instance_id,
+    image_key: document.getElementById('ri-image').value,
+    image_id: document.getElementById('ri-ami').value.trim()
+  });
+  try {
+    // 不走 api()：它把 ok:false 当异常抛，而预检的 ok:false 是正常结果
+    // （"这台不能重装，原因如下"），抛出去就只剩一句没用的 HTTP 200。
+    const resp = await fetch(`/api/instances/reinstall-preflight?${q}`);
+    const d = await resp.json();
+    if (!resp.ok && d.error) throw new Error(d.error);
+    const vol = document.getElementById('ri-keep-vol');
+    vol.textContent = (d.extra_volumes || []).length
+      ? `挂载的数据卷（${d.extra_volumes.join(', ')}）`
+      : '挂载的数据卷（当前没有额外数据卷）';
+
+    if (d.ok) {
+      const target = d.target_image_id
+        ? `将装成 ${escapeHtml(d.target_image_label || d.target_image_id)}（${escapeHtml(d.target_image_id)}）`
+        : `用原镜像 ${escapeHtml(d.current_image_id)} 重铺`;
+      box.innerHTML = `<span class="tag ok">可以重装</span> ${target}`
+        + ` · 架构 ${escapeHtml(d.architecture)} · 状态 ${escapeHtml(d.state)}`;
+      go.disabled = false;
+    } else {
+      box.innerHTML = `<span class="tag err">不能重装</span><br>`
+        + d.problems.map(p => `<span class="mono" style="font-size:12px">${escapeHtml(p)}</span>`).join('<br>');
+      go.disabled = true;
+    }
+  } catch (e) {
+    box.innerHTML = `<span class="tag err">检查失败</span> ${escapeHtml(e.message)}`;
+    go.disabled = true;
+  }
+}
+
+async function doReinstall() {
+  if (!RI_TARGET) return;
+  const label = document.getElementById('ri-image').selectedOptions[0]?.textContent || '原系统';
+  if (!confirm(`确认重装 ${RI_TARGET.instance_id}？\n\n`
+      + `装成：${label}\n`
+      + `根卷上的所有数据会被清空且不可恢复。\n`
+      + `实例 ID、IP、安全组、数据卷保留。`)) return;
+
+  document.getElementById('ri-mask').classList.remove('on');
+  try {
+    const r = await api('/api/instances/reinstall', {
+      method: 'POST',
+      json: {
+        ...sel(),
+        instance_id: RI_TARGET.instance_id,
+        image_key: document.getElementById('ri-image').value,
+        image_id: document.getElementById('ri-ami').value.trim(),
+        delete_old_volume: document.getElementById('ri-delete-old').checked
+      }
+    });
+    const task = await watchTask(r.task_id, '重装系统');
+    const d = task.result;
+    Progress.finish(
+      `<span class="mono" style="flex:1;text-align:left">${escapeHtml(d.image_id)} · 耗时 ${d.elapsed_sec}s</span>`
+    );
+    toast(`重装完成，IP 未变（${d.public_ip || d.private_ip}）`, 'ok');
   } catch (e) {
     Progress.finish();
     toast(e.message, 'err');

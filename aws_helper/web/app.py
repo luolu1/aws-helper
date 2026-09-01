@@ -41,7 +41,17 @@ from ..cache import (
     ls_instances_key,
     ls_regions_key,
 )
-from ..core import aws, bedrock, ddns, ddns_script, ipchange, launch, lightsail, respw
+from ..core import (
+    aws,
+    bedrock,
+    ddns,
+    ddns_script,
+    ipchange,
+    launch,
+    lightsail,
+    reinstall,
+    respw,
+)
 from ..core.userdata import ScriptOptions, ScriptError, render
 from ..ddnsmon import Monitor as DdnsMonitor
 from ..ddnsmon import check_rule as ddns_check_rule
@@ -1056,6 +1066,61 @@ async def api_reset_password(request: Request, _: None = Guard):
     task_id = manager.submit(
         "reset-password", f"重置 {instance_id} 的 {user} 密码", job
     )
+    return {"ok": True, "task_id": task_id}
+
+
+@app.get("/api/instances/reinstall-preflight")
+def api_reinstall_preflight(
+    account_id: int,
+    region: str,
+    instance_id: str,
+    image_key: str = "",
+    image_id: str = "",
+    _: None = Guard,
+):
+    """重装前预检。点开弹窗和换镜像时各调一次，把不匹配挡在点确认之前。"""
+    creds = store.credentials(account_id, region)
+    try:
+        return {"ok": True, **reinstall.preflight(
+            creds, region, instance_id, image_key, image_id
+        )}
+    except reinstall.ReinstallError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/instances/reinstall")
+async def api_reinstall(request: Request, _: None = Guard):
+    """重装系统（换根卷）。走后台任务 —— 实测 3-5 分钟。"""
+    body = await request.json()
+    account_id = int(body["account_id"])
+    region = body["region"]
+    instance_id = body["instance_id"]
+    image_key = (body.get("image_key") or "").strip()
+    image_id = (body.get("image_id") or "").strip()
+    delete_old = bool(body.get("delete_old_volume", True))
+
+    creds = store.credentials(account_id, region)
+
+    def job(progress: Any) -> dict[str, Any]:
+        try:
+            result = reinstall.reinstall(
+                creds, region, instance_id, image_key, image_id, delete_old, progress
+            )
+        except reinstall.ReinstallError as exc:
+            store.log("reinstall", instance_id, False, str(exc)[:400])
+            raise
+        finally:
+            # 根卷换了，实例的镜像 id 和状态都变了，缓存必须作废
+            cache.drop(*ec2_instances_key(account_id, region))
+        store.log(
+            "reinstall",
+            instance_id,
+            True,
+            f"重装完成（{result['image_id']}，耗时 {result['elapsed_sec']}s）",
+        )
+        return result
+
+    task_id = manager.submit("reinstall", f"重装 {instance_id}", job)
     return {"ok": True, "task_id": task_id}
 
 

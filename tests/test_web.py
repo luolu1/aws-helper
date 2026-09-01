@@ -643,3 +643,97 @@ def test_accounts_page_shows_proxy_and_edit_button(client):
     assert "pw@" not in html
     assert "编辑" in html
     assert "测试代理连通性" in html
+
+
+def test_reinstall_preflight_endpoint(client):
+    """重装预检要能给出保留/清空清单，页面靠它显示。"""
+    c, aid, _ = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={"account_id": aid, "region": "us-east-1", "name": "ri-node"},
+        ).json()["task_id"],
+    )
+    iid = task["result"]["instances"][0]["instance_id"]
+
+    body = c.get(
+        f"/api/instances/reinstall-preflight?account_id={aid}"
+        f"&region=us-east-1&instance_id={iid}"
+    ).json()
+
+    assert body["ok"] is True
+    assert body["root_device_type"] == "ebs"
+    assert body["private_ip"]
+    assert body["problems"] == []
+
+
+def test_reinstall_preflight_rejects_arch_mismatch(client):
+    """预检必须在点确认之前挡住架构不匹配。"""
+    import boto3
+
+    c, aid, _ = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={"account_id": aid, "region": "us-east-1", "name": "ri-arch"},
+        ).json()["task_id"],
+    )
+    iid = task["result"]["instances"][0]["instance_id"]
+
+    ec2 = boto3.client("ec2", region_name="us-east-1")
+    images = ec2.describe_images(Owners=["amazon"])["Images"]
+    arm = next((i for i in images if i.get("Architecture") == "arm64"), None)
+    if arm is None:
+        pytest.skip("moto 镜像里没有 arm64")
+
+    body = c.get(
+        f"/api/instances/reinstall-preflight?account_id={aid}"
+        f"&region=us-east-1&instance_id={iid}&image_id={arm['ImageId']}"
+    ).json()
+
+    assert body["ok"] is False
+    assert any("不匹配" in p for p in body["problems"])
+
+
+def test_reinstall_requires_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_module = build_app(monkeypatch, tmp_path / "ri-anon")
+    c = TestClient(app_module.app)
+    assert c.get("/api/instances/reinstall-preflight?account_id=1&region=us-east-1&instance_id=i-1").status_code == 401
+    assert c.post("/api/instances/reinstall", json={}).status_code == 401
+
+
+def test_reinstall_invalidates_instance_cache(client):
+    """根卷换了实例的镜像 id 会变，缓存必须作废。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.reinstall, "reinstall") as fake:
+        fake.return_value = {
+            "instance_id": "i-1",
+            "task_id": "rrvt-1",
+            "state": "succeeded",
+            "image_id": "ami-new",
+            "image_label": "",
+            "deleted_old_volume": True,
+            "elapsed_sec": 12,
+            "private_ip": "10.0.0.5",
+            "public_ip": "1.2.3.4",
+            "kept_volumes": [],
+        }
+        app_module.cache.fetch(
+            app_module.ec2_instances_key(aid, "us-east-1"), 60, lambda: ["stale"]
+        )
+        assert app_module.cache.size() >= 1
+        wait_task(
+            c,
+            c.post(
+                "/api/instances/reinstall",
+                json={"account_id": aid, "region": "us-east-1", "instance_id": "i-1"},
+            ).json()["task_id"],
+        )
+
+    assert app_module.cache.size() == 0, "重装后必须清掉实例缓存"
