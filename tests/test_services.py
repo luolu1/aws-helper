@@ -36,6 +36,7 @@ def panel(mock_ec2, ubuntu_ami, monkeypatch, tmp_path):
         ("/lightsail/create", "创建实例"),
         ("/bedrock", "模型清单"),
         ("/bedrock/playground", "调用测试"),
+        ("/ddns", "DDNS 解析"),
         ("/accounts", "账号 / 日志"),
         ("/profile", "用户面板"),
     ],
@@ -73,7 +74,7 @@ def test_sidebar_shows_all_entries_on_every_page(panel):
         "实例", "一键开机", "开机脚本", "自动换 IP",
         "轻量实例", "创建实例",
         "模型清单", "调用测试",
-        "账号 / 日志", "用户面板",
+        "DDNS 解析", "账号 / 日志", "用户面板",
     ]
     for path in ("/", "/lightsail", "/bedrock", "/accounts"):
         html = c.get(path).text
@@ -102,7 +103,7 @@ def test_sidebar_collapsible_on_narrow_screen(panel):
 def test_service_pages_require_login(mock_ec2, monkeypatch, tmp_path):
     app_module = build_app(monkeypatch, tmp_path / "anon-svc")
     c = TestClient(app_module.app)
-    for path in ("/lightsail", "/lightsail/create", "/bedrock", "/bedrock/playground"):
+    for path in ("/lightsail", "/lightsail/create", "/bedrock", "/bedrock/playground", "/ddns"):
         resp = c.get(path, follow_redirects=False)
         assert resp.status_code == 302, path
 

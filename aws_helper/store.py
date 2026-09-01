@@ -111,6 +111,28 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at BIGINT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ddns_rules (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'cloudflare',
+    zone TEXT NOT NULL,
+    hostname TEXT NOT NULL,
+    token_blob TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    want_ipv4 INTEGER NOT NULL DEFAULT 1,
+    want_ipv6 INTEGER NOT NULL DEFAULT 0,
+    ttl INTEGER NOT NULL DEFAULT 1,
+    proxied INTEGER NOT NULL DEFAULT 0,
+    interval_sec INTEGER NOT NULL DEFAULT 300,
+    note TEXT NOT NULL DEFAULT '',
+    last_check BIGINT NOT NULL DEFAULT 0,
+    last_ipv4 TEXT NOT NULL DEFAULT '',
+    last_ipv6 TEXT NOT NULL DEFAULT '',
+    last_status TEXT NOT NULL DEFAULT '',
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    created_at BIGINT NOT NULL DEFAULT 0,
+    UNIQUE(provider, hostname)
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     created_at BIGINT NOT NULL,
@@ -628,6 +650,120 @@ class Store:
 
     def delete_ip_rule(self, rule_id: int) -> None:
         self._execute("DELETE FROM ip_rules WHERE id=%s", (rule_id,))
+
+    # ---------- DDNS ----------
+
+    _DDNS_DEFAULTS: dict[str, Any] = {
+        "provider": "cloudflare",
+        "enabled": 1,
+        "want_ipv4": 1,
+        "want_ipv6": 0,
+        "ttl": 1,
+        "proxied": 0,
+        "interval_sec": 300,
+        "note": "",
+    }
+
+    def save_ddns_rule(self, zone: str, hostname: str, token: str | None = None, **kw: Any) -> int:
+        """新增或更新一条 DDNS 规则。
+
+        token 传 None 表示沿用原有的 —— 编辑时不必重新粘贴 API Token，
+        和账号编辑里 Secret Key 的处理保持一致。
+        """
+        zone = (zone or "").strip().lower()
+        hostname = (hostname or "").strip().lower()
+        if not zone:
+            raise ValueError("缺少必填字段: zone")
+        if not hostname:
+            raise ValueError("缺少必填字段: hostname")
+        if not hostname.endswith(zone):
+            raise ValueError(f"主机名 {hostname} 不属于区域 {zone}")
+
+        data: dict[str, Any] = {"zone": zone, "hostname": hostname}
+        for key, default in self._DDNS_DEFAULTS.items():
+            value = kw.get(key)
+            data[key] = default if value is None else value
+        for flag in ("enabled", "want_ipv4", "want_ipv6", "proxied"):
+            data[flag] = 1 if data[flag] else 0
+        if not (data["want_ipv4"] or data["want_ipv6"]):
+            raise ValueError("至少要开启 IPv4 或 IPv6 之一")
+
+        existing = self._fetchone(
+            "SELECT id, token_blob FROM ddns_rules WHERE provider=%s AND hostname=%s",
+            (data["provider"], hostname),
+        )
+        if token:
+            blob = self._encrypt(token.strip())
+        elif existing:
+            blob = existing["token_blob"]
+        else:
+            raise ValueError("新建规则必须提供 API Token")
+
+        # provider 已经在 _DDNS_DEFAULTS 里，别再拼一次，否则 INSERT 会重复列名
+        fields = ("zone", "hostname", "token_blob") + tuple(self._DDNS_DEFAULTS)
+        values = {**data, "token_blob": blob}
+        ordered = tuple(values[f] for f in fields)
+        updates = ",".join(
+            f"{f}=excluded.{f}" for f in fields if f not in ("provider", "hostname")
+        )
+        return self._returning_id(
+            f"INSERT INTO ddns_rules({','.join(fields)}, created_at)"
+            f" VALUES({','.join(['%s'] * len(fields))}, %s)"
+            f" ON CONFLICT(provider, hostname) DO UPDATE SET {updates}"
+            " RETURNING id",
+            (*ordered, int(time.time())),
+        )
+
+    def list_ddns_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """列出规则。绝不返回 token 明文或密文，只给「有没有配」。"""
+        sql = "SELECT * FROM ddns_rules"
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY id DESC"
+        out = []
+        for row in self._fetchall(sql):
+            item = dict(row)
+            item["has_token"] = bool(item.pop("token_blob", ""))
+            out.append(item)
+        return out
+
+    def ddns_token(self, rule_id: int) -> str:
+        row = self._fetchone("SELECT token_blob FROM ddns_rules WHERE id=%s", (rule_id,))
+        if not row or not row["token_blob"]:
+            raise DatabaseError(f"DDNS 规则 {rule_id} 没有保存 API Token")
+        return self._decrypt(row["token_blob"])
+
+    def ddns_rule(self, rule_id: int) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM ddns_rules WHERE id=%s", (rule_id,))
+        return dict(row) if row else None
+
+    def update_ddns_state(
+        self,
+        rule_id: int,
+        last_check: int | None = None,
+        last_ipv4: str | None = None,
+        last_ipv6: str | None = None,
+        last_status: str | None = None,
+        fail_count: int | None = None,
+    ) -> None:
+        sets, args = [], []
+        for column, value in (
+            ("last_check", last_check),
+            ("last_ipv4", last_ipv4),
+            ("last_ipv6", last_ipv6),
+            ("last_status", last_status),
+            ("fail_count", fail_count),
+        ):
+            if value is not None:
+                sets.append(f"{column}=%s")
+                args.append(value[:400] if isinstance(value, str) else value)
+        if not sets:
+            return
+        args.append(rule_id)
+        self._execute(f"UPDATE ddns_rules SET {','.join(sets)} WHERE id=%s", args)
+
+    def delete_ddns_rule(self, rule_id: int) -> None:
+        self._execute("DELETE FROM ddns_rules WHERE id=%s", (rule_id,))
 
     # ---------- 日志 ----------
 

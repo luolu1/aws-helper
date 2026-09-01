@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block title %}DDNS 解析 — AWS 小助手{% endblock %}
+
+{% block body %}
+<div class="card">
+  <h2>DDNS 动态解析</h2>
+  <p class="hint">
+    本机公网 IP 变了自动更新 DNS 解析。适合家宽或 IP 会变的 VPS ——
+    域名托管在 Cloudflare，IP 一变解析跟着走，不用手动去改。
+    后台每 60 秒扫一遍规则，按各自间隔检查；<strong>IP 没变化不会发任何更新请求</strong>，
+    避免白烧 Cloudflare 的限流额度（1200 次 / 5 分钟，账号级共享）。
+  </p>
+  <div class="row">
+    <span class="tag {{ 'ok' if monitor_on else 'err' }}">
+      监控{{ '运行中' if monitor_on else '已停止' }}
+    </span>
+    <span style="flex:1"></span>
+    <span class="hint" id="myip" style="margin:0">本机 IP 检测中…</span>
+    <button class="sm" onclick="detect()">重新检测</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>添加 / 更新规则</h2>
+  <p class="hint">
+    同一个（供应商 + 主机名）只存一条规则，重复提交就是更新。
+    保存前会实际调一次 API 校验 Token 和区域，配错当场就能看到。
+  </p>
+
+  <div class="grid g3">
+    <label class="f">
+      <span>DNS 供应商</span>
+      <select id="provider">
+        {% for code, name in providers.items() %}
+        <option value="{{ code }}">{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="f">
+      <span>区域（根域名）</span>
+      <input id="zone" placeholder="example.com">
+    </label>
+    <label class="f">
+      <span>主机名（完整域名）</span>
+      <input id="hostname" placeholder="home.example.com">
+    </label>
+  </div>
+
+  <label class="f mt">
+    <span>API Token</span>
+    <input id="token" type="password" placeholder="编辑已有规则时留空 = 沿用原 Token">
+  </label>
+  <p class="hint">
+    用 Cloudflare 的 <strong>API Token</strong>，不是 Global API Key ——
+    后者是账号级全权限。控制台「我的个人资料 → API 令牌 → 创建令牌」，
+    选「编辑区域 DNS」模板，权限为 <code>Zone → DNS → Edit</code>，
+    区域范围只勾这一个域名即可。
+  </p>
+
+  <div class="grid g4 mt">
+    <label class="f">
+      <span>检查间隔（秒）</span>
+      <input type="number" id="interval_sec" value="300" min="30" max="86400">
+    </label>
+    <label class="f">
+      <span>TTL</span>
+      <select id="ttl">
+        <option value="1">自动</option>
+        <option value="60">60 秒</option>
+        <option value="120">120 秒</option>
+        <option value="300">300 秒</option>
+      </select>
+    </label>
+    <label class="f">
+      <span>备注</span>
+      <input id="note" placeholder="可留空">
+    </label>
+    <label class="f">
+      <span>&nbsp;</span>
+      <button class="primary" style="width:100%" onclick="save()">保存规则</button>
+    </label>
+  </div>
+
+  <div class="row mt">
+    <label class="chk"><input type="checkbox" id="want_ipv4" checked> 更新 A 记录（IPv4）</label>
+    <label class="chk"><input type="checkbox" id="want_ipv6"> 更新 AAAA 记录（IPv6）</label>
+    <label class="chk"><input type="checkbox" id="proxied"> 开启 Cloudflare 代理（橙云）</label>
+    <label class="chk"><input type="checkbox" id="enabled" checked> 启用</label>
+  </div>
+  <p class="hint" id="proxy-note">
+    不开代理时，域名会直接暴露本机真实公网 IP —— 这通常正是 DDNS 的目的。
+    开了代理则 TTL 强制为自动，且流量经 Cloudflare 转发。
+  </p>
+</div>
+
+<div class="card">
+  <h2>已配置的规则</h2>
+  {% if rules %}
+  <table>
+    <thead>
+      <tr>
+        <th>主机名</th><th>供应商</th><th>记录</th><th>状态</th>
+        <th>当前 IPv4</th><th>当前 IPv6</th><th>最近检查</th><th style="width:150px">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rules %}
+      <tr>
+        <td class="mono">{{ r.hostname }}<br><span class="hint">{{ r.zone }}</span></td>
+        <td>{{ providers.get(r.provider, r.provider) }}</td>
+        <td>
+          {% if r.want_ipv4 %}<span class="tag ok" style="font-size:11px">A</span>{% endif %}
+          {% if r.want_ipv6 %}<span class="tag ok" style="font-size:11px">AAAA</span>{% endif %}
+          {% if r.proxied %}<span class="tag warn" style="font-size:11px">代理</span>{% endif %}
+        </td>
+        <td>
+          {% if r.enabled %}
+            {% if r.fail_count %}
+            <span class="tag err">连续失败 {{ r.fail_count }}</span>
+            {% else %}
+            <span class="tag ok">正常</span>
+            {% endif %}
+          {% else %}
+          <span class="tag">已停用</span>
+          {% endif %}
+          {% if r.last_status %}
+          <br><span class="hint" title="{{ r.last_status }}">{{ r.last_status[:40] }}</span>
+          {% endif %}
+        </td>
+        <td class="mono">{{ r.last_ipv4 or '-' }}</td>
+        <td class="mono">{{ r.last_ipv6 or '-' }}</td>
+        <td class="mono" data-ts="{{ r.last_check }}">{{ r.last_check or '从未' }}</td>
+        <td>
+          <button class="sm" onclick="runNow({{ r.id }})">立即同步</button>
+          <button class="sm danger" onclick="del({{ r.id }})">删除</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">还没有 DDNS 规则</div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+// 后端存的是 unix 秒，前端转本地时间显示；0 表示从未检查过
+document.querySelectorAll('td[data-ts]').forEach(td => {
+  const ts = parseInt(td.dataset.ts, 10);
+  td.textContent = ts ? new Date(ts * 1000).toLocaleString() : '从未';
+});
+
+async function detect() {
+  const el = document.getElementById('myip');
+  el.textContent = '检测中…';
+  try {
+    const d = await api('/api/ddns/detect');
+    const parts = [];
+    parts.push(`IPv4 ${d.ipv4 || '取不到'}`);
+    parts.push(`IPv6 ${d.ipv6 || '无连通性'}`);
+    el.textContent = '本机 ' + parts.join(' · ');
+  } catch (e) {
+    el.textContent = '检测失败：' + e.message;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', detect);
+
+// 开了代理 TTL 只能是自动，禁掉选择器免得用户填了一个会被 Cloudflare 拒的值
+document.addEventListener('DOMContentLoaded', () => {
+  const proxied = document.getElementById('proxied');
+  const ttl = document.getElementById('ttl');
+  const sync = () => {
+    ttl.disabled = proxied.checked;
+    if (proxied.checked) ttl.value = '1';
+  };
+  proxied.addEventListener('change', sync);
+  sync();
+});
+
+async function save() {
+  const zone = document.getElementById('zone').value.trim();
+  const hostname = document.getElementById('hostname').value.trim();
+  if (!zone) return toast('请填写区域根域名', 'err');
+  if (!hostname) return toast('请填写完整主机名', 'err');
+
+  const payload = {
+    provider: document.getElementById('provider').value,
+    zone,
+    hostname,
+    token: document.getElementById('token').value,
+    interval_sec: parseInt(document.getElementById('interval_sec').value, 10) || 300,
+    ttl: parseInt(document.getElementById('ttl').value, 10) || 1,
+    note: document.getElementById('note').value,
+    want_ipv4: document.getElementById('want_ipv4').checked ? 1 : 0,
+    want_ipv6: document.getElementById('want_ipv6').checked ? 1 : 0,
+    proxied: document.getElementById('proxied').checked ? 1 : 0,
+    enabled: document.getElementById('enabled').checked ? 1 : 0
+  };
+
+  try {
+    await api('/api/ddns/rules', { method: 'POST', json: payload });
+    toast('已保存', 'ok');
+    setTimeout(() => location.reload(), 700);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function runNow(id) {
+  toast('正在同步…', 'ok');
+  try {
+    const d = await api(`/api/ddns/rules/${id}/run`, { method: 'POST' });
+    const msg = d.reason || d.action;
+    toast(d.errors && d.errors.length ? msg : `同步完成：${msg}`,
+          d.errors && d.errors.length ? 'err' : 'ok');
+    setTimeout(() => location.reload(), 1200);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function del(id) {
+  if (!confirm('删除这条 DDNS 规则？DNS 上已有的解析记录不会被删除。')) return;
+  try {
+    await api(`/api/ddns/rules/${id}`, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    setTimeout(() => location.reload(), 600);
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+</script>
+{% endblock %}

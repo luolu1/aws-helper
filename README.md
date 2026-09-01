@@ -38,6 +38,7 @@ sudo bash deploy/install.sh          # 交互选择部署方式
 │   调用测试        │
 ├──────────────────┤
 │ 通用              │
+│   DDNS 解析       │
 │   账号 / 日志     │
 │   用户面板        │
 └──────────────────┴─────────────────────────────
@@ -67,6 +68,7 @@ Bedrock 没有实例概念，只有模型和 token 计费。所以各栏有自�
 | 自动换 IP | 后台探测端口，连续失败达阈值自动换 IP —— IP 被墙自动换新，带冷却保护 |
 | 多账号代理 | 每个 AWS 账号可配独立 SOCKS5/HTTP 出站代理，互不影响 |
 | 用户面板 | 改登录密码、查看和踢下线登录会话、登录记录审计 |
+| DDNS 解析 | 本机公网 IP 变了自动更新 DNS，域名托管在 Cloudflare，支持 A / AAAA |
 | 批量与 IPv6 | 一次开多台共用密钥对，可选自建 VPC + IGW + v4/v6 双栈路由 |
 | 计费保护 | 终止实例时连带清理弹性 IP、残留卷、安全组、自建 VPC，防止继续计费 |
 | 账号探测 | 分项检查凭据、账号状态、开机权限、vCPU 配额与当前用量 |
@@ -551,13 +553,83 @@ aws-helper logout-all    # 只下线所有会话，不改密码
 
 ---
 
+## DDNS 动态解析
+
+面板部署在 IP 会变的机器上时（家宽、部分 VPS），IP 一变域名就失效。
+这一栏定期探测本机公网 IP，和 DNS 上的记录比对，**变了才更新**。
+
+和 EC2 的自动换 IP 是相反方向的两件事：
+
+| | 自动换 IP | DDNS |
+|---|---|---|
+| 触发 | 实例 IP 被墙，探测失败 | 本机公网 IP 变了 |
+| 动作 | 给实例换一个新 IP | 让域名指向新 IP |
+| 对象 | AWS 上的实例 | 面板所在的这台机器 |
+
+### 用法
+
+左侧「通用 → DDNS 解析」，填区域根域名、完整主机名和 API Token 即可。
+勾选要更新 A（IPv4）还是 AAAA（IPv6），或者两个都要。
+
+页面顶部会显示当前探测到的本机 IPv4 / IPv6，方便确认机器到底有没有 v6 连通性。
+
+### Cloudflare Token 怎么建
+
+用 **API Token**，不要 Global API Key —— 后者是账号级全权限，放在一台
+动态 IP 的机器上风险太大。
+
+控制台「我的个人资料 → API 令牌 → 创建令牌」，选「编辑区域 DNS」模板：
+
+```
+权限:     Zone → DNS → Edit
+区域资源: 包含 → 特定区域 → 你的域名
+```
+
+Token 用 Fernet 加密后存 Postgres，页面和接口都不回传（连密文也不回）。
+**保存时会实际调一次 Cloudflare API 校验**，Token 配错当场就能看到，
+不用等定时任务默默失败几小时后再去翻日志。
+
+### 几个刻意的设计
+
+**IP 没变化不发任何更新请求。** 照发一次也能跑（PATCH 是幂等的），
+但 Cloudflare 的限流额度是账号级共享的（1200 次 / 5 分钟），白烧没有意义。
+
+**更新用 `PATCH` 而不是 `PUT`。** 这是 DDNS 实现最常见的坑：`PUT` 是整条替换，
+漏传 `proxied` 或 `ttl` 会被重置成默认值 —— 用户在控制台开的橙云会被静默关掉，
+自定义 TTL 也会丢。`PATCH` 只改传了的字段，所以这里只发 `{"content": 新IP}`。
+
+**v4 和 v6 分开探测，用不同的探测点。** `api.ipify.org` 只有 A 记录，
+强制走 v6 会直接连不上 —— 那不是"机器没有 v6"，而是探测点本身不支持。
+v6 用 `api6.ipify.org` / `ipv6.icanhazip.com`。取回的地址还会用 `ipaddress`
+校验版本对得上，探测点偶尔会回一个错误页或 v4 映射地址。
+
+**没有 IPv6 连通性不算失败。** 很多机器就是只有 v4，把它算进失败计数会触发降频，
+连 A 记录的更新也跟着变慢。
+
+**连续失败会降频。** Token 配错时每轮都去撞，会同时触发限流和 Cloudflare 的
+防爆破（连续认证失败会被临时封 IP）。连续失败 3 次后间隔放大 6 倍，上限 1 小时。
+
+**一轮里多条规则共用一次 IP 探测。** 探测要走外部 HTTP，N 条规则各探一次
+纯属浪费，而且不同规则拿到的 IP 还可能不一致。
+
+**开了 Cloudflare 代理时 TTL 强制为自动。** 代理记录的 TTL 不可改，传数字会被拒，
+所以页面上勾了代理就把 TTL 选择器禁掉。
+
+### 换其他 DNS 供应商
+
+供应商走 `DnsProvider` 协议（`zone_id` / `find_record` / `create_record` /
+`update_record` 四个方法），加一家只要写一个类并注册进 `PROVIDERS`，
+不用动监控循环和页面。目前实现了 Cloudflare。
+
+取本机 IP 的逻辑与供应商无关，是独立的，新供应商直接复用。
+
 ## 数据存储
 
 业务数据全部在 **Postgres**，`AWS_HELPER_DATA` 目录只放一个文件：`secret.key`。
 
 | 位置 | 内容 |
 |---|---|
-| Postgres | AWS 账号（密文）、密钥对（密文）、代理（密文）、脚本模板、换 IP 规则、会话、日志 |
+| Postgres | AWS 账号（密文）、密钥对（密文）、代理（密文）、DDNS Token（密文）、脚本模板、换 IP 规则、会话、日志 |
 | `secret.key` | Fernet 加密密钥 |
 
 **两者都要备份，且缺一不可**：库里的凭据用这把密钥加密，密钥丢了数据解不开；
@@ -660,10 +732,11 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-485 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+533 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
-CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、部署脚本静态检查。
+CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
+部署脚本静态检查。
 
 代理相关测试会起一个真实的 SOCKS5 服务器（支持 RFC 1929 认证），
 断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -686,6 +759,8 @@ aws_helper/
   cli.py              密码重置 / 状态查看 / 下线会话
   store.py            Postgres 持久层（加密凭据、会话、规则、日志、SQLite 迁移）
   cache.py            进程内 TTL 缓存（压掉重复 AWS 调用）
+  ddnsmon.py          DDNS 监控循环
+  core/ddns.py        DNS 供应商接口 + Cloudflare 实现 + 取本机公网 IP
   autoip.py           自动换 IP 监控循环
   tasks.py            后台任务与进度跟踪
   core/aws.py         boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
@@ -695,13 +770,13 @@ aws_helper/
   core/lightsail.py   Lightsail 套餐、蓝图、实例、静态 IP
   core/bedrock.py     Bedrock 模型清单、可用性探测、Converse 调用
   web/app.py          FastAPI 路由
-  web/templates/      左侧目录布局 + 十个页面
+  web/templates/      左侧目录布局 + 十一个页面
   demo/               演示环境（moto 后端 + 预置数据）
 deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                485 项测试
+tests/                533 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

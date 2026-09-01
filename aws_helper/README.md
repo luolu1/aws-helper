@@ -210,6 +210,40 @@ CLI 只读写本地数据目录，不经过网络和登录校验，面板打不�
 python3 -m aws_helper.autoip
 ```
 
+## DDNS 动态解析
+
+本机公网 IP 变了自动更新 DNS 解析。域名托管在 Cloudflare，支持 A / AAAA。
+
+和自动换 IP 方向相反：自动换 IP 是实例被墙了换新 IP，DDNS 是本机 IP 变了让域名跟上。
+
+用 Cloudflare **API Token**（不是 Global API Key），权限 `Zone → DNS → Edit`，
+区域范围只勾目标域名。Token 用 Fernet 加密存库，接口不回传明文也不回传密文。
+保存时会实际调一次 API 校验，配错当场报错。
+
+几个要点：
+
+- **IP 没变不发写请求。** PATCH 本身幂等，但 Cloudflare 限流额度是账号级共享的
+  （1200 次 / 5 分钟）
+- **更新用 PATCH 不用 PUT。** PUT 是整条替换，漏传 `proxied` / `ttl` 会重置成默认值，
+  用户开的橙云会被静默关掉。所以只发 `{"content": 新IP}`
+- **v4 / v6 分开探测。** `api.ipify.org` 只有 A 记录，强制走 v6 会连不上；
+  v6 用 `api6.ipify.org` / `ipv6.icanhazip.com`。取回后用 `ipaddress` 校验版本
+- **没有 v6 连通性不算失败**，否则会拖累 A 记录的更新频率
+- **连续失败 3 次后降频 6 倍**（上限 1 小时）。Token 配错时每轮硬撞会触发
+  Cloudflare 的防爆破，连续认证失败会被临时封
+- **一轮内多条规则共用一次 IP 探测**
+- **开了代理时 TTL 强制为自动**，代理记录的 TTL 不可改，传数字会被拒
+
+加新 DNS 供应商实现 `DnsProvider` 协议的四个方法（`zone_id` / `find_record` /
+`create_record` / `update_record`）并注册进 `PROVIDERS` 即可，取本机 IP 的逻辑
+与供应商无关可直接复用。
+
+也能脱离面板单独跑：
+
+```bash
+python3 -m aws_helper.ddnsmon
+```
+
 ## 减少 AWS 调用
 
 频繁调 AWS 容易撞限流和风控。按数据变化频率分别缓存：
@@ -378,11 +412,11 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-485 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+533 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
-并发写入、缓存命中与失效。
+并发写入、缓存命中与失效、DDNS 解析同步。
 
 代理相关测试用 [tests/socks_server.py](tests/socks_server.py) 起真实 SOCKS5 服务器
 （支持 RFC 1929 认证），断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -403,10 +437,12 @@ aws_helper/
   core/bedrock.py    Bedrock 模型清单、可用性探测、Converse 调用
   store.py           Postgres 持久层（加密凭据、会话、规则、日志、SQLite 迁移）
   cache.py           进程内 TTL 缓存与失效
+  ddnsmon.py         DDNS 监控循环
+  core/ddns.py       DNS 供应商接口 + Cloudflare + 取本机公网 IP
   tasks.py           后台任务与进度跟踪
   autoip.py          自动换 IP 监控循环
   web/app.py         FastAPI 路由
-  web/templates/     左侧目录布局 + 十个页面
+  web/templates/     左侧目录布局 + 十一个页面
   demo/              演示环境（moto 后端 + 预置数据）
 
 deploy/install.sh    一键部署（systemd / docker 两种方式）

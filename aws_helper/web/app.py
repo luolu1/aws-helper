@@ -36,8 +36,10 @@ from ..cache import (
     ls_instances_key,
     ls_regions_key,
 )
-from ..core import aws, bedrock, ipchange, launch, lightsail
+from ..core import aws, bedrock, ddns, ipchange, launch, lightsail
 from ..core.userdata import ScriptOptions, ScriptError, render
+from ..ddnsmon import Monitor as DdnsMonitor
+from ..ddnsmon import check_rule as ddns_check_rule
 from ..store import Store
 from ..tasks import manager
 
@@ -46,6 +48,7 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 store = Store()
 monitor = Monitor(store)
+ddns_monitor = DdnsMonitor(store)
 
 SESSION_TTL = int(os.environ.get("AWS_HELPER_SESSION_TTL", "86400"))
 
@@ -80,8 +83,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         print("    python3 -m aws_helper.cli reset-password")
         print("=" * 64)
     monitor.start()
+    ddns_monitor.start()
     yield
     monitor.stop()
+    ddns_monitor.stop()
 
 
 app = FastAPI(title="AWS 小助手", version=__version__, lifespan=lifespan)
@@ -330,6 +335,85 @@ def autoip_page(request: Request, _: None = Guard):
             "monitor_on": monitor.running,
         },
     )
+
+
+@app.get("/ddns", response_class=HTMLResponse)
+def ddns_page(request: Request, _: None = Guard):
+    return templates.TemplateResponse(
+        request,
+        "ddns.html",
+        {
+            **_page_ctx("ddns"),
+            "rules": store.list_ddns_rules(),
+            "providers": ddns.PROVIDERS,
+            "monitor_on": ddns_monitor.running,
+        },
+    )
+
+
+@app.get("/api/ddns/detect")
+def api_ddns_detect(_: None = Guard):
+    """探测本机公网 IP。IPv6 拿不到是常态，不当错误。"""
+    return {
+        "ok": True,
+        "ipv4": ddns.detect_ip(4),
+        "ipv6": ddns.detect_ip(6),
+    }
+
+
+@app.post("/api/ddns/rules")
+async def api_ddns_save(request: Request, _: None = Guard):
+    body = await request.json()
+    token = (body.get("token") or "").strip()
+    zone = (body.get("zone") or "").strip()
+    hostname = (body.get("hostname") or "").strip()
+    provider_kind = body.get("provider", "cloudflare")
+
+    # 保存前实际调一次 API —— 配错 Token 应该当场就知道，
+    # 而不是等定时任务默默失败几小时后才在日志里发现。
+    if token:
+        try:
+            ddns.verify_token(provider_kind, token, zone)
+        except ddns.DdnsError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    try:
+        rule_id = store.save_ddns_rule(
+            zone,
+            hostname,
+            token=token or None,
+            provider=provider_kind,
+            enabled=body.get("enabled", 1),
+            want_ipv4=body.get("want_ipv4", 1),
+            want_ipv6=body.get("want_ipv6", 0),
+            ttl=int(body.get("ttl", ddns.TTL_AUTO)),
+            proxied=body.get("proxied", 0),
+            interval_sec=int(body.get("interval_sec", 300)),
+            note=body.get("note", ""),
+        )
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    store.log("ddns", hostname, True, f"保存规则（{provider_kind} / {zone}）")
+    return {"ok": True, "id": rule_id}
+
+
+@app.post("/api/ddns/rules/{rule_id}/run")
+def api_ddns_run(rule_id: int, _: None = Guard):
+    """立刻跑一次这条规则，不等间隔。"""
+    rule = store.ddns_rule(rule_id)
+    if rule is None:
+        return JSONResponse({"ok": False, "error": "规则不存在"}, status_code=404)
+    # last_check 归零绕过间隔判断，用户点了就该立刻执行
+    result = ddns_check_rule(store, {**rule, "last_check": 0})
+    return {"ok": True, **result}
+
+
+@app.delete("/api/ddns/rules/{rule_id}")
+def api_ddns_delete(rule_id: int, _: None = Guard):
+    store.delete_ddns_rule(rule_id)
+    store.log("ddns", str(rule_id), True, "删除规则")
+    return {"ok": True}
 
 
 @app.get("/accounts", response_class=HTMLResponse)
