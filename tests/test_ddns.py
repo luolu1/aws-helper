@@ -675,3 +675,57 @@ def test_delete_rule(panel, monkeypatch):
     rule_id = app_module.store.save_ddns_rule(ZONE, HOST, token="tok")
     assert c.request("DELETE", f"/api/ddns/rules/{rule_id}").status_code == 200
     assert app_module.store.list_ddns_rules() == []
+
+
+# ---------- 脚本生成接口 ----------
+
+
+def test_script_endpoint_returns_bash(panel):
+    c, _ = panel
+    body = c.post(
+        "/api/ddns/script",
+        json={"zone": ZONE, "hostname": HOST, "token": "t" * 40, "want_ipv6": 1},
+    ).json()
+    assert body["ok"] is True
+    assert body["script"].startswith("#!/usr/bin/env bash")
+    assert body["filename"] == "ddns-deploy.sh"
+
+
+def test_script_endpoint_does_not_persist(panel):
+    """生成脚本是给别的机器用的，不该在面板里留一条规则。"""
+    c, app_module = panel
+    c.post(
+        "/api/ddns/script",
+        json={"zone": ZONE, "hostname": HOST, "token": "t" * 40},
+    )
+    assert app_module.store.list_ddns_rules() == []
+
+
+def test_script_endpoint_validates(panel):
+    c, _ = panel
+    resp = c.post(
+        "/api/ddns/script",
+        json={"zone": ZONE, "hostname": "home.other.com", "token": "t" * 40},
+    )
+    assert resp.status_code == 400
+    assert "不属于区域" in resp.json()["error"]
+
+
+def test_script_endpoint_requires_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from .test_web import build_app
+
+    app_module = build_app(monkeypatch, tmp_path / "ddns-script-anon")
+    c = TestClient(app_module.app)
+    assert c.post("/api/ddns/script", json={}).status_code == 401
+
+
+def test_script_endpoint_rejects_bad_numbers(panel):
+    c, _ = panel
+    resp = c.post(
+        "/api/ddns/script",
+        json={"zone": ZONE, "hostname": HOST, "token": "t" * 40, "ttl": "abc"},
+    )
+    assert resp.status_code == 400
+    assert "参数错误" in resp.json()["error"]

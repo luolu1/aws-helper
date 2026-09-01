@@ -21,10 +21,11 @@
 </div>
 
 <div class="card">
-  <h2>添加 / 更新规则</h2>
+  <h2>填写配置</h2>
   <p class="hint">
-    同一个（供应商 + 主机名）只存一条规则，重复提交就是更新。
-    保存前会实际调一次 API 校验 Token 和区域，配错当场就能看到。
+    填完可以二选一：<strong>生成一键脚本</strong>拿到别的机器上部署（脚本自包含，
+    目标机器不需要 Python、不用连这个面板），或者<strong>交给面板托管</strong>
+    直接更新本机的解析。
   </p>
 
   <div class="grid g3">
@@ -60,7 +61,7 @@
   <div class="grid g4 mt">
     <label class="f">
       <span>检查间隔（秒）</span>
-      <input type="number" id="interval_sec" value="300" min="30" max="86400">
+      <input type="number" id="interval_sec" value="300" min="60" max="86400">
     </label>
     <label class="f">
       <span>TTL</span>
@@ -72,12 +73,15 @@
       </select>
     </label>
     <label class="f">
-      <span>备注</span>
-      <input id="note" placeholder="可留空">
+      <span>脚本的运行方式</span>
+      <select id="schedule">
+        <option value="systemd">systemd timer（推荐）</option>
+        <option value="cron">cron 定时任务</option>
+      </select>
     </label>
     <label class="f">
-      <span>&nbsp;</span>
-      <button class="primary" style="width:100%" onclick="save()">保存规则</button>
+      <span>备注（仅面板托管用）</span>
+      <input id="note" placeholder="可留空">
     </label>
   </div>
 
@@ -85,16 +89,49 @@
     <label class="chk"><input type="checkbox" id="want_ipv4" checked> 更新 A 记录（IPv4）</label>
     <label class="chk"><input type="checkbox" id="want_ipv6"> 更新 AAAA 记录（IPv6）</label>
     <label class="chk"><input type="checkbox" id="proxied"> 开启 Cloudflare 代理（橙云）</label>
-    <label class="chk"><input type="checkbox" id="enabled" checked> 启用</label>
+    <label class="chk"><input type="checkbox" id="enabled" checked> 启用（仅面板托管用）</label>
   </div>
-  <p class="hint" id="proxy-note">
-    不开代理时，域名会直接暴露本机真实公网 IP —— 这通常正是 DDNS 的目的。
+  <p class="hint">
+    不开代理时，域名会直接暴露机器的真实公网 IP —— 这通常正是 DDNS 的目的。
     开了代理则 TTL 强制为自动，且流量经 Cloudflare 转发。
+  </p>
+
+  <div class="row mt">
+    <button class="primary" onclick="genScript()">生成一键脚本</button>
+    <button onclick="save()">交给面板托管</button>
+    <span style="flex:1"></span>
+    <span class="hint" id="form-hint" style="margin:0"></span>
+  </div>
+</div>
+
+<div class="card" id="script-card" style="display:none">
+  <h2>一键部署脚本</h2>
+  <p class="hint">
+    在目标机器上以 root 执行即可。脚本会装好更新器、写好配置、
+    <strong>先跑一次校验 Token 和区域</strong>，再挂上定时任务。
+    校验不过会直接报错退出，不会留下一个跑不通的定时任务。
+  </p>
+  <div class="row">
+    <button class="sm" onclick="copyScript()">复制到剪贴板</button>
+    <button class="sm" onclick="downloadScript()">下载 ddns-deploy.sh</button>
+    <span style="flex:1"></span>
+    <span class="hint" id="copy-hint" style="margin:0"></span>
+  </div>
+  <pre class="out mt" id="script-out" style="max-height:420px;overflow:auto"></pre>
+  <p class="hint">
+    <span class="tag warn">注意</span>
+    脚本里含明文 API Token，等同于该区域 DNS 的修改权限。
+    传输时别走公开渠道，部署完建议删掉脚本文件并清理 shell 历史
+    （<code>history -c</code>）。
   </p>
 </div>
 
 <div class="card">
-  <h2>已配置的规则</h2>
+  <h2>面板托管的规则</h2>
+  <p class="hint">
+    这些是<strong>面板自己</strong>定期检查并更新的，同步的是这台机器的公网 IP。
+    用一键脚本部署到别的机器上的不会出现在这里 —— 那些由目标机器自己跑。
+  </p>
   {% if rules %}
   <table>
     <thead>
@@ -180,29 +217,81 @@ document.addEventListener('DOMContentLoaded', () => {
   sync();
 });
 
-async function save() {
-  const zone = document.getElementById('zone').value.trim();
-  const hostname = document.getElementById('hostname').value.trim();
-  if (!zone) return toast('请填写区域根域名', 'err');
-  if (!hostname) return toast('请填写完整主机名', 'err');
-
-  const payload = {
+function formValues() {
+  return {
     provider: document.getElementById('provider').value,
-    zone,
-    hostname,
+    zone: document.getElementById('zone').value.trim(),
+    hostname: document.getElementById('hostname').value.trim(),
     token: document.getElementById('token').value,
     interval_sec: parseInt(document.getElementById('interval_sec').value, 10) || 300,
     ttl: parseInt(document.getElementById('ttl').value, 10) || 1,
+    schedule: document.getElementById('schedule').value,
     note: document.getElementById('note').value,
     want_ipv4: document.getElementById('want_ipv4').checked ? 1 : 0,
     want_ipv6: document.getElementById('want_ipv6').checked ? 1 : 0,
     proxied: document.getElementById('proxied').checked ? 1 : 0,
     enabled: document.getElementById('enabled').checked ? 1 : 0
   };
+}
+
+let SCRIPT_TEXT = '';
+
+async function genScript() {
+  const v = formValues();
+  if (!v.zone) return toast('请填写区域根域名', 'err');
+  if (!v.hostname) return toast('请填写完整主机名', 'err');
+  if (!v.token) return toast('请填写 API Token', 'err');
+
+  document.getElementById('form-hint').textContent = '生成中…';
+  try {
+    const d = await api('/api/ddns/script', { method: 'POST', json: v });
+    SCRIPT_TEXT = d.script;
+    document.getElementById('script-out').textContent = d.script;
+    document.getElementById('script-card').style.display = 'block';
+    document.getElementById('form-hint').textContent = '';
+    document.getElementById('script-card').scrollIntoView({ behavior: 'smooth' });
+    toast('脚本已生成', 'ok');
+  } catch (e) {
+    document.getElementById('form-hint').textContent = '';
+    toast(e.message, 'err');
+  }
+}
+
+async function copyScript() {
+  const hint = document.getElementById('copy-hint');
+  try {
+    await navigator.clipboard.writeText(SCRIPT_TEXT);
+    hint.textContent = '已复制';
+  } catch (e) {
+    // 非 HTTPS 下 clipboard API 不可用，退回选中文本让用户自己按 Ctrl+C
+    const pre = document.getElementById('script-out');
+    const range = document.createRange();
+    range.selectNodeContents(pre);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    hint.textContent = '已全选，按 Ctrl+C 复制';
+  }
+  setTimeout(() => { hint.textContent = ''; }, 3000);
+}
+
+function downloadScript() {
+  const blob = new Blob([SCRIPT_TEXT], { type: 'text/x-shellscript' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'ddns-deploy.sh';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function save() {
+  const v = formValues();
+  if (!v.zone) return toast('请填写区域根域名', 'err');
+  if (!v.hostname) return toast('请填写完整主机名', 'err');
 
   try {
-    await api('/api/ddns/rules', { method: 'POST', json: payload });
-    toast('已保存', 'ok');
+    await api('/api/ddns/rules', { method: 'POST', json: v });
+    toast('已保存，面板会定期检查', 'ok');
     setTimeout(() => location.reload(), 700);
   } catch (e) {
     toast(e.message, 'err');

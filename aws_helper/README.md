@@ -238,7 +238,18 @@ python3 -m aws_helper.autoip
 `create_record` / `update_record`）并注册进 `PROVIDERS` 即可，取本机 IP 的逻辑
 与供应商无关可直接复用。
 
-也能脱离面板单独跑：
+### 一键脚本
+
+面板还能把配置渲染成一段自包含的 bash，复制到任意机器上以 root 执行即部署完成 ——
+目标机器不需要 Python、不用连面板、不用数据库，只要有 curl（没有会自动装）。
+
+用 bash 而不是 Python 就是为了这个：要能丢到任何一台机器上跑，包括精简系统。
+定时可选 systemd timer 或 cron。脚本会先跑一次校验 Token 和区域，
+校验不过直接报错退出，不会留下一个跑不通的定时任务。
+
+脚本里含明文 Token，部署完建议删掉文件并清理 shell 历史。
+
+面板自己托管的规则也能脱离 Web 单独跑：
 
 ```bash
 python3 -m aws_helper.ddnsmon
@@ -412,11 +423,11 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-533 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+574 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
-并发写入、缓存命中与失效、DDNS 解析同步。
+并发写入、缓存命中与失效、DDNS 解析同步与一键脚本生成。
 
 代理相关测试用 [tests/socks_server.py](tests/socks_server.py) 起真实 SOCKS5 服务器
 （支持 RFC 1929 认证），断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -439,6 +450,7 @@ aws_helper/
   cache.py           进程内 TTL 缓存与失效
   ddnsmon.py         DDNS 监控循环
   core/ddns.py       DNS 供应商接口 + Cloudflare + 取本机公网 IP
+  core/ddns_script.py 生成自包含的一键部署脚本（bash + curl）
   tasks.py           后台任务与进度跟踪
   autoip.py          自动换 IP 监控循环
   web/app.py         FastAPI 路由

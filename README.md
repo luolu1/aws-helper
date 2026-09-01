@@ -68,7 +68,7 @@ Bedrock 没有实例概念，只有模型和 token 计费。所以各栏有自�
 | 自动换 IP | 后台探测端口，连续失败达阈值自动换 IP —— IP 被墙自动换新，带冷却保护 |
 | 多账号代理 | 每个 AWS 账号可配独立 SOCKS5/HTTP 出站代理，互不影响 |
 | 用户面板 | 改登录密码、查看和踢下线登录会话、登录记录审计 |
-| DDNS 解析 | 本机公网 IP 变了自动更新 DNS，域名托管在 Cloudflare，支持 A / AAAA |
+| DDNS 解析 | 填好配置生成一键部署脚本给任意机器用，或交面板托管；Cloudflare，A / AAAA |
 | 批量与 IPv6 | 一次开多台共用密钥对，可选自建 VPC + IGW + v4/v6 双栈路由 |
 | 计费保护 | 终止实例时连带清理弹性 IP、残留卷、安全组、自建 VPC，防止继续计费 |
 | 账号探测 | 分项检查凭据、账号状态、开机权限、vCPU 配额与当前用量 |
@@ -566,10 +566,53 @@ aws-helper logout-all    # 只下线所有会话，不改密码
 | 动作 | 给实例换一个新 IP | 让域名指向新 IP |
 | 对象 | AWS 上的实例 | 面板所在的这台机器 |
 
-### 用法
+### 两种用法
 
-左侧「通用 → DDNS 解析」，填区域根域名、完整主机名和 API Token 即可。
-勾选要更新 A（IPv4）还是 AAAA（IPv6），或者两个都要。
+左侧「通用 → DDNS 解析」，填 DNS 供应商、区域根域名、完整主机名、API Token，
+勾选要更新 A（IPv4）还是 AAAA（IPv6）。然后二选一：
+
+**一、生成一键脚本（给别的机器用）**
+
+点「生成一键脚本」，页面直接给出一段自包含的 bash，复制或下载到目标机器上
+以 root 执行即可：
+
+```bash
+bash ddns-deploy.sh
+```
+
+脚本会装好更新器（`/usr/local/bin/ddns-update`）、写好配置
+（`/etc/ddns-update.env`，权限 600）、**先跑一次校验 Token 和区域**，
+再挂上 systemd timer 或 cron。校验不过直接报错退出，不会留下一个跑不通的定时任务。
+
+**目标机器不需要 Python，不需要连这个面板，也不需要数据库** —— 只要有
+`curl`（没有的话脚本会自动装）。用 bash 而不是 Python 就是为了这个：
+要能丢到任何一台机器上跑，包括精简系统。
+
+定时方式可选：
+
+| 方式 | 说明 |
+|---|---|
+| systemd timer（推荐） | `Type=oneshot` + timer，崩了下次自己重来；`ProtectSystem=strict` 只允许写状态目录 |
+| cron | 更轻量，日志写 `/var/log/ddns-update.log`。重复部署会先删掉旧行再加，不会堆积 |
+
+装完的常用命令：
+
+```bash
+systemctl list-timers ddns-update.timer   # 看下次执行时间
+systemctl start ddns-update               # 立刻同步一次
+journalctl -u ddns-update -n 50           # 看日志
+/usr/local/bin/ddns-update                # 手动跑，直接看输出
+```
+
+**脚本里含明文 API Token**，等同于该区域 DNS 的修改权限。传输别走公开渠道，
+部署完建议删掉脚本文件并 `history -c`。
+
+**二、交给面板托管（更新面板这台机器）**
+
+点「交给面板托管」，规则存进数据库，面板后台每 60 秒扫一遍，同步的是
+**面板所在这台机器**的公网 IP。保存时会实际调一次 API 校验。
+
+两者互不干扰：一键脚本部署的规则由目标机器自己跑，不会出现在面板的规则列表里。
 
 页面顶部会显示当前探测到的本机 IPv4 / IPv6，方便确认机器到底有没有 v6 连通性。
 
@@ -732,10 +775,11 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-533 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+574 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
+DDNS 一键脚本（两层 bash 语法检查 + 对着假 Cloudflare 真实执行）、
 部署脚本静态检查。
 
 代理相关测试会起一个真实的 SOCKS5 服务器（支持 RFC 1929 认证），
@@ -761,6 +805,7 @@ aws_helper/
   cache.py            进程内 TTL 缓存（压掉重复 AWS 调用）
   ddnsmon.py          DDNS 监控循环
   core/ddns.py        DNS 供应商接口 + Cloudflare 实现 + 取本机公网 IP
+  core/ddns_script.py 生成自包含的 DDNS 一键部署脚本（bash + curl）
   autoip.py           自动换 IP 监控循环
   tasks.py            后台任务与进度跟踪
   core/aws.py         boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
@@ -776,7 +821,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                533 项测试
+tests/                574 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

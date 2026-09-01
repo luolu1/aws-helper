@@ -36,7 +36,7 @@ from ..cache import (
     ls_instances_key,
     ls_regions_key,
 )
-from ..core import aws, bedrock, ddns, ipchange, launch, lightsail
+from ..core import aws, bedrock, ddns, ddns_script, ipchange, launch, lightsail
 from ..core.userdata import ScriptOptions, ScriptError, render
 from ..ddnsmon import Monitor as DdnsMonitor
 from ..ddnsmon import check_rule as ddns_check_rule
@@ -359,6 +359,37 @@ def api_ddns_detect(_: None = Guard):
         "ipv4": ddns.detect_ip(4),
         "ipv6": ddns.detect_ip(6),
     }
+
+
+@app.post("/api/ddns/script")
+async def api_ddns_script(request: Request, _: None = Guard):
+    """生成一键部署脚本。
+
+    这条接口不落库、不校验 Token —— 脚本是给别的机器用的，
+    面板只当生成器。要面板自己托管才走 /api/ddns/rules。
+    """
+    body = await request.json()
+    try:
+        script = ddns_script.render_script(
+            ddns_script.ScriptRequest(
+                provider=body.get("provider", "cloudflare"),
+                zone=body.get("zone", ""),
+                hostname=body.get("hostname", ""),
+                token=body.get("token", ""),
+                want_ipv4=bool(body.get("want_ipv4", True)),
+                want_ipv6=bool(body.get("want_ipv6", False)),
+                proxied=bool(body.get("proxied", False)),
+                ttl=int(body.get("ttl", ddns.TTL_AUTO)),
+                interval_sec=int(body.get("interval_sec", 300)),
+                schedule=body.get("schedule", "systemd"),
+            )
+        )
+    except ddns_script.ScriptError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": f"参数错误: {exc}"}, status_code=400)
+
+    return {"ok": True, "script": script, "filename": "ddns-deploy.sh"}
 
 
 @app.post("/api/ddns/rules")
