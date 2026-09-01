@@ -536,7 +536,9 @@ def list_instances(creds: aws.Credentials, region: str) -> list[dict[str, Any]]:
                     ),
                 }
             )
-    out.sort(key=lambda i: i["launch_time"], reverse=True)
+    # 同批开机的实例 launch_time 精确到秒是相同的，只按它排序时 AWS 返回顺序
+    # 一变，列表顺序就变 —— 页面上行会莫名跳动，前端算的指纹也会误判「变了」。
+    out.sort(key=lambda i: (i["launch_time"], i["instance_id"]), reverse=True)
     return out
 
 

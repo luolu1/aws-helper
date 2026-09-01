@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 import time
@@ -23,6 +25,17 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .. import __version__, auth
 from ..autoip import Monitor, probe, run_once
+from ..cache import (
+    BEDROCK_TTL,
+    CATALOG_TTL,
+    INSTANCES_TTL,
+    bedrock_models_key,
+    cache,
+    ec2_instances_key,
+    ls_catalog_key,
+    ls_instances_key,
+    ls_regions_key,
+)
 from ..core import aws, bedrock, ipchange, launch, lightsail
 from ..core.userdata import ScriptOptions, ScriptError, render
 from ..store import Store
@@ -254,6 +267,7 @@ def api_catalog(
     region: str,
     os_family: str = "linux",
     arch: str = "x86_64",
+    force: bool = False,
     _: None = Guard,
 ):
     """返回该区域真实可用的镜像与规格，供级联选择使用。
@@ -273,9 +287,14 @@ def api_catalog(
     ]
 
     degraded = False
+    cached = False
+    age = 0.0
     try:
-        types = aws.list_instance_types(creds, region, arch)
+        types, cached, age = aws.instance_types_cached(
+            creds, region, arch, force=force
+        )
     except Exception as exc:
+        # 降级结果不进缓存，否则一次权限失败会粘住整个 TTL
         degraded = True
         types = aws.fallback_instance_types(arch)
         store.log("catalog", region, False, f"拉取规格失败，已降级: {exc}")
@@ -287,6 +306,8 @@ def api_catalog(
         "images": images,
         "instance_types": types,
         "degraded": degraded,
+        "cached": cached,
+        "age_seconds": age,
         "is_windows": os_family == "windows",
     }
 
@@ -354,11 +375,20 @@ def bedrock_play_page(request: Request, _: None = Guard):
 
 
 @app.get("/api/lightsail/catalog")
-def api_ls_catalog(account_id: int, region: str, _: None = Guard):
-    """Lightsail 的套餐与蓝图。区域支持范围比 EC2 窄，要单独校验。"""
+def api_ls_catalog(account_id: int, region: str, force: bool = False, _: None = Guard):
+    """Lightsail 的套餐与蓝图。区域支持范围比 EC2 窄，要单独校验。
+
+    套餐和蓝图基本不变（实测 ap-east-1 有 100 个套餐），缓存 6 小时。
+    原先每打开一次创建页就是 3 次 AWS 调用。
+    """
     creds = store.credentials(account_id, region)
     try:
-        regions = lightsail.available_regions(creds, region)
+        regions, _rc, _ra = cache.fetch(
+            ls_regions_key(account_id),
+            CATALOG_TTL,
+            lambda: lightsail.available_regions(creds, region),
+            force=force,
+        )
     except lightsail.LightsailError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
@@ -371,9 +401,16 @@ def api_ls_catalog(account_id: int, region: str, _: None = Guard):
             status_code=400,
         )
 
+    def load() -> dict[str, Any]:
+        return {
+            "bundles": lightsail.list_bundles(creds, region),
+            "blueprints": lightsail.list_blueprints(creds, region),
+        }
+
     try:
-        bundles = lightsail.list_bundles(creds, region)
-        blueprints = lightsail.list_blueprints(creds, region)
+        catalog, cached, age = cache.fetch(
+            ls_catalog_key(account_id, region), CATALOG_TTL, load, force=force
+        )
     except lightsail.LightsailError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
@@ -381,22 +418,31 @@ def api_ls_catalog(account_id: int, region: str, _: None = Guard):
         "ok": True,
         "region": region,
         "supported_regions": regions,
-        "bundles": bundles,
-        "blueprints": blueprints,
+        "bundles": catalog["bundles"],
+        "blueprints": catalog["blueprints"],
+        "cached": cached,
+        "age_seconds": age,
     }
 
 
 @app.get("/api/lightsail/instances")
-def api_ls_instances(account_id: int, region: str, _: None = Guard):
-    creds = store.credentials(account_id, region)
-    try:
+def api_ls_instances(
+    account_id: int, region: str, force: bool = False, _: None = Guard
+):
+    def load() -> dict[str, Any]:
         return {
-            "ok": True,
             "instances": lightsail.list_instances(creds, region),
             "static_ips": lightsail.list_static_ips(creds, region),
         }
+
+    creds = store.credentials(account_id, region)
+    try:
+        data, cached, age = cache.fetch(
+            ls_instances_key(account_id, region), INSTANCES_TTL, load, force=force
+        )
     except lightsail.LightsailError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, **data, "cached": cached, "age_seconds": age}
 
 
 @app.post("/api/lightsail/create")
@@ -407,15 +453,18 @@ async def api_ls_create(request: Request, _: None = Guard):
     creds = store.credentials(account_id, region)
 
     def job(progress: Any) -> dict[str, Any]:
-        result = lightsail.create_instance(
-            creds,
-            region,
-            name=str(body.get("name", "")).strip(),
-            bundle_id=body.get("bundle_id", ""),
-            blueprint_id=body.get("blueprint_id", ""),
-            user_data=body.get("user_data", ""),
-            progress=progress,
-        )
+        try:
+            result = lightsail.create_instance(
+                creds,
+                region,
+                name=str(body.get("name", "")).strip(),
+                bundle_id=body.get("bundle_id", ""),
+                blueprint_id=body.get("blueprint_id", ""),
+                user_data=body.get("user_data", ""),
+                progress=progress,
+            )
+        finally:
+            cache.drop(*ls_instances_key(account_id, region))
         store.log(
             "lightsail",
             result["name"],
@@ -433,7 +482,8 @@ async def api_ls_create(request: Request, _: None = Guard):
 @app.post("/api/lightsail/power")
 async def api_ls_power(request: Request, _: None = Guard):
     body = await request.json()
-    creds = store.credentials(int(body["account_id"]), body["region"])
+    account_id = int(body["account_id"])
+    creds = store.credentials(account_id, body["region"])
     names = body.get("names") or []
     action = body["action"]
     try:
@@ -441,6 +491,8 @@ async def api_ls_power(request: Request, _: None = Guard):
     except lightsail.LightsailError as exc:
         store.log("lightsail", ",".join(names), False, f"{action} 失败: {exc}")
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    finally:
+        cache.drop(*ls_instances_key(account_id, body["region"]))
 
     detail = f"{action} 完成"
     if result.get("released_static_ips"):
@@ -453,12 +505,20 @@ async def api_ls_power(request: Request, _: None = Guard):
 
 
 @app.get("/api/bedrock/models")
-def api_bd_models(account_id: int, region: str, _: None = Guard):
+def api_bd_models(account_id: int, region: str, force: bool = False, _: None = Guard):
+    """模型清单。TTL 只给 15 分钟 —— 模型访问是用户在控制台申请的，
+    刚开通就得能看到，不能让他等 6 小时。"""
     creds = store.credentials(account_id, region)
     try:
-        return {"ok": True, **bedrock.list_models(creds, region)}
+        data, cached, age = cache.fetch(
+            bedrock_models_key(account_id, region),
+            BEDROCK_TTL,
+            lambda: bedrock.list_models(creds, region),
+            force=force,
+        )
     except bedrock.BedrockError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, **data, "cached": cached, "age_seconds": age}
 
 
 @app.get("/api/bedrock/probe")
@@ -710,6 +770,8 @@ async def api_update_account(account_id: int, request: Request, _: None = Guard)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"保存失败: {exc}"}, status_code=400)
 
+    # 换了密钥或代理，出口和权限都可能变了，旧结果不能再用
+    cache.drop_account(account_id)
     store.log(
         "account",
         label,
@@ -768,6 +830,7 @@ async def api_test_proxy(request: Request, _: None = Guard):
 @app.delete("/api/accounts/{account_id}")
 def api_delete_account(account_id: int, _: None = Guard):
     store.delete_account(account_id)
+    cache.drop_account(account_id)
     store.log("account", str(account_id), True, "删除账号")
     return {"ok": True}
 
@@ -775,14 +838,54 @@ def api_delete_account(account_id: int, _: None = Guard):
 # ---------------- 实例 API ----------------
 
 
+def _fingerprint(items: list[dict[str, Any]]) -> str:
+    """算清单指纹，用来判断「和上次相比有没有变」。
+
+    先按 instance_id 排序再算 —— 同批开机的实例 launch_time 精确到秒是相同的，
+    AWS 返回顺序不固定，直接算会得到假的「变了」。
+    """
+    stable = sorted(items, key=lambda i: i.get("instance_id", ""))
+    raw = json.dumps(stable, sort_keys=True, default=str).encode()
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
 @app.get("/api/instances")
-def api_instances(account_id: int, region: str, _: None = Guard):
+def api_instances(
+    account_id: int,
+    region: str,
+    force: bool = False,
+    fingerprint: str = "",
+    _: None = Guard,
+):
+    """实例清单。默认走 10 秒缓存，force=1 强制回源。
+
+    缓存窗口刻意压得比人的反应时间短 —— 实例状态是用户盯着看的东西，
+    宁可多调一次也不能显示已经不成立的状态。开关机、终止、换 IP 之后
+    会主动失效缓存，不用等 TTL 到期。
+    """
     creds = store.credentials(account_id, region)
     try:
-        items = launch.list_instances(creds, region)
+        items, cached, age = cache.fetch(
+            ec2_instances_key(account_id, region),
+            INSTANCES_TTL,
+            lambda: launch.list_instances(creds, region),
+            force=force,
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-    return {"ok": True, "instances": items}
+
+    current = _fingerprint(items)
+    body: dict[str, Any] = {
+        "ok": True,
+        "cached": cached,
+        "age_seconds": age,
+        "fingerprint": current,
+        "changed": current != fingerprint,
+    }
+    # 没变就不回传列表：前端保留现有 DOM 和勾选状态，避免整表重绘
+    if current != fingerprint:
+        body["instances"] = items
+    return body
 
 
 @app.post("/api/instances/power")
@@ -799,19 +902,24 @@ async def api_power(request: Request, _: None = Guard):
     # 必须走后台任务，否则 HTTP 请求会超时。
     if action == "terminate":
         def job(progress: Any) -> dict[str, Any]:
-            result = launch.power(creds, region, action, ids, cleanup, progress)
-            cleaned = result.get("cleaned", {})
-            summary = "，".join(
-                f"{name} {len(items)}" for name, items in cleaned.items() if items
-            )
-            store.log(
-                "terminate",
-                ",".join(ids),
-                not result.get("failed"),
-                f"已清理: {summary or '仅实例'}"
-                + (f"；失败: {'; '.join(result['failed'])}" if result.get("failed") else ""),
-            )
-            return result
+            try:
+                result = launch.power(creds, region, action, ids, cleanup, progress)
+                cleaned = result.get("cleaned", {})
+                summary = "，".join(
+                    f"{name} {len(items)}" for name, items in cleaned.items() if items
+                )
+                store.log(
+                    "terminate",
+                    ",".join(ids),
+                    not result.get("failed"),
+                    f"已清理: {summary or '仅实例'}"
+                    + (f"；失败: {'; '.join(result['failed'])}" if result.get("failed") else ""),
+                )
+                return result
+            finally:
+                # 必须在后台任务内失效，不能在提交处 —— 提交时实例还没真终止。
+                # 用 finally：失败也可能已经部分变更。
+                cache.drop(*ec2_instances_key(account_id, region))
 
         task_id = manager.submit("terminate", f"终止并清理 {len(ids)} 台实例", job)
         return {"ok": True, "task_id": task_id, "action": action}
@@ -821,6 +929,8 @@ async def api_power(request: Request, _: None = Guard):
     except Exception as exc:
         store.log("power", ",".join(ids), False, f"{action} 失败: {exc}")
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    finally:
+        cache.drop(*ec2_instances_key(account_id, region))
     store.log("power", ",".join(ids), True, f"{action} 成功")
     return {"ok": True, **{k: v for k, v in result.items() if k != "raw"}}
 
@@ -869,7 +979,10 @@ async def api_launch(request: Request, _: None = Guard):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     def job(progress: Any) -> dict[str, Any]:
-        results = launch.launch(creds, req, progress)
+        try:
+            results = launch.launch(creds, req, progress)
+        finally:
+            cache.drop(*ec2_instances_key(account_id, region))
         for res in results:
             if res.private_key:
                 store.save_keypair(account_id, region, res.key_name, res.private_key)
@@ -919,7 +1032,12 @@ async def api_change_ip(request: Request, _: None = Guard):
     )
 
     def job(progress: Any) -> dict[str, Any]:
-        result = ipchange.change_ip(creds, region, instance_id, strategy, rule, progress)
+        try:
+            result = ipchange.change_ip(
+                creds, region, instance_id, strategy, rule, progress
+            )
+        finally:
+            cache.drop(*ec2_instances_key(account_id, region))
         store.log(
             "change-ip",
             instance_id,

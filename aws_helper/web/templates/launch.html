@@ -164,56 +164,87 @@ systemctl enable --now docker"></textarea>
 {% block script %}
 <script>
 let CATALOG = null;
+// 同一 (账号,区域,系统,架构) 的镜像和规格不会变，本页内记住即可。
+// 原先每切一次下拉都重新请求一遍，白跑 HTTP 也白算一遍 JSON。
+const CATALOG_MEMO = new Map();
 
-async function loadCatalog() {
+async function loadCatalog(opts) {
+  const force = !!(opts && opts.force);
   const accountId = document.getElementById('account_id').value;
   const region = document.getElementById('region').value;
   const osFamily = document.getElementById('os_family').value;
   const arch = document.getElementById('arch').value;
+  const memoKey = `${accountId}|${region}|${osFamily}|${arch}`;
 
   const imgSel = document.getElementById('image_key');
   const typeSel = document.getElementById('instance_type');
+
+  if (force) CATALOG_MEMO.delete(memoKey);
+  const memo = CATALOG_MEMO.get(memoKey);
+  if (memo) {
+    renderCatalog(memo, true);
+    return;
+  }
+
   imgSel.innerHTML = '<option value="">加载中…</option>';
   typeSel.innerHTML = '<option value="">加载中…</option>';
   document.getElementById('type_count').textContent = '';
 
   try {
     const d = await api(`/api/catalog?account_id=${accountId}&region=${region}`
-      + `&os_family=${osFamily}&arch=${arch}`);
-    CATALOG = d;
-
-    if (!d.images.length) {
-      imgSel.innerHTML = '<option value="">该组合下没有可用镜像</option>';
-    } else {
-      imgSel.innerHTML = d.images
-        .map(i => `<option value="${escapeHtml(i.key)}">${escapeHtml(i.label)}</option>`)
-        .join('');
-    }
-
-    if (!d.instance_types.length) {
-      typeSel.innerHTML = '<option value="">该区域没有此架构的规格</option>';
-    } else {
-      typeSel.innerHTML = d.instance_types.map(t => {
-        const tag = t.free_tier ? '（免费额度）' : '';
-        return `<option value="${escapeHtml(t.name)}">${escapeHtml(t.label)}${tag}</option>`;
-      }).join('');
-      // 默认选一个小规格，免费额度优先
-      const free = d.instance_types.find(t => t.free_tier);
-      typeSel.value = (free || d.instance_types[0]).name;
-    }
-
-    document.getElementById('type_count').textContent =
-      d.instance_types.length ? `（该区域 ${d.instance_types.length} 种）` : '';
-    document.getElementById('catalog-hint').innerHTML = d.degraded
-      ? '<span class="tag warn">规格清单拉取失败，已降级为内置列表</span> 建议给 IAM 加 ec2:DescribeInstanceTypes'
-      : '';
-    applyOsMode(d.is_windows);
+      + `&os_family=${osFamily}&arch=${arch}` + (force ? '&force=1' : ''));
+    // 降级结果不记忆，否则修好权限也要等到刷新页面才恢复
+    if (!d.degraded) CATALOG_MEMO.set(memoKey, d);
+    renderCatalog(d, false);
   } catch (e) {
     imgSel.innerHTML = '<option value="">加载失败</option>';
     typeSel.innerHTML = '<option value="">加载失败</option>';
     document.getElementById('catalog-hint').innerHTML =
       '<span class="tag err">' + escapeHtml(e.message) + '</span>';
   }
+}
+
+function renderCatalog(d, fromMemo) {
+  const imgSel = document.getElementById('image_key');
+  const typeSel = document.getElementById('instance_type');
+  CATALOG = d;
+
+  if (!d.images.length) {
+    imgSel.innerHTML = '<option value="">该组合下没有可用镜像</option>';
+  } else {
+    imgSel.innerHTML = d.images
+      .map(i => `<option value="${escapeHtml(i.key)}">${escapeHtml(i.label)}</option>`)
+      .join('');
+  }
+
+  if (!d.instance_types.length) {
+    typeSel.innerHTML = '<option value="">该区域没有此架构的规格</option>';
+  } else {
+    typeSel.innerHTML = d.instance_types.map(t => {
+      const tag = t.free_tier ? '（免费额度）' : '';
+      return `<option value="${escapeHtml(t.name)}">${escapeHtml(t.label)}${tag}</option>`;
+    }).join('');
+    // 默认选一个小规格，免费额度优先
+    const free = d.instance_types.find(t => t.free_tier);
+    typeSel.value = (free || d.instance_types[0]).name;
+  }
+
+  document.getElementById('type_count').textContent =
+    d.instance_types.length ? `（该区域 ${d.instance_types.length} 种）` : '';
+
+  const parts = [];
+  if (d.degraded) {
+    parts.push('<span class="tag warn">规格清单拉取失败，已降级为内置列表</span>'
+      + ' 建议给 IAM 加 ec2:DescribeInstanceTypes');
+  } else if (fromMemo) {
+    parts.push('<span class="hint">本页已缓存，'
+      + '<a href="#" onclick="loadCatalog({force:true});return false">强制刷新</a></span>');
+  } else if (d.cached) {
+    parts.push(`<span class="hint">服务端缓存 ${d.age_seconds}s 前，`
+      + '<a href="#" onclick="loadCatalog({force:true});return false">强制刷新</a></span>');
+  }
+  document.getElementById('catalog-hint').innerHTML = parts.join(' ');
+  applyOsMode(d.is_windows);
 }
 
 // Windows 不吃 bash 开机脚本和 root 密码，相关字段直接隐藏

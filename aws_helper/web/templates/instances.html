@@ -12,7 +12,7 @@
   <div class="grid g4">
     <label class="f">
       <span>账号</span>
-      <select id="account_id">
+      <select id="account_id" onchange="resetFingerprint()">
         {% for a in accounts %}
         <option value="{{ a.id }}">{{ a.label }}（{{ a.masked() }}）</option>
         {% endfor %}
@@ -20,7 +20,7 @@
     </label>
     <label class="f">
       <span>区域</span>
-      <select id="region">
+      <select id="region" onchange="resetFingerprint()">
         {% for code, name in regions.items() %}
         <option value="{{ code }}">{{ code }} — {{ name }}</option>
         {% endfor %}
@@ -42,6 +42,7 @@
     <button class="sm" onclick="power('reboot')">重启</button>
     <button class="sm danger" onclick="power('terminate')">终止</button>
     <span style="flex:1"></span>
+    <span class="hint" id="freshness" style="margin:0"></span>
     <span class="hint" id="count" style="margin:0"></span>
   </div>
   {% endif %}
@@ -132,19 +133,50 @@ function sel() {
   };
 }
 
-async function refresh() {
+let FINGERPRINT = '';
+
+// 切换账号或区域后旧指纹没有意义，必须清掉 —— 否则两边恰好同形
+// （比如都是空列表）会被误判成「没变」，页面继续显示上一个账号的内容。
+function resetFingerprint() {
+  FINGERPRINT = '';
+  INSTANCES = [];
+  document.getElementById('rows').innerHTML = '';
+}
+
+async function refresh(opts) {
+  const force = !!(opts && opts.force);
   const s = sel();
   const tbody = document.getElementById('rows');
-  tbody.innerHTML = '<tr><td colspan="8" class="empty">加载中…</td></tr>';
+  const first = !tbody.children.length;
+  if (first) tbody.innerHTML = '<tr><td colspan="8" class="empty">加载中…</td></tr>';
   try {
-    const data = await api(`/api/instances?account_id=${s.account_id}&region=${s.region}`);
+    const q = `/api/instances?account_id=${s.account_id}&region=${s.region}`
+      + `&fingerprint=${encodeURIComponent(FINGERPRINT)}` + (force ? '&force=1' : '');
+    const data = await api(q);
+    showFreshness(data);
+    if (!data.changed) return;          // 内容没变，保留现有 DOM 和勾选
+    FINGERPRINT = data.fingerprint;
     INSTANCES = data.instances;
     render();
-    toast(`找到 ${INSTANCES.length} 台实例`, 'ok');
+    if (force || first) toast(`找到 ${INSTANCES.length} 台实例`, 'ok');
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="8" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
     toast(e.message, 'err');
   }
+}
+
+function showFreshness(d) {
+  const el = document.getElementById('freshness');
+  if (!el) return;
+  el.innerHTML = d.cached
+    ? `数据缓存于 ${d.age_seconds}s 前，<a href="#" onclick="refresh({force:true});return false">强制刷新</a>`
+    : '刚从 AWS 拉取';
+}
+
+// 开关机、终止之后必须绕过缓存：状态刚变，10 秒的缓存窗口正好会
+// 把变更前的快照又端回来，用户看到「关机了还是 running」。
+async function refreshAfterAction() {
+  await refresh({ force: true });
 }
 
 function stateTag(state) {
@@ -152,15 +184,8 @@ function stateTag(state) {
   return `<span class="tag ${cls}">${escapeHtml(state)}</span>`;
 }
 
-function render() {
-  const tbody = document.getElementById('rows');
-  document.getElementById('count').textContent = `共 ${INSTANCES.length} 台`;
-  if (!INSTANCES.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">该区域没有实例</td></tr>';
-    return;
-  }
-  tbody.innerHTML = INSTANCES.map(i => `
-    <tr>
+function rowHtml(i) {
+  return `
       <td><input type="checkbox" class="pick" value="${escapeHtml(i.instance_id)}"></td>
       <td>${escapeHtml(i.name || '-')}</td>
       <td class="mono">${escapeHtml(i.instance_id)}</td>
@@ -170,8 +195,51 @@ function render() {
       <td class="mono">${escapeHtml(i.private_ip || '-')}</td>
       <td>
         <button class="sm" onclick="openIp('${escapeHtml(i.instance_id)}','${escapeHtml(i.public_ip || '')}')">换 IP</button>
-      </td>
-    </tr>`).join('');
+      </td>`;
+}
+
+// 按 instance_id 增量更新：只改动到的行，不整表重绘。
+// 整表重绘会把用户已勾选的实例清空 —— 勾了 5 台正要关机，一次自动刷新就白勾了。
+function render() {
+  const tbody = document.getElementById('rows');
+  document.getElementById('count').textContent = `共 ${INSTANCES.length} 台`;
+  if (!INSTANCES.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">该区域没有实例</td></tr>';
+    return;
+  }
+
+  const placeholder = tbody.querySelector('td.empty');
+  if (placeholder) tbody.innerHTML = '';
+
+  const seen = new Set();
+  INSTANCES.forEach(i => {
+    seen.add(i.instance_id);
+    let tr = tbody.querySelector(`tr[data-id="${cssEscape(i.instance_id)}"]`);
+    const html = rowHtml(i);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.dataset.id = i.instance_id;
+      tr.innerHTML = html;
+      tr.dataset.sig = html;
+      tbody.appendChild(tr);
+      return;
+    }
+    if (tr.dataset.sig !== html) {
+      const checked = tr.querySelector('.pick')?.checked;
+      tr.innerHTML = html;
+      if (checked) tr.querySelector('.pick').checked = true;
+    }
+    tr.dataset.sig = html;
+  });
+
+  [...tbody.querySelectorAll('tr[data-id]')].forEach(tr => {
+    if (!seen.has(tr.dataset.id)) tr.remove();
+  });
+}
+
+// instance_id 只含字母数字和连字符，但选择器里还是转义一下更稳妥
+function cssEscape(v) {
+  return window.CSS && CSS.escape ? CSS.escape(v) : String(v).replace(/"/g, '\\"');
 }
 
 function toggleAll(box) {
@@ -192,7 +260,7 @@ async function power(action) {
   try {
     await api('/api/instances/power', { method: 'POST', json: { ...sel(), action, instance_ids: ids } });
     toast(`${names[action]} 指令已发送（${ids.length} 台）`, 'ok');
-    setTimeout(refresh, 2500);
+    pollUntilSettled(action, ids);
   } catch (e) {
     toast(e.message, 'err');
   }
@@ -266,7 +334,25 @@ async function doChangeIp() {
   }
 }
 
-function onProgressClose() { refresh(); }
+function onProgressClose() { refreshAfterAction(); }
+
+// 开关机不是立刻生效的，AWS 要几十秒才走完状态机。
+// 有界退避轮询（2s/4s/8s，最多 3 次）：目标状态一到就停，
+// 比让用户反复手点刷新省调用，也不会无限轮询。
+async function pollUntilSettled(action, ids) {
+  const want = { start: 'running', stop: 'stopped' }[action];
+  const delays = [2000, 4000, 8000];
+  for (const wait of delays) {
+    await new Promise(r => setTimeout(r, wait));
+    await refresh({ force: true });
+    if (!want) return;
+    const done = ids.every(id => {
+      const inst = INSTANCES.find(i => i.instance_id === id);
+      return inst && inst.state === want;
+    });
+    if (done) return;
+  }
+}
 
 async function showEips() {
   const s = sel();

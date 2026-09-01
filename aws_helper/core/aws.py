@@ -374,8 +374,12 @@ FALLBACK_INSTANCE_TYPES: dict[str, list[str]] = {
 
 # 规格清单按 (region, arch) 缓存。DescribeInstanceTypes 要翻 4 页拉近 400 条，
 # 每次开开机页都拉一遍太慢。
+#
+# 不带 account_id 是有意的：DescribeInstanceTypes 返回的是区域支持哪些规格，
+# 与账号无关，带上只会让每个账号各冷启动一次。其他账号相关的缓存不能照抄。
 _TYPE_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
-_TYPE_CACHE_TTL = 3600
+# 只有 AWS 上新机型才会变，6 小时足够
+_TYPE_CACHE_TTL = 6 * 3600
 
 
 def list_instance_types(
@@ -431,6 +435,28 @@ def list_instance_types(
     out.sort(key=lambda t: (t["memory_gib"], t["vcpu"], t["name"]))
     _TYPE_CACHE[key] = (now, out)
     return out
+
+
+def instance_types_cached(
+    creds: Credentials, region: str, arch: str = "x86_64", force: bool = False
+) -> tuple[list[dict[str, Any]], bool, float]:
+    """同 list_instance_types，但一并返回 (清单, 是否命中缓存, 缓存年龄秒)。
+
+    页面要如实告诉用户看到的是几分钟前的数据，而不是假装刚拉的。
+    """
+    key = (region, arch)
+    if force:
+        _TYPE_CACHE.pop(key, None)
+    else:
+        hit = _TYPE_CACHE.get(key)
+        if hit is not None and time.time() - hit[0] < _TYPE_CACHE_TTL:
+            return hit[1], True, round(time.time() - hit[0], 1)
+
+    out = list_instance_types(creds, region, arch, use_cache=False)
+    # list_instance_types 内部会写缓存，但它可能被 mock 掉或将来改实现，
+    # 这里显式补一次，保证「下次调用能命中」这个约定成立。
+    _TYPE_CACHE[key] = (time.time(), out)
+    return out, False, 0.0
 
 
 def fallback_instance_types(arch: str = "x86_64") -> list[dict[str, Any]]:

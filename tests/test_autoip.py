@@ -237,3 +237,86 @@ def test_monitor_survives_bad_rule(mock_ec2, store):
     time.sleep(1.5)
     assert monitor.running
     monitor.stop()
+
+
+def test_run_once_shares_instance_list_across_rules(env, monkeypatch, creds):
+    """同一 (账号,区域) 的多条规则只该拉一次实例清单。
+
+    这是最容易触发风控的地方：规则是无人值守一直跑的，N 条规则原先就是
+    N 次 DescribeInstances，规则越多越危险。
+    """
+    store, aid, inst = env
+    # 唯一约束是 (账号, 区域, 实例)，所以要用不同实例才能建出多条规则
+    others = launch.launch(
+        creds, launch.LaunchRequest(name="mon2", region="us-east-1", count=2)
+    )
+    for target in [inst, *others]:
+        store.save_ip_rule(
+            account_id=aid,
+            region="us-east-1",
+            instance_id=target.instance_id,
+            enabled=1,
+            interval_sec=0,
+            fail_threshold=99,
+        )
+
+    calls = []
+    real = launch.list_instances
+
+    def counting(creds, region, *a, **kw):
+        calls.append(region)
+        return real(creds, region, *a, **kw)
+
+    monkeypatch.setattr(autoip.launch, "list_instances", counting)
+    out = autoip.run_once(store)
+
+    assert len(store.list_ip_rules(enabled_only=True)) == 3
+    assert len(out) == 3
+    assert len(calls) == 1, f"3 条同区域规则只该拉一次，实际拉了 {len(calls)} 次"
+
+
+def test_run_once_still_separates_regions(env, monkeypatch):
+    """不同区域不能共用清单 —— 那是另一个区域的实例。"""
+    store, aid, inst = env
+    store.save_ip_rule(
+        account_id=aid, region="us-east-1", instance_id=inst.instance_id,
+        enabled=1, interval_sec=0, fail_threshold=99,
+    )
+    store.save_ip_rule(
+        account_id=aid, region="eu-west-1", instance_id=inst.instance_id,
+        enabled=1, interval_sec=0, fail_threshold=99,
+    )
+
+    seen_regions = []
+
+    def counting(creds, region, *a, **kw):
+        seen_regions.append(region)
+        return {}
+
+    monkeypatch.setattr(autoip.launch, "list_instances", counting)
+    autoip.run_once(store)
+
+    assert sorted(seen_regions) == ["eu-west-1", "us-east-1"]
+
+
+def test_check_rule_ignores_stale_shared_list(env, monkeypatch):
+    """共享清单超过 30 秒就必须重拉。
+
+    一轮里每条失败规则要跑两次 5s TCP 探测，整轮可能上百秒。拿旧 IP 去探测
+    会记一次假失败，累积到阈值就白换一次 IP、白烧弹性 IP 配额。
+    """
+    store, aid, inst = env
+    rule = _rule(store, aid, inst.instance_id, fail_threshold=99)
+
+    calls = []
+
+    def counting(creds, region, *a, **kw):
+        calls.append(region)
+        return {}
+
+    monkeypatch.setattr(autoip.launch, "list_instances", counting)
+
+    stale = {(aid, "us-east-1"): (time.time() - 60, {})}
+    autoip.check_rule(store, rule, seen=stale)
+
+    assert len(calls) == 1, "过期的共享清单不能复用"

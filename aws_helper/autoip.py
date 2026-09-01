@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from .cache import cache, ec2_instances_key
 from .core import ipchange, launch
 from .store import Store
 
@@ -54,24 +55,46 @@ def probe(
 
 DEFAULT_COOLDOWN = 1800
 
+# 一轮里每条失败规则要跑两次 5s TCP 探测，整轮可能上百秒。超过这个岁数的
+# 实例清单对 autoip 不可信 —— public_ip 可能已经变了，拿旧 IP 去探测会记
+# 一次假失败，累积到阈值就白换一次 IP。
+_SEEN_MAX_AGE = 30
+
 
 def check_rule(
-    store: Store, rule: dict[str, Any], cooldown: int = DEFAULT_COOLDOWN
+    store: Store,
+    rule: dict[str, Any],
+    cooldown: int = DEFAULT_COOLDOWN,
+    seen: dict[tuple[int, str], tuple[float, dict[str, dict[str, Any]]]] | None = None,
 ) -> dict[str, Any]:
-    """检查单条规则，必要时触发换 IP。返回本轮动作说明。"""
+    """检查单条规则，必要时触发换 IP。返回本轮动作说明。
+
+    seen 是 run_once 传进来的本轮共享清单，用来避免同一 (账号, 区域) 重复
+    调 DescribeInstances。不传时行为与从前一致（每次自己拉）。
+    """
     now = int(time.time())
     if now - int(rule["last_check"]) < int(rule["interval_sec"]):
         return {"action": "skip", "reason": "未到检查间隔"}
 
-    creds = store.credentials(int(rule["account_id"]), rule["region"])
-    try:
-        instances = {
-            i["instance_id"]: i for i in launch.list_instances(creds, rule["region"])
-        }
-    except Exception as exc:
-        store.update_rule_state(int(rule["id"]), last_check=now)
-        store.log("autoip", rule["instance_id"], False, f"拉取实例失败: {exc}")
-        return {"action": "error", "reason": str(exc)}
+    account_id = int(rule["account_id"])
+    seen_key = (account_id, rule["region"])
+    creds = store.credentials(account_id, rule["region"])
+
+    hit = seen.get(seen_key) if seen is not None else None
+    if hit is not None and time.time() - hit[0] < _SEEN_MAX_AGE:
+        instances = hit[1]
+    else:
+        try:
+            instances = {
+                i["instance_id"]: i
+                for i in launch.list_instances(creds, rule["region"])
+            }
+        except Exception as exc:
+            store.update_rule_state(int(rule["id"]), last_check=now)
+            store.log("autoip", rule["instance_id"], False, f"拉取实例失败: {exc}")
+            return {"action": "error", "reason": str(exc)}
+        if seen is not None:
+            seen[seen_key] = (time.time(), instances)
 
     inst = instances.get(rule["instance_id"])
     if inst is None:
@@ -136,6 +159,11 @@ def check_rule(
     store.update_rule_state(
         int(rule["id"]), fail_count=0, last_check=now, last_change=now
     )
+    # IP 已经变了：本轮共享清单和页面缓存都必须作废，否则同区域的下一条规则
+    # 会拿旧 IP 去探测，页面也会继续显示已经失效的地址。
+    if seen is not None:
+        seen.pop(seen_key, None)
+    cache.drop(*ec2_instances_key(account_id, rule["region"]))
     store.log(
         "autoip",
         rule["instance_id"],
@@ -151,10 +179,15 @@ def check_rule(
 
 
 def run_once(store: Store, cooldown: int = DEFAULT_COOLDOWN) -> list[dict[str, Any]]:
-    """遍历所有启用的规则跑一轮。"""
+    """遍历所有启用的规则跑一轮。
+
+    同一 (账号, 区域) 下的多条规则共用一次 DescribeInstances —— 否则 N 条规则
+    就是 N 次调用，无人值守地一直跑，是最容易触发风控的地方。
+    """
+    seen: dict[tuple[int, str], tuple[float, dict[str, dict[str, Any]]]] = {}
     out = []
     for rule in store.list_ip_rules(enabled_only=True):
-        out.append({"rule_id": rule["id"], **check_rule(store, rule, cooldown)})
+        out.append({"rule_id": rule["id"], **check_rule(store, rule, cooldown, seen)})
     return out
 
 
