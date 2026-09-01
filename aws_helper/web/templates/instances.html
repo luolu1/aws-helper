@@ -497,14 +497,63 @@ async function doReinstall() {
     });
     const task = await watchTask(r.task_id, '重装系统');
     const d = task.result;
-    Progress.finish(
-      `<span class="mono" style="flex:1;text-align:left">${escapeHtml(d.image_id)} · 耗时 ${d.elapsed_sec}s</span>`
-    );
+    showReinstallResult(d);
     toast(`重装完成，IP 未变（${d.public_ip || d.private_ip}）`, 'ok');
   } catch (e) {
     Progress.finish();
     toast(e.message, 'err');
   }
+}
+
+// 重装完只说"完成"是不够的：登录用户名可能已经变了（Ubuntu→ubuntu、
+// Debian→admin、AL2023→ec2-user），主机密钥也重建了。把连接方式直接摆出来。
+function showReinstallResult(d) {
+  const rows = [];
+  rows.push(['系统', `${escapeHtml(d.image_label || d.image_id)}`]);
+  if (d.public_ip) rows.push(['公网 IP', `<span class="mono">${escapeHtml(d.public_ip)}</span>`]);
+  rows.push(['内网 IP', `<span class="mono">${escapeHtml(d.private_ip || '-')}</span>`]);
+  if (d.key_name) rows.push(['密钥对', `<span class="mono">${escapeHtml(d.key_name)}</span>（原私钥继续可用）`]);
+  if (d.ssh_user) rows.push(['登录用户', `<span class="mono">${escapeHtml(d.ssh_user)}</span>`]);
+  rows.push([
+    d.os_family === 'windows' ? '连接方式' : 'SSH 命令',
+    `<span class="mono" style="user-select:all">${escapeHtml(d.ssh_command)}</span>`
+  ]);
+  if (d.kept_volumes && d.kept_volumes.length) {
+    rows.push(['保留的数据卷', `<span class="mono">${escapeHtml(d.kept_volumes.join(', '))}</span>`]);
+  }
+  rows.push(['耗时', `${d.elapsed_sec}s`]);
+
+  let html = '<table style="font-size:13px;margin:0">' + rows.map(
+    ([k, v]) => `<tr><td style="width:104px;color:var(--muted);white-space:nowrap">${k}</td><td>${v}</td></tr>`
+  ).join('') + '</table>';
+
+  if (!d.ssh_user && d.os_family !== 'windows') {
+    html += '<p class="hint" style="margin:8px 0 0">'
+      + '认不出这个镜像的默认登录用户，常见是 <code>ubuntu</code>（Ubuntu）、'
+      + '<code>admin</code>（Debian）、<code>ec2-user</code>（Amazon Linux / RHEL）。'
+      + '</p>';
+  }
+  if (d.known_hosts_hint) {
+    html += '<p class="hint" style="margin:8px 0 0">'
+      + '主机密钥已随根卷重建，先清掉本地旧记录再连：<br>'
+      + `<span class="mono" style="user-select:all">${escapeHtml(d.known_hosts_hint)}</span>`
+      + '</p>';
+  }
+  if (d.deleted_old_volume === false) {
+    html += '<p class="hint" style="margin:8px 0 0">'
+      + '<span class="tag warn">注意</span> 旧根卷已保留，会继续按 EBS 容量计费，'
+      + '确认不需要后请去控制台删除。</p>';
+  }
+
+  // 写进 pg-steps 而不是 pg-foot：后者是 flex row end（跟关闭按钮同行），
+  // 表格塞进去会被挤成一条。.steps 默认等宽 + muted 色是给日志用的，
+  // 这里包一层恢复正常字体和前景色。
+  const steps = document.getElementById('pg-steps');
+  if (steps) {
+    steps.innerHTML =
+      `<div style="font-family:inherit;color:var(--text)">${html}</div>`;
+  }
+  Progress.finish();
 }
 
 let PW_TARGET = null;

@@ -42,6 +42,39 @@ class ReinstallError(RuntimeError):
     """重装失败。"""
 
 
+_SSH_USER_BY_KEYWORD: tuple[tuple[str, str], ...] = (
+    ("ubuntu", "ubuntu"),
+    ("debian", "admin"),
+    ("amzn", "ec2-user"),
+    ("amazon", "ec2-user"),
+    ("al2023", "ec2-user"),
+    ("rhel", "ec2-user"),
+    ("suse", "ec2-user"),
+    ("sles", "ec2-user"),
+    ("fedora", "fedora"),
+    ("centos", "centos"),
+    ("rocky", "rocky"),
+    ("alma", "ec2-user"),
+    ("windows", "Administrator"),
+)
+
+
+def _guess_ssh_user(image_name: str, platform: str) -> str:
+    """从镜像名猜默认登录用户。
+
+    重装后连不上最常见的原因就是用户名换了（Ubuntu 是 ubuntu、Debian 是 admin、
+    AL2023 是 ec2-user）。恢复出厂时我们没有 image_key，只能从 AMI 名字推断。
+    猜不出来时返回空串，页面提示用户自己确认，而不是给一个错的用户名。
+    """
+    if platform.lower() == "windows":
+        return "Administrator"
+    lowered = image_name.lower()
+    for keyword, user in _SSH_USER_BY_KEYWORD:
+        if keyword in lowered:
+            return user
+    return ""
+
+
 def preflight(
     creds: aws.Credentials,
     region: str,
@@ -90,6 +123,8 @@ def preflight(
         target_label = spec.label if spec else image_key
 
     image_arch = ""
+    image_name = ""
+    image_platform = ""
     if target_image and not problems:
         try:
             images = session.describe_images(ImageIds=[target_image]).get("Images") or []
@@ -98,6 +133,8 @@ def preflight(
             images = []
         if images:
             image_arch = images[0].get("Architecture", "")
+            image_name = images[0].get("Name", "")
+            image_platform = images[0].get("Platform", "")
             # 架构不匹配是最容易踩的坑：换完实例起不来，且没有明显报错
             if image_arch and arch and image_arch != arch:
                 problems.append(
@@ -107,6 +144,26 @@ def preflight(
                 )
         elif not problems:
             problems.append(f"镜像 {target_image} 不存在或不可用")
+
+    # 换系统后登录用户名会变（Ubuntu 是 ubuntu、Debian 是 admin、
+    # AL2023 是 ec2-user），这是重装后最容易卡住人的地方。
+    # 选了内置镜像就用它声明的用户，否则从 AMI 名字猜；恢复出厂时查原镜像。
+    spec = aws.IMAGES.get(image_key) if image_key else None
+    if spec is not None:
+        ssh_user = spec.ssh_user
+        os_family = spec.os_family
+    else:
+        if not image_name and not problems:
+            probe = target_image or info.get("ImageId", "")
+            try:
+                found = session.describe_images(ImageIds=[probe]).get("Images") or []
+            except ClientError:
+                found = []
+            if found:
+                image_name = found[0].get("Name", "")
+                image_platform = found[0].get("Platform", "")
+        ssh_user = _guess_ssh_user(image_name, image_platform)
+        os_family = "windows" if image_platform.lower() == "windows" else "linux"
 
     return {
         "ok": not problems,
@@ -121,6 +178,11 @@ def preflight(
         "target_image_arch": image_arch,
         "private_ip": info.get("PrivateIpAddress", ""),
         "public_ip": info.get("PublicIpAddress", ""),
+        # 换根卷不影响实例的 KeyName 属性，新根卷的 cloud-init 照旧从 IMDS
+        # 取同一个公钥，所以原私钥继续可用，无需重新生成密钥对。
+        "key_name": info.get("KeyName", ""),
+        "ssh_user": ssh_user,
+        "os_family": os_family,
         # 数据卷会原样保留，页面上要说清楚，否则用户不敢点
         "extra_volumes": [
             m.get("DeviceName", "")
@@ -219,6 +281,22 @@ def reinstall(
             )
         raise ReinstallError(f"重装失败（{state}）{hint}")
 
+    # 重装后 IP 不变，但登录用户名可能变了，所以把连接方式一并回给页面 ——
+    # 只给一句"重装完成"的话用户还得自己去查新系统的默认用户是什么。
+    ssh_user = checks["ssh_user"]
+    public_ip = checks["public_ip"]
+    key_name = checks["key_name"]
+    windows = checks["os_family"] == "windows"
+
+    if windows:
+        ssh_command = f"RDP {public_ip}:3389" if public_ip else "无公网 IP"
+    elif not public_ip:
+        ssh_command = "无公网 IP，需通过内网或跳板机连接"
+    elif not ssh_user:
+        ssh_command = f"ssh -i {key_name or '<私钥>'}.pem <登录用户>@{public_ip}"
+    else:
+        ssh_command = f"ssh -i {key_name or '<私钥>'}.pem {ssh_user}@{public_ip}"
+
     return {
         "instance_id": instance_id,
         "task_id": task_id,
@@ -228,6 +306,14 @@ def reinstall(
         "deleted_old_volume": bool(delete_old_volume),
         "elapsed_sec": int(time.time() - started),
         "private_ip": checks["private_ip"],
-        "public_ip": checks["public_ip"],
+        "public_ip": public_ip,
         "kept_volumes": checks["extra_volumes"],
+        "key_name": key_name,
+        "ssh_user": ssh_user,
+        "os_family": checks["os_family"],
+        "ssh_command": ssh_command,
+        # 主机密钥随根卷一起重建，老的 known_hosts 记录会导致连接被拒
+        "known_hosts_hint": (
+            f"ssh-keygen -R {public_ip}" if public_ip and not windows else ""
+        ),
     }

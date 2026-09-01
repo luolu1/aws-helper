@@ -114,7 +114,32 @@ succeeded`，轮询到终态为止；超时不等于失败，任务还在后台�
 可启动的根卷**，需要在控制台手动挂一个或用快照恢复。只报"失败"会让人以为
 什么都没发生。
 
-重装后 SSH 主机密钥会变，下次连接会提示 host key 变更，按提示清掉旧记录即可。
+**重装完会直接给出连接方式**，因为最容易卡住人的是登录用户名跟着系统变了：
+
+```
+系统          Ubuntu 24.04
+公网 IP       1.2.3.4
+密钥对        prod-key（原私钥继续可用）
+登录用户      ubuntu
+SSH 命令      ssh -i prod-key.pem ubuntu@1.2.3.4
+保留的数据卷   /dev/sdf
+```
+
+Ubuntu 是 `ubuntu`、Debian 是 `admin`、Amazon Linux / RHEL 是 `ec2-user`，
+换个系统就换个用户。选内置镜像时用它声明的用户；恢复出厂或手填 AMI 时从镜像
+名字推断，认不出来就留空并列出常见几个，而不是给一个错的让你白试。
+
+**原私钥继续可用。** 换根卷不影响实例的 KeyName 属性，新根卷的 cloud-init
+照旧从 IMDS 取同一个公钥，不需要重新生成密钥对。
+
+**主机密钥会重建**，旧的 `known_hosts` 记录会让连接被拒，所以结果里直接给出
+要执行的清理命令：
+
+```bash
+ssh-keygen -R 1.2.3.4
+```
+
+Windows 实例给的是 RDP 地址而不是 SSH 命令。
 
 **重置实例登录密码**
 
@@ -889,7 +914,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-649 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+669 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -938,7 +963,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                649 项测试
+tests/                669 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

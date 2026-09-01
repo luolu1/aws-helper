@@ -339,3 +339,171 @@ def test_preflight_page_reads_body_not_api_helper():
         "不能走 api()，它会把 ok:false 的具体原因吞成 HTTP 200"
     )
     assert "d.problems" in block, "要把 problems 显示出来"
+
+
+# ---------- 重装后的连接信息 ----------
+
+
+def test_result_includes_ssh_command(monkeypatch):
+    """重装完必须给出 SSH 命令。
+
+    只回一句"重装完成"用户还得自己去查新系统的默认用户是什么 ——
+    这正是用户报的问题："重装后的 ssh 信息没有"。
+    """
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="mykey")
+    session.describe_images.return_value = {
+        "Images": [
+            {
+                "ImageId": "ami-x86",
+                "Architecture": "x86_64",
+                "Name": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-1",
+            }
+        ]
+    }
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID, image_id="ami-x86")
+
+    assert out["ssh_user"] == "ubuntu"
+    assert out["key_name"] == "mykey"
+    assert out["ssh_command"] == "ssh -i mykey.pem ubuntu@1.2.3.4"
+
+
+def test_ssh_user_from_builtin_image_key(monkeypatch):
+    """选内置镜像时用它声明的用户，不靠猜。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="k1")
+    session.describe_images.return_value = {
+        "Images": [{"ImageId": "ami-deb", "Architecture": "x86_64", "Name": "whatever"}]
+    }
+    with patch.object(reinstall.aws, "ec2", return_value=session), patch.object(
+        reinstall.aws, "resolve_ami", return_value="ami-deb"
+    ):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID, image_key="debian-12")
+
+    assert out["ssh_user"] == "admin", "Debian 的默认用户是 admin 不是 ubuntu"
+
+
+def test_reflash_resolves_ssh_user_from_current_image(monkeypatch):
+    """恢复出厂时没有 image_key，要去查实例当前镜像的名字来推断用户。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="k1")
+    session.describe_images.return_value = {
+        "Images": [
+            {
+                "ImageId": "ami-original",
+                "Architecture": "x86_64",
+                "Name": "al2023-ami-2026.0.20260101-kernel-6.1-x86_64",
+            }
+        ]
+    }
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID)
+
+    assert out["ssh_user"] == "ec2-user"
+
+
+def test_unknown_image_leaves_ssh_user_blank(monkeypatch):
+    """认不出来就留空，别给一个错的用户名让用户白试。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="k1")
+    session.describe_images.return_value = {
+        "Images": [
+            {"ImageId": "ami-x", "Architecture": "x86_64", "Name": "my-custom-golden-image"}
+        ]
+    }
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID)
+
+    assert out["ssh_user"] == ""
+    assert "<登录用户>" in out["ssh_command"], "用户名未知时要留占位符提示"
+
+
+def test_windows_gets_rdp_instead_of_ssh(monkeypatch):
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="k1")
+    session.describe_images.return_value = {
+        "Images": [
+            {
+                "ImageId": "ami-win",
+                "Architecture": "x86_64",
+                "Name": "Windows_Server-2025-English-Full-Base",
+                "Platform": "windows",
+            }
+        ]
+    }
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID, image_id="ami-win")
+
+    assert out["os_family"] == "windows"
+    assert out["ssh_command"].startswith("RDP 1.2.3.4:3389")
+    assert out["known_hosts_hint"] == "", "Windows 没有 known_hosts 的问题"
+
+
+def test_no_public_ip_says_so(monkeypatch):
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], PublicIpAddress=None, KeyName="k1")
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID)
+
+    assert "无公网 IP" in out["ssh_command"]
+    assert out["known_hosts_hint"] == ""
+
+
+def test_known_hosts_hint_provided(monkeypatch):
+    """主机密钥随根卷重建，旧 known_hosts 记录会让连接被拒。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="k1")
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID)
+
+    assert out["known_hosts_hint"] == "ssh-keygen -R 1.2.3.4"
+
+
+def test_key_name_preserved_across_reinstall(monkeypatch):
+    """换根卷不动实例的 KeyName，原私钥仍然可用 —— 页面要这么告诉用户。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"], KeyName="prod-key")
+    with patch.object(reinstall.aws, "ec2", return_value=session):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID)
+
+    assert out["key_name"] == "prod-key"
+    assert "prod-key.pem" in out["ssh_command"]
+
+
+@pytest.mark.parametrize(
+    "image_name,expected",
+    [
+        ("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-1", "ubuntu"),
+        ("debian-12-amd64-20260101-1234", "admin"),
+        ("al2023-ami-2026.0.20260101-kernel-6.1-x86_64", "ec2-user"),
+        ("amzn2-ami-hvm-2.0.20260101-x86_64-gp2", "ec2-user"),
+        ("RHEL-9.4_HVM-20260101-x86_64-0-Hourly2-GP3", "ec2-user"),
+        ("Fedora-Cloud-Base-40-1.14.x86_64", "fedora"),
+        ("CentOS-Stream-ec2-9-20260101.0.x86_64", "centos"),
+        ("Rocky-9-EC2-Base-9.4-20260101.0.x86_64", "rocky"),
+        ("suse-sles-15-sp6-v20260101-hvm-ssd-x86_64", "ec2-user"),
+        ("my-own-golden-image-v3", ""),
+    ],
+)
+def test_ssh_user_guessing(image_name, expected):
+    assert reinstall._guess_ssh_user(image_name, "") == expected
+
+
+def test_windows_platform_overrides_name_guess():
+    """Platform=windows 优先于名字匹配。"""
+    assert reinstall._guess_ssh_user("some-ubuntu-flavored-name", "windows") == "Administrator"
+
+
+def test_page_renders_ssh_command_after_reinstall():
+    """页面必须把 SSH 命令渲染出来，而不只是显示镜像 id 和耗时。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "function showReinstallResult" in html
+    block = html[html.index("function showReinstallResult"):]
+    block = block[: block.index("let PW_TARGET")]
+
+    for field in ("ssh_command", "ssh_user", "key_name", "known_hosts_hint"):
+        assert f"d.{field}" in block, f"结果面板没有用到 {field}"
+    assert "原私钥继续可用" in block
