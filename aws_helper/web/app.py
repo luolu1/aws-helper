@@ -1021,6 +1021,28 @@ def api_instances(
     return body
 
 
+@app.get("/api/instances/creds")
+def api_instance_creds(account_id: int, region: str, _: None = Guard):
+    """本区域所有实例的登录方式。密码只回「有没有」，不回明文。"""
+    return {
+        "ok": True,
+        "creds": store.list_instance_creds(account_id, region),
+    }
+
+
+@app.get("/api/instances/{instance_id}/password")
+def api_instance_password(
+    account_id: int, region: str, instance_id: str, _: None = Guard
+):
+    """取实例密码明文。用户点「查看」才调，并记一条审计日志。"""
+    try:
+        password = store.instance_password(account_id, region, instance_id)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    store.log("creds", instance_id, True, "查看了实例登录密码")
+    return {"ok": True, "instance_id": instance_id, "password": password}
+
+
 @app.get("/api/instances/ssm-status")
 def api_ssm_status(account_id: int, region: str, instance_id: str, _: None = Guard):
     """查实例能不能用 SSM 重置密码。点按钮前先探一下，省得填完表单才发现不支持。"""
@@ -1060,6 +1082,18 @@ async def api_reset_password(request: Request, _: None = Guard):
             # 密码绝不进日志
             store.log("reset-password", instance_id, False, str(exc)[:400])
             raise
+        # 重置成功后这台机器就能用密码登录了，凭据记录要跟上，
+        # 否则面板上还显示只能用密钥。
+        store.save_instance_creds(
+            account_id,
+            region,
+            instance_id,
+            auth_method="password",
+            login_user=user,
+            password=password,
+            os_family="windows" if is_windows else "linux",
+            note="通过 SSM 重置",
+        )
         store.log("reset-password", instance_id, True, f"已重置 {user} 的密码")
         return result
 
@@ -1112,6 +1146,19 @@ async def api_reinstall(request: Request, _: None = Guard):
         finally:
             # 根卷换了，实例的镜像 id 和状态都变了，缓存必须作废
             cache.drop(*ec2_instances_key(account_id, region))
+        # 换了系统登录用户可能变了（Ubuntu→ubuntu、Debian→admin），
+        # 而根卷重铺后原来设的 root 密码也没了 —— 凭据记录改回密钥登录。
+        if result.get("ssh_user"):
+            store.save_instance_creds(
+                account_id,
+                region,
+                instance_id,
+                auth_method="key",
+                login_user=result["ssh_user"],
+                key_name=result.get("key_name", ""),
+                os_family=result.get("os_family", "linux"),
+                note=f"重装于 {result['image_id']}",
+            )
         store.log(
             "reinstall",
             instance_id,
@@ -1151,6 +1198,10 @@ async def api_power(request: Request, _: None = Guard):
                     f"已清理: {summary or '仅实例'}"
                     + (f"；失败: {'; '.join(result['failed'])}" if result.get("failed") else ""),
                 )
+                # 实例没了就别留着它的密码。实例 ID 会被 AWS 复用，
+                # 留着会让下一台同 ID 的机器显示错的凭据。
+                for terminated in ids:
+                    store.delete_instance_creds(account_id, region, terminated)
                 return result
             finally:
                 # 必须在后台任务内失效，不能在提交处 —— 提交时实例还没真终止。
@@ -1222,6 +1273,19 @@ async def api_launch(request: Request, _: None = Guard):
         for res in results:
             if res.private_key:
                 store.save_keypair(account_id, region, res.key_name, res.private_key)
+            # 记下这台机器怎么登录。设了 root 密码就记密码，否则记密钥 ——
+            # 不记的话开完机关掉页面，密码就再也找不回来了（它只存在于 user-data）。
+            store.save_instance_creds(
+                account_id,
+                region,
+                res.instance_id,
+                auth_method="password" if req.root_password else "key",
+                login_user="root" if req.root_password else res.ssh_user,
+                password=req.root_password,
+                key_name=res.key_name,
+                name=res.name,
+                os_family=res.os_family,
+            )
             store.log(
                 "launch",
                 res.instance_id,

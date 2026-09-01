@@ -398,6 +398,27 @@ vCPU 配额全为 0 是账号未完成验证或被限制的明确信号。
 传 bash 脚本上去不报错但静默不执行，比直接拒绝更难排查。
 Windows 实例的结果区显示 RDP 连接方式，并提示管理员密码需用密钥在控制台解密。
 
+**登录凭据会记下来，在实例面板直接看**
+
+开机时怎么登录，面板就记下什么：
+
+| 开机方式 | 记录内容 | 面板显示 |
+|---|---|---|
+| 填了 root 密码 | 用户名 + 密码（Fernet 加密） | `密码 root [查看]` |
+| 没填密码（默认） | 用户名 + 密钥对名 | `密钥 ubuntu prod-key` |
+
+**这是必须的：root 密码只存在于 user-data 里**，开完机关掉页面就再也找不回来。
+密钥登录那行的密钥名是可点的下载链接。
+
+点「查看」才返回密码明文，并且会留一条审计日志。列表接口只回
+`has_password: true/false`，连密文都不送出去。
+
+三个时机会更新这份记录：
+
+- **重置密码后** → 登录方式改成密码，记下新密码
+- **重装后** → 登录用户跟着新系统变（根卷重铺后原 root 密码也没了，改回密钥）
+- **终止后** → 删掉记录。AWS 会复用实例 ID，留着会让下一台同 ID 的机器显示错的凭据
+
 **私钥以纯文本文件下发**
 
 开机时新建的密钥对，私钥用 Fernet 加密存 Postgres，页面上给下载链接。
@@ -811,7 +832,7 @@ v6 用 `api6.ipify.org` / `ipv6.icanhazip.com`。取回的地址还会用 `ipadd
 
 | 位置 | 内容 |
 |---|---|
-| Postgres | AWS 账号（密文）、密钥对（密文）、代理（密文）、DDNS Token（密文）、脚本模板、换 IP 规则、会话、日志 |
+| Postgres | AWS 账号（密文）、密钥对（密文）、代理（密文）、DDNS Token（密文）、实例登录密码（密文）、脚本模板、换 IP 规则、会话、日志 |
 | `secret.key` | Fernet 加密密钥 |
 
 **两者都要备份，且缺一不可**：库里的凭据用这把密钥加密，密钥丢了数据解不开；
@@ -914,7 +935,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-669 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+679 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -963,7 +984,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                669 项测试
+tests/                679 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

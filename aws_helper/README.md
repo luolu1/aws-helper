@@ -401,6 +401,17 @@ docker compose exec -T postgres pg_dump -U awshelper awshelper > awshelper.sql
 docker compose exec -T aws-helper cat /data/secret.key > secret.key.bak
 ```
 
+## 实例登录凭据
+
+开机时填了 root 密码就记「用户名 + 密码」，没填就记「用户名 + 密钥对名」，
+存在 `instance_creds` 表，密码用 Fernet 加密。实例面板的「登录方式」列直接显示，
+密码点「查看」才返回明文并留审计日志，列表接口只回 `has_password`。
+
+root 密码只存在于 user-data 里，不记下来开完机就找不回来了。
+
+重置密码、重装、终止三个时机会同步更新或删除这份记录 —— 实例 ID 会被 AWS 复用，
+终止不删会让下一台同 ID 的机器显示错的凭据。
+
 ## 凭据存储
 
 AWS Secret Access Key 和代理地址用 Fernet 加密后存 Postgres，页面只显示掩码。
@@ -430,7 +441,7 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-669 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+679 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、

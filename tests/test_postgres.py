@@ -526,3 +526,62 @@ def test_added_columns_backfilled_on_existing_table(tmp_path):
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
             conn.commit()
         os.environ.pop("AWS_HELPER_DB_SCHEMA", None)
+
+
+@requires_db
+def test_instance_creds_added_to_existing_db(tmp_path):
+    """升级已有库时 instance_creds 表要自动建出来。
+
+    这个表是新加的，老库里没有 —— CREATE TABLE IF NOT EXISTS 会建，
+    但要确认它真的在 SCHEMA 里而不是只写在 Python 方法里。
+    """
+    import os
+    import uuid
+
+    import psycopg
+
+    from .conftest import database_dsn
+
+    dsn = database_dsn()
+    schema = f"ic_{uuid.uuid4().hex[:8]}"
+    os.environ["AWS_HELPER_DB_SCHEMA"] = schema
+    os.environ["AWS_HELPER_DATABASE_URL"] = dsn
+    os.environ["AWS_HELPER_DATA"] = str(tmp_path / "ic")
+
+    from aws_helper import store as store_mod
+
+    try:
+        s = store_mod.Store()
+        aid = s.add_account("t", "AKIA0000000000000000", "sec", "us-east-1")
+        s.save_instance_creds(
+            aid, "us-east-1", "i-001",
+            auth_method="password", login_user="root", password="S3cret!Pass1",
+        )
+        assert s.instance_password(aid, "us-east-1", "i-001") == "S3cret!Pass1"
+
+        # 密码必须是加密落库的，不能明文躺在表里
+        with psycopg.connect(dsn) as conn:
+            conn.execute(f"SET search_path TO {schema}")
+            row = conn.execute(
+                "SELECT password_blob FROM instance_creds WHERE instance_id='i-001'"
+            ).fetchone()
+        assert row and "S3cret!Pass1" not in str(row[0]), "密码明文落库了"
+    finally:
+        with psycopg.connect(dsn) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            conn.commit()
+        os.environ.pop("AWS_HELPER_DB_SCHEMA", None)
+
+
+@requires_db
+def test_instance_creds_removed_with_account(store):
+    """删账号要连带删掉它下面所有实例的凭据（外键 CASCADE）。"""
+    aid = store.add_account("t", "AKIA0000000000000000", "sec", "us-east-1")
+    store.save_instance_creds(
+        aid, "us-east-1", "i-cascade",
+        auth_method="password", login_user="root", password="S3cret!Pass1",
+    )
+    assert store.list_instance_creds(aid, "us-east-1")
+
+    store.delete_account(aid)
+    assert store.list_instance_creds(aid, "us-east-1") == []

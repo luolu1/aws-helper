@@ -737,3 +737,172 @@ def test_reinstall_invalidates_instance_cache(client):
         )
 
     assert app_module.cache.size() == 0, "重装后必须清掉实例缓存"
+
+
+def test_launch_with_password_records_credentials(client):
+    """设了 root 密码开机，必须把密码记下来。
+
+    密码只存在于 user-data 里，开完机关掉页面就再也找不回来 ——
+    这是用户报的问题：创建的实例要记录好 root 密码。
+    """
+    c, aid, app_module = client
+    wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "name": "pw-node",
+                "root_password": "Str0ng!Pass1",
+            },
+        ).json()["task_id"],
+    )
+
+    rows = app_module.store.list_instance_creds(aid, "us-east-1")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["auth_method"] == "password"
+    assert row["login_user"] == "root"
+    assert row["has_password"] is True
+    assert "password_blob" not in row, "列表接口不能回传密文"
+
+
+def test_launch_without_password_records_key(client):
+    """没设密码就是密钥登录，记下用户名和密钥名。"""
+    c, aid, app_module = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={"account_id": aid, "region": "us-east-1", "name": "key-node"},
+        ).json()["task_id"],
+    )
+    inst = task["result"]["instances"][0]
+
+    row = app_module.store.instance_creds(aid, "us-east-1", inst["instance_id"])
+    assert row["auth_method"] == "key"
+    assert row["login_user"] == inst["ssh_user"]
+    assert row["key_name"] == inst["key_name"]
+    assert row["has_password"] is False
+
+
+def test_creds_endpoint_hides_password(client):
+    """列表接口只说有没有密码，不回明文。"""
+    c, aid, _ = client
+    wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "name": "secret-node",
+                "root_password": "Str0ng!Pass1",
+            },
+        ).json()["task_id"],
+    )
+
+    body = c.get(f"/api/instances/creds?account_id={aid}&region=us-east-1").text
+    assert "Str0ng!Pass1" not in body, "凭据列表泄漏了密码明文"
+    assert '"has_password":true' in body.replace(" ", "")
+
+
+def test_password_endpoint_returns_plaintext_and_audits(client):
+    """点「查看」才给明文，并且要留审计日志。"""
+    c, aid, app_module = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "name": "view-node",
+                "root_password": "Str0ng!Pass1",
+            },
+        ).json()["task_id"],
+    )
+    iid = task["result"]["instances"][0]["instance_id"]
+
+    body = c.get(
+        f"/api/instances/{iid}/password?account_id={aid}&region=us-east-1"
+    ).json()
+    assert body["password"] == "Str0ng!Pass1"
+
+    kinds = [log["kind"] for log in app_module.store.list_logs(50)]
+    assert "creds" in kinds, "查看密码要留审计记录"
+
+
+def test_password_endpoint_404_for_key_auth(client):
+    c, aid, _ = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={"account_id": aid, "region": "us-east-1", "name": "nokey-pw"},
+        ).json()["task_id"],
+    )
+    iid = task["result"]["instances"][0]["instance_id"]
+    assert (
+        c.get(f"/api/instances/{iid}/password?account_id={aid}&region=us-east-1").status_code
+        == 404
+    )
+
+
+def test_creds_require_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_module = build_app(monkeypatch, tmp_path / "creds-anon")
+    c = TestClient(app_module.app)
+    assert c.get("/api/instances/creds?account_id=1&region=us-east-1").status_code == 401
+    assert (
+        c.get("/api/instances/i-1/password?account_id=1&region=us-east-1").status_code
+        == 401
+    )
+
+
+def test_terminate_removes_credentials(client):
+    """实例终止后不该留着它的密码 —— AWS 会复用实例 ID。"""
+    c, aid, app_module = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "name": "doomed",
+                "root_password": "Str0ng!Pass1",
+            },
+        ).json()["task_id"],
+    )
+    iid = task["result"]["instances"][0]["instance_id"]
+    assert app_module.store.instance_creds(aid, "us-east-1", iid) is not None
+
+    wait_task(
+        c,
+        c.post(
+            "/api/instances/power",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "action": "terminate",
+                "instance_ids": [iid],
+                "cleanup": False,
+            },
+        ).json()["task_id"],
+    )
+
+    assert app_module.store.instance_creds(aid, "us-east-1", iid) is None
+
+
+def test_instances_page_shows_login_column():
+    """实例面板要有「登录方式」列，否则记了也看不到。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "<th>登录方式</th>" in html
+    assert "function credCell" in html
+    assert "showPassword" in html
+    assert 'colspan="8"' not in html, "加了一列，空态的 colspan 也要跟着改"

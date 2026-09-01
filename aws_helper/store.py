@@ -74,6 +74,23 @@ CREATE TABLE IF NOT EXISTS keypairs (
     UNIQUE(account_id, region, key_name)
 );
 
+CREATE TABLE IF NOT EXISTS instance_creds (
+    id SERIAL PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    region TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    auth_method TEXT NOT NULL DEFAULT 'key',
+    login_user TEXT NOT NULL DEFAULT '',
+    password_blob TEXT NOT NULL DEFAULT '',
+    key_name TEXT NOT NULL DEFAULT '',
+    os_family TEXT NOT NULL DEFAULT 'linux',
+    note TEXT NOT NULL DEFAULT '',
+    created_at BIGINT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL DEFAULT 0,
+    UNIQUE(account_id, region, instance_id)
+);
+
 CREATE TABLE IF NOT EXISTS ip_rules (
     id SERIAL PRIMARY KEY,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -584,6 +601,119 @@ class Store:
         return self._fetchall(
             "SELECT id,account_id,region,key_name,created_at FROM keypairs"
             " ORDER BY id DESC"
+        )
+
+    # ---------- 实例登录凭据 ----------
+
+    def save_instance_creds(
+        self,
+        account_id: int,
+        region: str,
+        instance_id: str,
+        *,
+        auth_method: str,
+        login_user: str,
+        password: str | None = None,
+        key_name: str = "",
+        name: str = "",
+        os_family: str = "linux",
+        note: str = "",
+    ) -> int:
+        """记下这台实例怎么登录。
+
+        password 传 None 表示沿用已存的（重装换了系统但密码没变时用）。
+        密码和私钥一样用 Fernet 加密，接口默认只回掩码。
+        """
+        if auth_method not in ("password", "key"):
+            raise ValueError(f"未知的登录方式: {auth_method}")
+
+        now = int(time.time())
+        existing = self._fetchone(
+            "SELECT id, password_blob FROM instance_creds"
+            " WHERE account_id=%s AND region=%s AND instance_id=%s",
+            (account_id, region, instance_id),
+        )
+        if password:
+            blob = self._encrypt(password)
+        elif existing:
+            blob = existing["password_blob"]
+        else:
+            blob = ""
+
+        return self._returning_id(
+            "INSERT INTO instance_creds(account_id, region, instance_id, name,"
+            " auth_method, login_user, password_blob, key_name, os_family, note,"
+            " created_at, updated_at)"
+            " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+            " ON CONFLICT(account_id, region, instance_id) DO UPDATE SET"
+            " name=excluded.name, auth_method=excluded.auth_method,"
+            " login_user=excluded.login_user, password_blob=excluded.password_blob,"
+            " key_name=excluded.key_name, os_family=excluded.os_family,"
+            " note=excluded.note, updated_at=excluded.updated_at"
+            " RETURNING id",
+            (
+                account_id,
+                region,
+                instance_id,
+                name,
+                auth_method,
+                login_user,
+                blob,
+                key_name,
+                os_family,
+                note,
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _strip_password_blob(row: dict[str, Any]) -> dict[str, Any]:
+        """密文必须 pop 掉而不是留着。
+
+        接口会把整个 dict 序列化给页面，留着密文等于把它公开了 ——
+        虽然解不开，但没有任何理由送出去。
+        """
+        item = dict(row)
+        item["has_password"] = bool(item.pop("password_blob", ""))
+        return item
+
+    def instance_creds(
+        self, account_id: int, region: str, instance_id: str
+    ) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM instance_creds"
+            " WHERE account_id=%s AND region=%s AND instance_id=%s",
+            (account_id, region, instance_id),
+        )
+        return self._strip_password_blob(row) if row else None
+
+    def list_instance_creds(self, account_id: int, region: str) -> list[dict[str, Any]]:
+        return [
+            self._strip_password_blob(row)
+            for row in self._fetchall(
+                "SELECT * FROM instance_creds WHERE account_id=%s AND region=%s"
+                " ORDER BY id DESC",
+                (account_id, region),
+            )
+        ]
+
+    def instance_password(self, account_id: int, region: str, instance_id: str) -> str:
+        """取密码明文。只有用户显式点「查看」时才调。"""
+        row = self._fetchone(
+            "SELECT password_blob FROM instance_creds"
+            " WHERE account_id=%s AND region=%s AND instance_id=%s",
+            (account_id, region, instance_id),
+        )
+        if not row or not row["password_blob"]:
+            raise DatabaseError("这台实例没有保存密码")
+        return self._decrypt(row["password_blob"])
+
+    def delete_instance_creds(self, account_id: int, region: str, instance_id: str) -> None:
+        self._execute(
+            "DELETE FROM instance_creds"
+            " WHERE account_id=%s AND region=%s AND instance_id=%s",
+            (account_id, region, instance_id),
         )
 
     # ---------- 换 IP 规则 ----------
