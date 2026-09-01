@@ -471,3 +471,58 @@ def test_secret_key_stays_in_data_dir(store):
         "SELECT COUNT(*) AS n FROM settings WHERE value LIKE %s", ("%secret.key%",)
     )
     assert row["n"] == 0
+
+
+@requires_db
+def test_added_columns_backfilled_on_existing_table(tmp_path):
+    """升级已有库时新列必须补上。
+
+    SCHEMA 里是 CREATE TABLE IF NOT EXISTS，对已存在的表什么都不做 ——
+    老库不会自动长出 cf_account_id，新字段的读写会全部报 UndefinedColumn。
+    真机上就踩到了：restart 之后 DDNS 页直接 500。
+    """
+    import os
+    import uuid
+
+    import psycopg
+
+    from .conftest import database_dsn
+
+    dsn = database_dsn()
+    schema = f"upg_{uuid.uuid4().hex[:8]}"
+    os.environ["AWS_HELPER_DB_SCHEMA"] = schema
+    os.environ["AWS_HELPER_DATABASE_URL"] = dsn
+    os.environ["AWS_HELPER_DATA"] = str(tmp_path / "upg")
+
+    from aws_helper import store as store_mod
+
+    # 先按"老版本"建表：故意不含 cf_account_id
+    with psycopg.connect(dsn) as conn:
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"SET search_path TO {schema}")
+        conn.execute(
+            "CREATE TABLE ddns_rules ("
+            " id SERIAL PRIMARY KEY, provider TEXT NOT NULL DEFAULT 'cloudflare',"
+            " zone TEXT NOT NULL, hostname TEXT NOT NULL,"
+            " token_blob TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,"
+            " want_ipv4 INTEGER NOT NULL DEFAULT 1, want_ipv6 INTEGER NOT NULL DEFAULT 0,"
+            " ttl INTEGER NOT NULL DEFAULT 1, proxied INTEGER NOT NULL DEFAULT 0,"
+            " interval_sec INTEGER NOT NULL DEFAULT 300, note TEXT NOT NULL DEFAULT '',"
+            " last_check BIGINT NOT NULL DEFAULT 0, last_ipv4 TEXT NOT NULL DEFAULT '',"
+            " last_ipv6 TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '',"
+            " fail_count INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL DEFAULT 0,"
+            " UNIQUE(provider, hostname))"
+        )
+        conn.commit()
+
+    try:
+        s = store_mod.Store()
+        rule_id = s.save_ddns_rule(
+            "example.com", "h.example.com", token="tok", cf_account_id="e" * 32
+        )
+        assert s.ddns_rule(rule_id)["cf_account_id"] == "e" * 32
+    finally:
+        with psycopg.connect(dsn) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            conn.commit()
+        os.environ.pop("AWS_HELPER_DB_SCHEMA", None)

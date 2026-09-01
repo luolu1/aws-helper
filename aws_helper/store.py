@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS ddns_rules (
     zone TEXT NOT NULL,
     hostname TEXT NOT NULL,
     token_blob TEXT NOT NULL DEFAULT '',
+    cf_account_id TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
     want_ipv4 INTEGER NOT NULL DEFAULT 1,
     want_ipv6 INTEGER NOT NULL DEFAULT 0,
@@ -162,6 +163,12 @@ CREATE TABLE IF NOT EXISTS login_history (
 CREATE INDEX IF NOT EXISTS idx_login_history_created
     ON login_history(created_at DESC);
 """
+
+# 升级已有库时补的列。CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做，
+# 老库不会自动长出新字段 —— 这里逐条 ADD COLUMN IF NOT EXISTS 补齐。
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("ddns_rules", "cf_account_id", "TEXT NOT NULL DEFAULT ''"),
+)
 
 # 迁移用：表名 → 列名。顺序有依赖，accounts 必须先导入
 _MIGRATION_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -267,6 +274,12 @@ class Store:
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema}")
             conn.execute(f"SET search_path TO {self.schema}")
             conn.execute(SCHEMA)
+            for table, column, ddl in _ADDED_COLUMNS:
+                # SCHEMA 里是 CREATE TABLE IF NOT EXISTS，对已存在的表不会加新列。
+                # 升级上来的库要单独补，否则新字段的读写全部报 UndefinedColumn。
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}"
+                )
             conn.commit()
 
     # ---------- SQLite 迁移 ----------
@@ -655,6 +668,7 @@ class Store:
 
     _DDNS_DEFAULTS: dict[str, Any] = {
         "provider": "cloudflare",
+        "cf_account_id": "",
         "enabled": 1,
         "want_ipv4": 1,
         "want_ipv6": 0,

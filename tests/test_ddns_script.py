@@ -281,7 +281,7 @@ class _FakeCF(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        self.state["calls"].append(("GET", parsed.path))
+        self.state["calls"].append(("GET", self.path))
         if not self._auth():
             return self._send(
                 {"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]},
@@ -453,3 +453,73 @@ def test_live_run_missing_config_fails_clearly(tmp_path):
     )
     assert proc.returncode != 0
     assert "读不到配置" in proc.stderr
+
+
+# ---------- Account ID ----------
+
+
+def test_script_omits_account_filter_when_absent(tmp_path):
+    """不填 Account ID 时脚本不该带这个过滤 —— DNS 增删改本来不需要它。"""
+    script = render_script(_req())
+    assert "CF_ACCOUNT_ID=\n" in script
+    updater = _inner_updater(script)
+    # 变量为空时不拼进 query
+    assert '[ -n "${CF_ACCOUNT_ID:-}" ]' in updater
+
+
+def test_script_includes_account_filter_when_given(tmp_path):
+    """过滤参数名是 account.id（点号），写成 account_id 不生效。"""
+    acct = "a" * 32
+    script = render_script(_req(account_id=acct))
+    assert f"CF_ACCOUNT_ID={acct}" in script
+    assert "account.id=${CF_ACCOUNT_ID}" in _inner_updater(script)
+    _bash_ok(script, tmp_path, "acct.sh")
+    _bash_ok(_inner_updater(script), tmp_path, "acct-inner.sh")
+
+
+def test_script_rejects_malformed_account_id():
+    """Account ID 是 32 位十六进制，别的一定是粘错了。"""
+    for bad in ("not-hex", "a" * 31, "a" * 33, "A" * 32, "zzzz" * 8):
+        with pytest.raises(ScriptError, match="32 位十六进制"):
+            render_script(_req(account_id=bad))
+
+
+def test_script_uses_ip_sb_first():
+    """探测点用 ip.sb 打头，与面板托管那条路径保持一致。
+
+    断言的是它在每个 set -- 列表里排第一，而不是出现次数 ——
+    注释里也会提到这个域名。
+    """
+    updater = _inner_updater(render_script(_req(want_ipv6=True)))
+    lists = [l.strip() for l in updater.splitlines() if l.strip().startswith("set -- ")]
+    assert len(lists) == 2, f"应有 v4/v6 两个探测点列表，实际 {len(lists)}"
+    for line in lists:
+        assert line.startswith('set -- "https://ip.sb"'), f"ip.sb 不在首位: {line}"
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="需要 curl")
+def test_live_run_sends_account_filter(tmp_path, live_cf):
+    """真跑一次，确认 account.id 真的进了请求 URL。"""
+    state, api_base = live_cf
+    acct = "b" * 32
+    script = render_script(_req(account_id=acct))
+    updater = tmp_path / "u.sh"
+    updater.write_text(_inner_updater(script))
+
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        f"CF_TOKEN={TOKEN}\nCF_ACCOUNT_ID={acct}\nCF_API={api_base}\n"
+        f"DDNS_ZONE={ZONE}\nDDNS_HOSTNAME={HOST}\n"
+        f"DDNS_WANT_IPV4=true\nDDNS_WANT_IPV6=false\n"
+        f"DDNS_PROXIED=false\nDDNS_TTL=1\nDDNS_STATE_DIR={tmp_path / 'state'}\n"
+    )
+    subprocess.run(
+        ["bash", str(updater)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={"DDNS_ENV_FILE": str(env_file), "PATH": "/usr/bin:/bin:/usr/local/bin"},
+    )
+
+    zone_calls = [p for m, p in state["calls"] if m == "GET" and "zones" in p]
+    assert zone_calls, "没有查 zone"

@@ -50,7 +50,9 @@ def check_rule(
 
     try:
         token = store.ddns_token(rule_id)
-        provider = ddns.build_provider(rule["provider"], token)
+        provider = ddns.build_provider(
+            rule["provider"], token, rule.get("cf_account_id") or ""
+        )
     except Exception as exc:
         store.update_ddns_state(
             rule_id,

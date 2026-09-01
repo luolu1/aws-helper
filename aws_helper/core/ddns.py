@@ -28,14 +28,20 @@ from typing import Any, Iterator, Protocol
 # 与 AWS_HELPER_ENDPOINT_URL 同理：本地起假服务端做联调时覆盖，平时不设
 CF_API = os.environ.get("AWS_HELPER_CF_API", "https://api.cloudflare.com/client/v4")
 
-# 取本机公网 IP 的探测点。v4 和 v6 必须分开问 —— api.ipify.org 只有 A 记录，
-# 强制走 v6 会直接连不上，那不是"没有 v6"而是探测点本身不支持。
+# 取本机**出站** IP 的探测点 —— 这些服务回显的是它看到的源地址，也就是
+# 这台机器真正用哪个 IP 出网（等价于 curl -4/-6 https://ip.sb）。
+# 网卡上绑的地址不一定是出站地址：NAT 后面、多网卡、有代理时都不一样。
+#
+# v4 和 v6 必须分开问：api.ipify.org 只有 A 记录，强制走 v6 会直接连不上，
+# 那不是"这台机器没有 v6"，而是探测点本身不支持。
 IPV4_SOURCES: tuple[str, ...] = (
+    "https://ip.sb",
     "https://one.one.one.one/cdn-cgi/trace",
     "https://api.ipify.org",
     "https://ipv4.icanhazip.com",
 )
 IPV6_SOURCES: tuple[str, ...] = (
+    "https://ip.sb",
     "https://one.one.one.one/cdn-cgi/trace",
     "https://api6.ipify.org",
     "https://ipv6.icanhazip.com",
@@ -122,10 +128,13 @@ def _parse_body(url: str, body: str) -> str:
 
 
 def detect_ip(version: int = 4, sources: tuple[str, ...] | None = None, timeout: float = 8.0) -> str:
-    """取本机公网 IP。拿不到返回空串，不抛异常。
+    """取本机**出站** IP，也就是这台机器实际用哪个地址出网。
 
-    单个探测点会挂、会限流、会返回垃圾，所以按顺序试多个，并且用
-    ipaddress 校验版本对得上 —— 探测点偶尔会回一个 v4 映射地址或错误页。
+    等价于 `curl -4 https://ip.sb` / `curl -6 https://ip.sb`：由外部服务回显它
+    看到的源地址。不读网卡 —— NAT 后面、多网卡、走代理时网卡地址和出站地址不同，
+    把网卡地址写进 DNS 会解析到一个外部根本连不上的内网地址。
+
+    拿不到返回空串，不抛异常：机器没有 v6 连通性是常态，不是故障。
     """
     if version not in (4, 6):
         raise ValueError(f"未知 IP 版本: {version}")
@@ -162,11 +171,17 @@ class CloudflareProvider:
 
     kind = "cloudflare"
 
-    def __init__(self, token: str, timeout: float = 15.0) -> None:
+    def __init__(
+        self, token: str, timeout: float = 15.0, account_id: str = ""
+    ) -> None:
         if not token.strip():
             raise DdnsError("缺少 Cloudflare API Token")
         self.token = token.strip()
         self.timeout = timeout
+        # DNS 记录的增删改只需要 zone id，不需要 account id。account id 只在
+        # 查 zone 时用来消歧义：一个 Token 能看到多个账号、而这些账号下有同名
+        # zone 时，GET /zones?name= 会返回多条，这时无法确定该改哪一个。
+        self.account_id = account_id.strip()
         self._zone_cache: dict[str, str] = {}
 
     def _call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -228,17 +243,28 @@ class CloudflareProvider:
         if zone in self._zone_cache:
             return self._zone_cache[zone]
 
-        query = urllib.parse.urlencode({"name": zone})
+        params = {"name": zone}
+        if self.account_id:
+            # 过滤参数名是 account.id（点号），不是 account_id
+            params["account.id"] = self.account_id
+        query = urllib.parse.urlencode(params)
         result = self._call("GET", f"/zones?{query}").get("result") or []
         if not result:
             # 单区域 Token 查不到别的区域时返回空数组而不是 403，
             # 所以"没找到"要同时提示权限范围。
+            scope = f"，且属于账号 {self.account_id}" if self.account_id else ""
             raise DdnsError(
-                f"找不到区域 {zone} —— 确认域名已托管在 Cloudflare，"
-                "且 Token 的权限范围覆盖这个区域"
+                f"找不到区域 {zone} —— 确认域名已托管在 Cloudflare、"
+                f"Token 的权限范围覆盖这个区域{scope}"
             )
         if len(result) > 1:
-            raise DdnsError(f"区域 {zone} 匹配到 {len(result)} 个结果，无法确定")
+            names = ", ".join(
+                (item.get("account") or {}).get("id", "?") for item in result[:4]
+            )
+            raise DdnsError(
+                f"区域 {zone} 在多个账号下都存在（{names}），"
+                "请填写 Account ID 指定用哪一个"
+            )
 
         zid = str(result[0]["id"])
         self._zone_cache[zone] = zid
@@ -305,10 +331,10 @@ class CloudflareProvider:
 PROVIDERS: dict[str, str] = {"cloudflare": "Cloudflare"}
 
 
-def build_provider(kind: str, token: str) -> DnsProvider:
+def build_provider(kind: str, token: str, account_id: str = "") -> DnsProvider:
     if kind != "cloudflare":
         raise DdnsError(f"暂不支持的 DNS 供应商: {kind}")
-    return CloudflareProvider(token)
+    return CloudflareProvider(token, account_id=account_id)
 
 
 # ---------------- 同步一条记录 ----------------
@@ -350,8 +376,10 @@ def sync_record(
     )
 
 
-def verify_token(kind: str, token: str, zone: str) -> dict[str, Any]:
+def verify_token(
+    kind: str, token: str, zone: str, account_id: str = ""
+) -> dict[str, Any]:
     """校验凭据能否真的读到这个区域。保存前调一次，别等到定时任务里才发现配错。"""
-    provider = build_provider(kind, token)
+    provider = build_provider(kind, token, account_id)
     zid = provider.zone_id(zone)
-    return {"ok": True, "zone": zone, "zone_id": zid}
+    return {"ok": True, "zone": zone, "zone_id": zid, "account_id": account_id}

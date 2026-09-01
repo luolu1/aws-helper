@@ -474,7 +474,7 @@ def test_monitor_shares_detected_ip_across_rules(store, monkeypatch):
 
     monkeypatch.setattr(ddnsmon.ddns, "detect_ip", counting)
     monkeypatch.setattr(
-        ddnsmon.ddns, "build_provider", lambda kind, token: _StubProvider()
+        ddnsmon.ddns, "build_provider", lambda kind, token, acct="": _StubProvider()
     )
     ddnsmon.run_once(store)
 
@@ -505,7 +505,7 @@ def test_monitor_missing_ipv6_is_not_a_failure(store, monkeypatch):
         ddnsmon.ddns, "detect_ip", lambda version=4, **kw: "203.0.113.9" if version == 4 else ""
     )
     monkeypatch.setattr(
-        ddnsmon.ddns, "build_provider", lambda kind, token: _StubProvider()
+        ddnsmon.ddns, "build_provider", lambda kind, token, acct="": _StubProvider()
     )
     out = ddnsmon.check_rule(store, store.ddns_rule(rule_id))
 
@@ -597,7 +597,7 @@ def test_save_rule_verifies_token_before_saving(panel, monkeypatch):
     """Token 校验不过就不该落库 —— 否则定时任务会默默失败几小时。"""
     c, app_module = panel
 
-    def boom(kind, token, zone):
+    def boom(kind, token, zone, acct=""):
         raise ddns.DdnsError("Cloudflare: 1000: Invalid API Token")
 
     monkeypatch.setattr(app_module.ddns, "verify_token", boom)
@@ -613,7 +613,7 @@ def test_save_rule_verifies_token_before_saving(panel, monkeypatch):
 def test_save_rule_persists_after_verification(panel, monkeypatch):
     c, app_module = panel
     monkeypatch.setattr(
-        app_module.ddns, "verify_token", lambda kind, token, zone: {"ok": True}
+        app_module.ddns, "verify_token", lambda kind, token, zone, acct="": {"ok": True}
     )
     resp = c.post(
         "/api/ddns/rules",
@@ -629,7 +629,7 @@ def test_api_never_returns_token(panel, monkeypatch):
     """页面和接口都不能回传 Token，连密文也不行。"""
     c, app_module = panel
     monkeypatch.setattr(
-        app_module.ddns, "verify_token", lambda kind, token, zone: {"ok": True}
+        app_module.ddns, "verify_token", lambda kind, token, zone, acct="": {"ok": True}
     )
     c.post("/api/ddns/rules", json={"zone": ZONE, "hostname": HOST, "token": "tok-leak"})
     assert "tok-leak" not in c.get("/ddns").text
@@ -659,7 +659,7 @@ def test_run_now_ignores_interval(panel, monkeypatch):
         app_module.ddns, "detect_ip", lambda version=4, **kw: "203.0.113.9"
     )
     monkeypatch.setattr(
-        app_module.ddns, "build_provider", lambda kind, token: _StubProvider()
+        app_module.ddns, "build_provider", lambda kind, token, acct="": _StubProvider()
     )
     body = c.post(f"/api/ddns/rules/{rule_id}/run").json()
     assert body["action"] != "skip", "立即同步不该被间隔挡住"
@@ -729,3 +729,160 @@ def test_script_endpoint_rejects_bad_numbers(panel):
     )
     assert resp.status_code == 400
     assert "参数错误" in resp.json()["error"]
+
+
+# ---------- 出站 IP 与 Account ID ----------
+
+
+def test_ip_sb_is_first_source():
+    """ip.sb 放第一位 —— 用户明确要求用它锁定出站地址。"""
+    assert ddns.IPV4_SOURCES[0] == "https://ip.sb"
+    assert ddns.IPV6_SOURCES[0] == "https://ip.sb"
+
+
+def test_v4_and_v6_sources_are_different():
+    """v4/v6 探测点不能共用。
+
+    api.ipify.org 只有 A 记录，强制走 v6 会连不上 —— 那会被误判成
+    "这台机器没有 v6"，AAAA 记录永远不更新。
+    """
+    assert "https://api.ipify.org" in ddns.IPV4_SOURCES
+    assert "https://api6.ipify.org" in ddns.IPV6_SOURCES
+    assert "https://api.ipify.org" not in ddns.IPV6_SOURCES
+
+
+def test_force_family_pins_getaddrinfo():
+    """_force_family 必须真的把 getaddrinfo 钉在指定协议族上。
+
+    urllib 不给切换地址族的入口。不钉住的话同一个域名可能解析到 v4，
+    "取 IPv6"就取回一个 v4 地址，写进 AAAA 记录直接失败。
+    """
+    import socket as socket_mod
+
+    seen: list[int] = []
+    original = socket_mod.getaddrinfo
+    try:
+        socket_mod.getaddrinfo = lambda host, port, family=0, *a, **kw: (
+            seen.append(family) or []
+        )
+        with ddns._force_family(socket_mod.AF_INET6):
+            socket_mod.getaddrinfo("example.com", 443)
+        assert seen == [socket_mod.AF_INET6]
+
+        # 退出上下文后必须还原，否则会污染整个进程的域名解析
+        seen.clear()
+        socket_mod.getaddrinfo("example.com", 443, 0)
+        assert seen == [0]
+    finally:
+        socket_mod.getaddrinfo = original
+
+
+def test_detect_ip_uses_force_family(monkeypatch):
+    """detect_ip 取 v6 时要走 _force_family(AF_INET6)。"""
+    import socket as socket_mod
+
+    used: list[int] = []
+    original = ddns._force_family
+
+    def spy(family):
+        used.append(family)
+        return original(family)
+
+    monkeypatch.setattr(ddns, "_force_family", spy)
+    monkeypatch.setattr(
+        ddns.urllib.request, "urlopen", lambda *a, **k: _FakeResponse("2001:db8::1")
+    )
+    ddns.detect_ip(6, sources=("https://x",))
+    assert used == [socket_mod.AF_INET6]
+
+    used.clear()
+    monkeypatch.setattr(
+        ddns.urllib.request, "urlopen", lambda *a, **k: _FakeResponse("203.0.113.9")
+    )
+    ddns.detect_ip(4, sources=("https://x",))
+    assert used == [socket_mod.AF_INET]
+
+
+def test_zone_lookup_omits_account_id_when_absent(fake_cf):
+    """不填 Account ID 时不该带这个参数 —— DNS 增删改本来不需要它。"""
+    ddns.CloudflareProvider("tok-valid").zone_id(ZONE)
+    zone_calls = [path for method, path in fake_cf["calls"] if "/zones?" in path]
+    assert zone_calls and "account.id" not in zone_calls[0]
+
+
+def test_zone_lookup_sends_account_id_when_given(fake_cf):
+    """过滤参数名是 account.id（点号），写成 account_id 不会生效。"""
+    provider = ddns.CloudflareProvider("tok-valid", account_id="a" * 32)
+    try:
+        provider.zone_id(ZONE)
+    except ddns.DdnsError:
+        pass
+    zone_calls = [path for method, path in fake_cf["calls"] if "/zones?" in path]
+    assert zone_calls
+    assert "account.id=" + "a" * 32 in urllib.parse.unquote(zone_calls[0])
+
+
+def test_duplicate_zone_asks_for_account_id(fake_cf, monkeypatch):
+    """同名 zone 出现在多个账号下时，要明确让用户填 Account ID。
+
+    这正是 Cloudflare 需要账号维度信息的唯一场景 —— 报"匹配到 2 个结果"
+    对用户毫无帮助。
+    """
+    provider = ddns.CloudflareProvider("tok-valid")
+
+    def two_zones(method, path, payload=None):
+        return {
+            "success": True,
+            "errors": [],
+            "result": [
+                {"id": "z1", "name": ZONE, "account": {"id": "acct-one"}},
+                {"id": "z2", "name": ZONE, "account": {"id": "acct-two"}},
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_call", two_zones)
+    with pytest.raises(ddns.DdnsError, match="请填写 Account ID"):
+        provider.zone_id(ZONE)
+
+
+def test_duplicate_zone_error_lists_account_ids(fake_cf, monkeypatch):
+    provider = ddns.CloudflareProvider("tok-valid")
+    monkeypatch.setattr(
+        provider,
+        "_call",
+        lambda *a, **k: {
+            "success": True,
+            "errors": [],
+            "result": [
+                {"id": "z1", "name": ZONE, "account": {"id": "acct-one"}},
+                {"id": "z2", "name": ZONE, "account": {"id": "acct-two"}},
+            ],
+        },
+    )
+    with pytest.raises(ddns.DdnsError) as err:
+        provider.zone_id(ZONE)
+    assert "acct-one" in str(err.value) and "acct-two" in str(err.value)
+
+
+def test_not_found_error_mentions_account_when_filtered(fake_cf):
+    provider = ddns.CloudflareProvider("tok-valid", account_id="b" * 32)
+    with pytest.raises(ddns.DdnsError, match="属于账号"):
+        provider.zone_id("nope.com")
+
+
+def test_build_provider_passes_account_id():
+    provider = ddns.build_provider("cloudflare", "tok", "c" * 32)
+    assert provider.account_id == "c" * 32
+
+
+def test_store_saves_cf_account_id(store):
+    rule_id = store.save_ddns_rule(
+        ZONE, HOST, token="tok", cf_account_id="d" * 32
+    )
+    assert store.ddns_rule(rule_id)["cf_account_id"] == "d" * 32
+    assert store.list_ddns_rules()[0]["cf_account_id"] == "d" * 32
+
+
+def test_store_defaults_cf_account_id_to_empty(store):
+    rule_id = store.save_ddns_rule(ZONE, HOST, token="tok")
+    assert store.ddns_rule(rule_id)["cf_account_id"] == ""

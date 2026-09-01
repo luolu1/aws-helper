@@ -78,6 +78,32 @@ Bedrock 没有实例概念，只有模型和 token 计费。所以各栏有自�
 
 ---
 
+**重置实例登录密码**
+
+实例列表每行有「重置密码」。走 Systems Manager 在实例内执行改密码 ——
+这是唯一不需要"先能登进去"的路径（SSH 改密码的前提是已经能 SSH，
+密码忘了正好用不上）。
+
+**只改密码是不够的。** 官方云镜像默认 `PasswordAuthentication no`，
+改完密码仍然登不进去。所以顺带打开密码认证，并且：
+
+- Ubuntu 22.04+ 用 `Include /etc/ssh/sshd_config.d/*.conf` 覆盖主配置，
+  只改主配置会被片段盖掉 —— 所以写一个高优先级片段 `00-aws-helper-password.conf`
+- 云镜像的 root 账号默认是锁定状态，不 `passwd -u` 密码认证照样失败
+- 重启 sshd 前先 `sshd -t` 校验，配置写坏了重启会把自己彻底关在门外，
+  而这台机器的密码正是刚才要重置的那个
+- 密码从 stdin 喂给 `chpasswd`，不作为命令行参数 —— 同机任何用户 `ps` 一下就能看到
+
+**前提：实例挂了带 `AmazonSSMManagedInstanceCore` 的 IAM 实例配置文件。**
+开机时没挂也能补（控制台「操作 → 安全 → 修改 IAM 角色」，附加后等 1-2 分钟
+自动注册，不用重启）。点开弹窗会先探一次 SSM 注册状态，不可用时直接把
+上面这段说明显示出来，而不是让你填完密码点了才发现不行。
+
+Windows 走 `AWS-RunPowerShellScript` + `Set-LocalUser`。
+
+密码强度按面板登录密码的同一套标准校验 —— 这个密码是要开着 SSH 密码登录用的，
+弱口令等于把机器交出去。密码不写日志，也不进返回值。
+
 ## 关于 API 调用与自动换 IP
 
 所有 EC2 操作走 boto3 官方 SDK，共 24 个 API，参数和行为对照 AWS 官方文档实现。
@@ -308,6 +334,16 @@ vCPU 配额全为 0 是账号未完成验证或被限制的明确信号。
 后端也会拒绝这些参数 —— Windows 的 cloud-init 是 EC2Launch，
 传 bash 脚本上去不报错但静默不执行，比直接拒绝更难排查。
 Windows 实例的结果区显示 RDP 连接方式，并提示管理员密码需用密钥在控制台解密。
+
+**私钥以纯文本文件下发**
+
+开机时新建的密钥对，私钥用 Fernet 加密存 Postgres，页面上给下载链接。
+下载走 `text/plain` + `Content-Disposition: attachment`，**不是 JSON** ——
+JSON 会把换行转成字面量 `\n`，浏览器里看到和复制出来的都是一行带 `\n`
+的字符串，`ssh -i` 直接报 invalid format。文件末尾也补上换行，
+OpenSSH 少了这个同样拒绝加载。
+
+存下来 `chmod 600` 就能直接用。
 
 **镜像解析用官方 SSM 公共参数**
 
@@ -616,6 +652,46 @@ journalctl -u ddns-update -n 50           # 看日志
 
 页面顶部会显示当前探测到的本机 IPv4 / IPv6，方便确认机器到底有没有 v6 连通性。
 
+### 取的是出站 IP，不是网卡地址
+
+由外部服务回显它看到的源地址，等价于：
+
+```bash
+curl -4 https://ip.sb    # A 记录用这个
+curl -6 https://ip.sb    # AAAA 记录用这个
+```
+
+**不读网卡。** NAT 后面、多网卡、走代理时，网卡上绑的地址和实际出站地址不同 ——
+把网卡地址写进 DNS 会解析到一个外部根本连不上的内网地址。
+
+探测点按 `ip.sb` → `cdn-cgi/trace` → `ipify` → `icanhazip` 顺序试，
+单个挂了或限流就换下一个。取回的地址会用 `ipaddress` 校验版本对得上，
+探测点偶尔会回错误页或另一个协议族的地址。
+
+v4 / v6 必须用不同探测点：`api.ipify.org` 只有 A 记录，强制走 v6 会连不上，
+那会被误判成"这台机器没有 v6"，AAAA 永远不更新。v6 用 `api6.ipify.org`。
+
+地址族是在 socket 层钉住的（`getaddrinfo` 只返回指定协议族），
+等价于 `curl -4` / `curl -6` —— 不钉住的话同一个域名可能解析到另一族。
+
+### Account ID：一般不用填
+
+**DNS 记录的增删改只需要 zone id，不需要 Account ID。** 面板留了这个可选字段，
+只用于查 zone 时消歧义：
+
+```
+GET /zones?name=example.com&account.id=<32位十六进制>
+```
+
+注意过滤参数名是 `account.id`（点号），写成 `account_id` 不会生效、会静默返回
+未过滤的结果。
+
+真正需要它的场景只有一个：**一个 Token 能看到多个账号，而这些账号下存在同名域名。**
+这时查询返回多条，无法确定该改哪一个。面板遇到这种情况会明确报出各自的
+account id 并提示你填，而不是笼统地说"匹配到 2 个结果"。
+
+Account ID 在 Cloudflare 控制台域名概览页右下角。
+
 ### Cloudflare Token 怎么建
 
 用 **API Token**，不要 Global API Key —— 后者是账号级全权限，放在一台
@@ -775,12 +851,12 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-574 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+622 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
 DDNS 一键脚本（两层 bash 语法检查 + 对着假 Cloudflare 真实执行）、
-部署脚本静态检查。
+SSM 重置密码（前提检查与脚本内容）、部署脚本静态检查。
 
 代理相关测试会起一个真实的 SOCKS5 服务器（支持 RFC 1929 认证），
 断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -806,6 +882,7 @@ aws_helper/
   ddnsmon.py          DDNS 监控循环
   core/ddns.py        DNS 供应商接口 + Cloudflare 实现 + 取本机公网 IP
   core/ddns_script.py 生成自包含的 DDNS 一键部署脚本（bash + curl）
+  core/respw.py       通过 SSM 重置实例登录密码
   autoip.py           自动换 IP 监控循环
   tasks.py            后台任务与进度跟踪
   core/aws.py         boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
@@ -821,7 +898,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                574 项测试
+tests/                622 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

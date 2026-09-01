@@ -327,6 +327,11 @@ def test_addresses_and_release_idle(client):
 
 
 def test_keypair_download_after_launch(client):
+    """私钥必须以纯文本下发，且换行是真换行。
+
+    早先返回 JSON，浏览器里看到的是 "-----BEGIN...\\nMIIE..."，
+    用户复制出来的 \\n 是两个字符而不是换行，ssh -i 直接报 invalid format。
+    """
     c, aid, _ = client
     task = wait_task(
         c,
@@ -336,8 +341,18 @@ def test_keypair_download_after_launch(client):
         ).json()["task_id"],
     )
     key_name = task["result"]["instances"][0]["key_name"]
-    body = c.get(f"/api/keypairs/{aid}/us-east-1/{key_name}").json()
-    assert "PRIVATE KEY" in body["private_key"]
+    resp = c.get(f"/api/keypairs/{aid}/us-east-1/{key_name}")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert f'filename="{key_name}.pem"' in resp.headers["content-disposition"]
+
+    body = resp.text
+    assert "PRIVATE KEY" in body
+    assert "\\n" not in body, "私钥里出现了字面量 \\n，ssh 无法使用"
+    assert body.count("\n") >= 2, "私钥应该有真实换行"
+    assert body.endswith("\n"), "OpenSSH 要求私钥文件以换行结尾"
+    assert body.lstrip().startswith("-----BEGIN"), "不能被 JSON 包裹"
 
 
 def test_keypair_missing_returns_404(client):

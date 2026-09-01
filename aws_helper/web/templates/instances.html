@@ -81,6 +81,48 @@
   </div>
 </div>
 
+<!-- 重置密码弹窗 -->
+<div class="mask" id="pw-mask">
+  <div class="box">
+    <h2>重置实例密码</h2>
+    <p class="hint" id="pw-target"></p>
+    <div id="pw-ssm-check" class="hint">正在检查 SSM 可用性…</div>
+
+    <div class="grid g2 mt">
+      <label class="f">
+        <span>用户名</span>
+        <input type="text" id="pw-user" value="root">
+      </label>
+      <label class="f">
+        <span>新密码</span>
+        <div class="row" style="gap:6px">
+          <input type="text" id="pw-value" style="flex:1" placeholder="至少 10 位，含大小写数字符号中三类">
+          <button class="sm" onclick="genInstancePw()">生成</button>
+        </div>
+      </label>
+    </div>
+
+    <p class="hint mt">
+      通过 Systems Manager 在实例内执行改密码，<strong>并顺带打开 SSH 密码登录</strong>
+      —— 官方云镜像默认关闭密码认证，只改密码仍然登不进去。
+      Ubuntu 22.04+ 会写 <code>/etc/ssh/sshd_config.d/</code> 下的高优先级片段，
+      因为主配置会被那里的片段覆盖。重启 sshd 前会先 <code>sshd -t</code> 校验，
+      避免把自己关在门外。
+    </p>
+    <p class="hint">
+      <span class="tag warn">前提</span>
+      实例必须挂了带 <code>AmazonSSMManagedInstanceCore</code> 的 IAM 实例配置文件。
+      开机时没挂也能补：控制台「操作 → 安全 → 修改 IAM 角色」，附加后等 1-2 分钟
+      自动注册，不用重启。
+    </p>
+
+    <div class="row end mt">
+      <button onclick="document.getElementById('pw-mask').classList.remove('on')">取消</button>
+      <button class="primary" id="pw-go" onclick="doResetPassword()">重置密码</button>
+    </div>
+  </div>
+</div>
+
 <!-- 换 IP 弹窗 -->
 <div class="mask" id="ip-mask">
   <div class="box">
@@ -195,6 +237,7 @@ function rowHtml(i) {
       <td class="mono">${escapeHtml(i.private_ip || '-')}</td>
       <td>
         <button class="sm" onclick="openIp('${escapeHtml(i.instance_id)}','${escapeHtml(i.public_ip || '')}')">换 IP</button>
+        <button class="sm" onclick="openResetPw('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}','${i.platform === 'windows' ? 1 : 0}')">重置密码</button>
       </td>`;
 }
 
@@ -297,6 +340,72 @@ async function terminateWithCleanup(ids) {
     html += '</span>';
     Progress.finish(html);
     toast('终止并清理完成', 'ok');
+  } catch (e) {
+    Progress.finish();
+    toast(e.message, 'err');
+  }
+}
+
+let PW_TARGET = null;
+
+function openResetPw(id, name, isWin) {
+  PW_TARGET = { instance_id: id, is_windows: isWin === '1' || isWin === 1 };
+  document.getElementById('pw-target').textContent =
+    `${name || id}（${id}）${PW_TARGET.is_windows ? ' · Windows' : ' · Linux'}`;
+  document.getElementById('pw-user').value = PW_TARGET.is_windows ? 'Administrator' : 'root';
+  document.getElementById('pw-value').value = '';
+  document.getElementById('pw-mask').classList.add('on');
+
+  // 先探一次 SSM 注册状态：没挂实例配置文件的机器根本用不了，
+  // 让用户填完密码点了才知道不行是最糟的体验。
+  const box = document.getElementById('pw-ssm-check');
+  const go = document.getElementById('pw-go');
+  box.textContent = '正在检查 SSM 可用性…';
+  go.disabled = true;
+  const s = sel();
+  api(`/api/instances/ssm-status?account_id=${s.account_id}&region=${s.region}&instance_id=${id}`)
+    .then(d => {
+      if (d.registered) {
+        box.innerHTML = `<span class="tag ok">SSM 已就绪</span> ${escapeHtml(d.platform_name || d.platform || '')} · Agent ${escapeHtml(d.agent_version || '?')}`;
+        go.disabled = false;
+      } else {
+        box.innerHTML = `<span class="tag err">SSM 不可用</span><br>`
+          + `<span class="mono" style="white-space:pre-wrap;font-size:12px">${escapeHtml(d.reason || '')}</span>`;
+        go.disabled = true;
+      }
+    })
+    .catch(e => {
+      box.innerHTML = `<span class="tag err">检查失败</span> ${escapeHtml(e.message)}`;
+      go.disabled = true;
+    });
+}
+
+function genInstancePw() {
+  // 排除易混淆字符（0/O、1/l/I）—— 这密码用户要手敲进 SSH
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%^&*-_=+';
+  const buf = new Uint32Array(20);
+  crypto.getRandomValues(buf);
+  document.getElementById('pw-value').value =
+    [...buf].map(n => chars[n % chars.length]).join('');
+}
+
+async function doResetPassword() {
+  if (!PW_TARGET) return;
+  const password = document.getElementById('pw-value').value;
+  const user = document.getElementById('pw-user').value.trim();
+  if (!password) return toast('请填写或生成新密码', 'err');
+
+  document.getElementById('pw-mask').classList.remove('on');
+  try {
+    const r = await api('/api/instances/reset-password', {
+      method: 'POST',
+      json: { ...sel(), ...PW_TARGET, user, password }
+    });
+    const task = await watchTask(r.task_id, '重置密码');
+    Progress.finish(
+      `<span class="mono" style="flex:1;text-align:left">${escapeHtml(task.result.output || '已完成')}</span>`
+    );
+    toast(`已重置 ${user} 的密码`, 'ok');
   } catch (e) {
     Progress.finish();
     toast(e.message, 'err');

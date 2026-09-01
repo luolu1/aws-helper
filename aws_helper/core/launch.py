@@ -529,6 +529,11 @@ def list_instances(creds: aws.Credentials, region: str) -> list[dict[str, Any]]:
                     "ipv6": ipv6,
                     "region": region,
                     "key_name": inst.get("KeyName", ""),
+                    # Windows 实例的 Platform 才是 "windows"，Linux 上这个字段
+                    # 直接不存在（不是空串）—— 重置密码要用它决定发 shell
+                    # 还是 PowerShell 脚本。
+                    "platform": inst.get("Platform") or "linux",
+                    "iam_profile": (inst.get("IamInstanceProfile") or {}).get("Arn", ""),
                     "launch_time": (
                         inst["LaunchTime"].isoformat()
                         if inst.get("LaunchTime")

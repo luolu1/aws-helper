@@ -10,6 +10,12 @@
     后台每 60 秒扫一遍规则，按各自间隔检查；<strong>IP 没变化不会发任何更新请求</strong>，
     避免白烧 Cloudflare 的限流额度（1200 次 / 5 分钟，账号级共享）。
   </p>
+  <p class="hint">
+    取的是<strong>出站 IP</strong> —— 由 <code>ip.sb</code> 等服务回显它看到的源地址，
+    等价于 <code>curl -4 https://ip.sb</code> / <code>curl -6 https://ip.sb</code>。
+    不读网卡：NAT 后面、多网卡、走代理时网卡地址和出站地址不同，
+    把网卡地址写进 DNS 会解析到一个外部根本连不上的内网地址。
+  </p>
   <div class="row">
     <span class="tag {{ 'ok' if monitor_on else 'err' }}">
       监控{{ '运行中' if monitor_on else '已停止' }}
@@ -51,11 +57,21 @@
     <span>API Token</span>
     <input id="token" type="password" placeholder="编辑已有规则时留空 = 沿用原 Token">
   </label>
+  <label class="f mt">
+    <span>Account ID（可选）</span>
+    <input id="cf_account_id" placeholder="32 位十六进制，仅在多个账号下有同名域名时需要">
+  </label>
   <p class="hint">
     用 Cloudflare 的 <strong>API Token</strong>，不是 Global API Key ——
     后者是账号级全权限。控制台「我的个人资料 → API 令牌 → 创建令牌」，
     选「编辑区域 DNS」模板，权限为 <code>Zone → DNS → Edit</code>，
     区域范围只勾这一个域名即可。
+  </p>
+  <p class="hint">
+    <strong>Account ID 一般不用填。</strong>DNS 记录的增删改只需要 zone id，
+    Account ID 仅用于查 zone 时消歧义 —— 当一个 Token 能看到多个账号、
+    而这些账号下存在同名域名时，查询会返回多条无法确定改哪个。
+    真遇到时面板会明确提示你来填。控制台域名概览页右下角能找到。
   </p>
 
   <div class="grid g4 mt">
@@ -223,6 +239,7 @@ function formValues() {
     zone: document.getElementById('zone').value.trim(),
     hostname: document.getElementById('hostname').value.trim(),
     token: document.getElementById('token').value,
+    cf_account_id: document.getElementById('cf_account_id').value.trim(),
     interval_sec: parseInt(document.getElementById('interval_sec').value, 10) || 300,
     ttl: parseInt(document.getElementById('ttl').value, 10) || 1,
     schedule: document.getElementById('schedule').value,

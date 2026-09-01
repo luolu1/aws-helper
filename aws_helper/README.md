@@ -355,6 +355,10 @@ Lightsail 栏需要：`lightsail:GetRegions` `lightsail:GetBundles` `lightsail:G
 `lightsail:DeleteInstance` `lightsail:GetStaticIps` `lightsail:DetachStaticIp`
 `lightsail:ReleaseStaticIp`
 
+重置实例密码需要：`ssm:SendCommand` `ssm:GetCommandInvocation`
+`ssm:DescribeInstanceInformation`，且目标实例要挂带 `AmazonSSMManagedInstanceCore`
+的 IAM 实例配置文件（这是实例侧的角色，不是调用方的权限）。
+
 Bedrock 栏需要：`bedrock:ListFoundationModels`、`bedrock:ListInferenceProfiles`，
 调用测试还要 `bedrock:InvokeModel`（Converse 走同一权限），且需在 Bedrock 控制台的
 「模型访问」里为具体模型申请开通。
@@ -423,11 +427,11 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-574 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+622 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
-并发写入、缓存命中与失效、DDNS 解析同步与一键脚本生成。
+并发写入、缓存命中与失效、DDNS 解析同步与一键脚本生成、SSM 重置密码。
 
 代理相关测试用 [tests/socks_server.py](tests/socks_server.py) 起真实 SOCKS5 服务器
 （支持 RFC 1929 认证），断言代理端确实记录到了目标连接 —— 否则"代理生效"是无法证伪的。
@@ -451,6 +455,7 @@ aws_helper/
   ddnsmon.py         DDNS 监控循环
   core/ddns.py       DNS 供应商接口 + Cloudflare + 取本机公网 IP
   core/ddns_script.py 生成自包含的一键部署脚本（bash + curl）
+  core/respw.py      通过 SSM 重置实例登录密码
   tasks.py           后台任务与进度跟踪
   autoip.py          自动换 IP 监控循环
   web/app.py         FastAPI 路由

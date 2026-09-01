@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -36,7 +41,7 @@ from ..cache import (
     ls_instances_key,
     ls_regions_key,
 )
-from ..core import aws, bedrock, ddns, ddns_script, ipchange, launch, lightsail
+from ..core import aws, bedrock, ddns, ddns_script, ipchange, launch, lightsail, respw
 from ..core.userdata import ScriptOptions, ScriptError, render
 from ..ddnsmon import Monitor as DdnsMonitor
 from ..ddnsmon import check_rule as ddns_check_rule
@@ -376,6 +381,7 @@ async def api_ddns_script(request: Request, _: None = Guard):
                 zone=body.get("zone", ""),
                 hostname=body.get("hostname", ""),
                 token=body.get("token", ""),
+                account_id=body.get("cf_account_id", ""),
                 want_ipv4=bool(body.get("want_ipv4", True)),
                 want_ipv6=bool(body.get("want_ipv6", False)),
                 proxied=bool(body.get("proxied", False)),
@@ -399,12 +405,13 @@ async def api_ddns_save(request: Request, _: None = Guard):
     zone = (body.get("zone") or "").strip()
     hostname = (body.get("hostname") or "").strip()
     provider_kind = body.get("provider", "cloudflare")
+    cf_account_id = (body.get("cf_account_id") or "").strip()
 
     # 保存前实际调一次 API —— 配错 Token 应该当场就知道，
     # 而不是等定时任务默默失败几小时后才在日志里发现。
     if token:
         try:
-            ddns.verify_token(provider_kind, token, zone)
+            ddns.verify_token(provider_kind, token, zone, cf_account_id)
         except ddns.DdnsError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
@@ -414,6 +421,7 @@ async def api_ddns_save(request: Request, _: None = Guard):
             hostname,
             token=token or None,
             provider=provider_kind,
+            cf_account_id=cf_account_id,
             enabled=body.get("enabled", 1),
             want_ipv4=body.get("want_ipv4", 1),
             want_ipv6=body.get("want_ipv6", 0),
@@ -1003,6 +1011,54 @@ def api_instances(
     return body
 
 
+@app.get("/api/instances/ssm-status")
+def api_ssm_status(account_id: int, region: str, instance_id: str, _: None = Guard):
+    """查实例能不能用 SSM 重置密码。点按钮前先探一下，省得填完表单才发现不支持。"""
+    creds = store.credentials(account_id, region)
+    return {"ok": True, **respw.ssm_status(creds, region, instance_id)}
+
+
+@app.post("/api/instances/reset-password")
+async def api_reset_password(request: Request, _: None = Guard):
+    """重置实例登录密码。走后台任务 —— SSM 下发加轮询可能十几秒。"""
+    body = await request.json()
+    account_id = int(body["account_id"])
+    region = body["region"]
+    instance_id = body["instance_id"]
+    password = body.get("password") or ""
+    user = (body.get("user") or "").strip()
+    is_windows = bool(body.get("is_windows"))
+
+    if not user:
+        user = "Administrator" if is_windows else "root"
+
+    # 弱密码在这里必须拦住：这个密码是要开着 SSH 密码登录用的，
+    # 弱口令等于把机器直接交出去。
+    try:
+        auth.validate_strength(password)
+    except auth.PasswordError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    creds = store.credentials(account_id, region)
+
+    def job(progress: Any) -> dict[str, Any]:
+        try:
+            result = respw.reset_password(
+                creds, region, instance_id, password, user, is_windows, progress
+            )
+        except respw.PasswordResetError as exc:
+            # 密码绝不进日志
+            store.log("reset-password", instance_id, False, str(exc)[:400])
+            raise
+        store.log("reset-password", instance_id, True, f"已重置 {user} 的密码")
+        return result
+
+    task_id = manager.submit(
+        "reset-password", f"重置 {instance_id} 的 {user} 密码", job
+    )
+    return {"ok": True, "task_id": task_id}
+
+
 @app.post("/api/instances/power")
 async def api_power(request: Request, _: None = Guard):
     body = await request.json()
@@ -1311,10 +1367,28 @@ def api_logs(limit: int = 100, _: None = Guard):
 
 @app.get("/api/keypairs/{account_id}/{region}/{key_name}")
 def api_keypair(account_id: int, region: str, key_name: str, _: None = Guard):
+    """下载私钥文件。
+
+    必须回纯文本而不是 JSON —— JSON 会把换行转成字面量 \\n，浏览器里看到的和
+    复制出来的都是一行带 \\n 的字符串，ssh 直接拒绝（invalid format）。
+    带 Content-Disposition 让浏览器存成 .pem 文件而不是在页面里渲染。
+    """
     key = store.get_private_key(account_id, region, key_name)
     if key is None:
         raise HTTPException(404, "没有保存该密钥的私钥")
-    return {"ok": True, "key_name": key_name, "private_key": key}
+
+    # OpenSSH 要求文件以换行结尾，缺了会报 invalid format
+    if not key.endswith("\n"):
+        key += "\n"
+
+    filename = f"{key_name}.pem".replace('"', "")
+    return PlainTextResponse(
+        key,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/healthz")

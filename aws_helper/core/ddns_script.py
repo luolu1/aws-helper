@@ -35,6 +35,7 @@ class ScriptRequest:
     zone: str = ""
     hostname: str = ""
     token: str = ""
+    account_id: str = ""
     want_ipv4: bool = True
     want_ipv6: bool = False
     proxied: bool = False
@@ -70,6 +71,10 @@ def _validate(req: ScriptRequest) -> ScriptRequest:
     if req.schedule not in ("systemd", "cron"):
         raise ScriptError(f"未知的运行方式: {req.schedule}")
 
+    account_id = req.account_id.strip()
+    if account_id and not re.fullmatch(r"[0-9a-f]{32}", account_id):
+        raise ScriptError("Account ID 应该是 32 位十六进制，检查是否复制完整")
+
     interval = max(60, min(int(req.interval_sec), 86400))
     ttl = 1 if req.proxied else max(1, min(int(req.ttl), 86400))
 
@@ -78,6 +83,7 @@ def _validate(req: ScriptRequest) -> ScriptRequest:
         zone=zone,
         hostname=hostname,
         token=token,
+        account_id=account_id,
         want_ipv4=bool(req.want_ipv4),
         want_ipv6=bool(req.want_ipv6),
         proxied=bool(req.proxied),
@@ -147,16 +153,22 @@ cf_call() {
     curl "${args[@]}" "${CF_API}${path}"
 }
 
-# 取本机公网 IP。v4/v6 用各自的探测点 —— api.ipify.org 只有 A 记录，
-# 强制走 v6 会连不上，那不是"没有 v6"而是探测点不支持。
+# 取本机**出站** IP：这些服务回显它看到的源地址，也就是这台机器真正用哪个
+# IP 出网（等价于 curl -4/-6 https://ip.sb）。不读网卡 —— NAT 后面、多网卡、
+# 走代理时网卡地址和出站地址不同。
+#
+# v4/v6 用各自的探测点：api.ipify.org 只有 A 记录，强制走 v6 会连不上，
+# 那不是"没有 v6"而是探测点不支持。
 detect_ip() {
     local ver="$1" flag src ip
     if [ "$ver" = "4" ]; then
         flag="-4"
-        set -- "https://one.one.one.one/cdn-cgi/trace" "https://api.ipify.org" "https://ipv4.icanhazip.com"
+        set -- "https://ip.sb" "https://one.one.one.one/cdn-cgi/trace" \
+               "https://api.ipify.org" "https://ipv4.icanhazip.com"
     else
         flag="-6"
-        set -- "https://one.one.one.one/cdn-cgi/trace" "https://api6.ipify.org" "https://ipv6.icanhazip.com"
+        set -- "https://ip.sb" "https://one.one.one.one/cdn-cgi/trace" \
+               "https://api6.ipify.org" "https://ipv6.icanhazip.com"
     fi
     for src in "$@"; do
         ip=$(curl -sS $flag --max-time 10 "$src" 2>/dev/null || true)
@@ -178,8 +190,12 @@ detect_ip() {
 ZONE_CACHE="$STATE_DIR/zone_id"
 zone_id() {
     if [ -s "$ZONE_CACHE" ]; then cat "$ZONE_CACHE"; return 0; fi
-    local body zid
-    body=$(cf_call GET "/zones?name=${DDNS_ZONE}")
+    local body zid query
+    query="name=${DDNS_ZONE}"
+    # 过滤参数名是 account.id（点号），不是 account_id。只在填了时才带上：
+    # DNS 增删改本身不需要 account id，它只用来消除同名 zone 的歧义。
+    [ -n "${CF_ACCOUNT_ID:-}" ] && query="${query}&account.id=${CF_ACCOUNT_ID}"
+    body=$(cf_call GET "/zones?${query}")
     cf_ok "$body" || { log "查询区域失败: $(cf_error "$body")"; return 1; }
     zid=$(json_get '.result[0].id' "$body")
     if [ -z "$zid" ]; then
@@ -405,6 +421,7 @@ touch {ENV_PATH}
 chmod 600 {ENV_PATH}
 cat > {ENV_PATH} <<EOF
 CF_TOKEN={quoted_token}
+CF_ACCOUNT_ID={cfg.account_id}
 DDNS_ZONE={cfg.zone}
 DDNS_HOSTNAME={cfg.hostname}
 DDNS_WANT_IPV4={bool_str(cfg.want_ipv4)}
