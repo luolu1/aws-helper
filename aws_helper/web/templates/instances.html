@@ -111,6 +111,36 @@
 
     <div id="ri-check" class="hint">正在检查…</div>
 
+    <div class="mt" style="border-top:1px solid #e5e7eb;padding-top:10px">
+      <label class="f">
+        <span>重装后的登录凭据</span>
+        <select id="ri-cred-mode" onchange="riCredMode()">
+          <option value="">沿用原密钥对（不改凭据）</option>
+          <option value="password">设一个 root 密码</option>
+          <option value="key">写入我自己的 SSH 公钥</option>
+        </select>
+      </label>
+
+      <div id="ri-cred-pw" class="mt" style="display:none">
+        <label class="f">
+          <span>root 密码</span>
+          <div class="row" style="gap:6px">
+            <input type="text" id="ri-password" style="flex:1" placeholder="至少 10 位，含大小写数字符号中三类">
+            <button class="sm" onclick="genReinstallPw()">生成</button>
+          </div>
+        </label>
+      </div>
+
+      <div id="ri-cred-key" class="mt" style="display:none">
+        <label class="f">
+          <span>SSH 公钥（.pub 文件的内容，不是私钥）</span>
+          <textarea id="ri-pubkey" rows="3" placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... you@host"></textarea>
+        </label>
+      </div>
+
+      <p class="hint" id="ri-cred-hint" style="display:none"></p>
+    </div>
+
     <table class="mt" style="font-size:13px">
       <tbody>
         <tr>
@@ -300,7 +330,7 @@ function rowHtml(i) {
       <td>
         <button class="sm" onclick="openIp('${escapeHtml(i.instance_id)}','${escapeHtml(i.public_ip || '')}')">换 IP</button>
         <button class="sm" onclick="openResetPw('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}','${i.platform === 'windows' ? 1 : 0}')">重置密码</button>
-        <button class="sm danger" onclick="openReinstall('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}')">重装</button>
+        <button class="sm danger" onclick="openReinstall('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}','${i.platform === 'windows' ? 1 : 0}')">重装</button>
       </td>`;
 }
 
@@ -473,12 +503,17 @@ async function showPassword(id) {
 let RI_TARGET = null;
 let RI_IMAGES_LOADED = false;
 
-async function openReinstall(id, name) {
-  RI_TARGET = { instance_id: id };
+async function openReinstall(id, name, isWin) {
+  RI_TARGET = { instance_id: id, is_windows: isWin === '1' || isWin === 1 };
   document.getElementById('ri-target').textContent = `${name || id}（${id}）`;
   document.getElementById('ri-ami').value = '';
   document.getElementById('ri-image').value = '';
+  document.getElementById('ri-password').value = '';
+  document.getElementById('ri-pubkey').value = '';
+  document.getElementById('ri-cred-mode').value = '';
+  riCredMode();
   document.getElementById('ri-mask').classList.add('on');
+  riSsmProbe();
 
   if (!RI_IMAGES_LOADED) {
     // 镜像清单是本地静态数据，一次拿到就够；用当前区域的 catalog 接口取标签
@@ -498,6 +533,68 @@ async function openReinstall(id, name) {
     }
   }
   riPreflight();
+}
+
+// 改凭据只能走 SSM：user-data 只有停机才能改（停机会丢掉未绑弹性 IP 的公网
+// 地址），实例的 KeyName 属性又根本不可修改。所以先探一次，用不了就把这两个
+// 选项禁掉并说明原因，而不是让用户填完点了才发现设不上。
+let RI_SSM_OK = null;
+
+function riSsmProbe() {
+  const opts = document.getElementById('ri-cred-mode').options;
+  RI_SSM_OK = null;
+  for (const o of opts) if (o.value) o.disabled = true;
+  riCredMode();
+
+  const s = sel();
+  api(`/api/instances/ssm-status?account_id=${s.account_id}&region=${s.region}&instance_id=${RI_TARGET.instance_id}`)
+    .then(d => {
+      RI_SSM_OK = { ok: !!d.registered, reason: d.reason || '' };
+      for (const o of opts) {
+        if (!o.value) continue;
+        o.disabled = !d.registered || (o.value === 'key' && RI_TARGET.is_windows);
+      }
+      riCredMode();
+    })
+    .catch(e => {
+      RI_SSM_OK = { ok: false, reason: `SSM 状态检查失败: ${e.message}` };
+      riCredMode();
+    });
+}
+
+function riCredMode() {
+  const mode = document.getElementById('ri-cred-mode').value;
+  document.getElementById('ri-cred-pw').style.display = mode === 'password' ? '' : 'none';
+  document.getElementById('ri-cred-key').style.display = mode === 'key' ? '' : 'none';
+
+  const hint = document.getElementById('ri-cred-hint');
+  if (!mode) {
+    if (RI_SSM_OK && !RI_SSM_OK.ok) {
+      hint.style.display = '';
+      hint.innerHTML = '<span class="tag warn">改凭据不可用</span> '
+        + `<span class="mono" style="white-space:pre-wrap;font-size:12px">${escapeHtml(RI_SSM_OK.reason)}</span>`
+        + '<br>重装本身不受影响，原密钥对在新系统里照旧可用。';
+    } else {
+      hint.style.display = 'none';
+    }
+    return;
+  }
+  hint.style.display = '';
+  hint.innerHTML = mode === 'password'
+    ? '重装完成后通过 SSM 在新系统里设这个密码，并打开 SSH 密码登录。'
+      + '<strong>实例 ID 和 IP 都不变</strong> —— 走 user-data 的话必须停机，'
+      + '未绑弹性 IP 的实例停机就会丢掉公网地址。'
+    : '重装完成后把这把公钥写进新系统的 <code>authorized_keys</code>（追加，'
+      + '不覆盖原密钥对注入的那把）。'
+      + '<code>.ssh</code> 权限会设成 700/600，否则 sshd 的 StrictModes 会静默拒绝。';
+}
+
+function genReinstallPw() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%^&*-_=+';
+  const buf = new Uint32Array(20);
+  crypto.getRandomValues(buf);
+  document.getElementById('ri-password').value =
+    [...buf].map(n => chars[n % chars.length]).join('');
 }
 
 async function riPreflight() {
@@ -547,10 +644,19 @@ async function riPreflight() {
 async function doReinstall() {
   if (!RI_TARGET) return;
   const label = document.getElementById('ri-image').selectedOptions[0]?.textContent || '原系统';
+  const mode = document.getElementById('ri-cred-mode').value;
+  const password = mode === 'password' ? document.getElementById('ri-password').value : '';
+  const pubkey = mode === 'key' ? document.getElementById('ri-pubkey').value.trim() : '';
+  if (mode === 'password' && !password) return toast('请填写或生成 root 密码', 'err');
+  if (mode === 'key' && !pubkey) return toast('请粘贴 SSH 公钥', 'err');
+
+  const credLine = password
+    ? '\n重装后设置 root 密码并开启密码登录。'
+    : (pubkey ? '\n重装后写入你提供的 SSH 公钥。' : '');
   if (!confirm(`确认重装 ${RI_TARGET.instance_id}？\n\n`
       + `装成：${label}\n`
       + `根卷上的所有数据会被清空且不可恢复。\n`
-      + `实例 ID、IP、安全组、数据卷保留。`)) return;
+      + `实例 ID、IP、安全组、数据卷保留。${credLine}`)) return;
 
   document.getElementById('ri-mask').classList.remove('on');
   try {
@@ -561,7 +667,9 @@ async function doReinstall() {
         instance_id: RI_TARGET.instance_id,
         image_key: document.getElementById('ri-image').value,
         image_id: document.getElementById('ri-ami').value.trim(),
-        delete_old_volume: document.getElementById('ri-delete-old').checked
+        delete_old_volume: document.getElementById('ri-delete-old').checked,
+        root_password: password,
+        ssh_public_key: pubkey
       }
     });
     const task = await watchTask(r.task_id, '重装系统');
@@ -582,7 +690,17 @@ function showReinstallResult(d) {
   if (d.public_ip) rows.push(['公网 IP', `<span class="mono">${escapeHtml(d.public_ip)}</span>`]);
   rows.push(['内网 IP', `<span class="mono">${escapeHtml(d.private_ip || '-')}</span>`]);
   if (d.key_name) rows.push(['密钥对', `<span class="mono">${escapeHtml(d.key_name)}</span>（原私钥继续可用）`]);
-  if (d.ssh_user) rows.push(['登录用户', `<span class="mono">${escapeHtml(d.ssh_user)}</span>`]);
+  // 设了新凭据时不能再摆镜像的默认用户：那会和"公钥已写入 root"自相矛盾，
+  // 用户不知道该用哪个登录。
+  if (d.ssh_user && !d.creds_applied) {
+    rows.push(['登录用户', `<span class="mono">${escapeHtml(d.ssh_user)}</span>`]);
+  }
+  if (d.set_password) {
+    rows.push(['登录用户', `<span class="mono">${escapeHtml(d.login_user)}</span>（已设新密码，可密码登录）`]);
+  }
+  if (d.set_public_key) {
+    rows.push(['登录用户', `<span class="mono">${escapeHtml(d.login_user)}</span>（已写入你的公钥）`]);
+  }
   rows.push([
     d.os_family === 'windows' ? '连接方式' : 'SSH 命令',
     `<span class="mono" style="user-select:all">${escapeHtml(d.ssh_command)}</span>`
@@ -607,6 +725,10 @@ function showReinstallResult(d) {
       + '主机密钥已随根卷重建，先清掉本地旧记录再连：<br>'
       + `<span class="mono" style="user-select:all">${escapeHtml(d.known_hosts_hint)}</span>`
       + '</p>';
+  }
+  if (d.creds_note) {
+    html += '<p class="hint" style="margin:8px 0 0">'
+      + `<span class="tag warn">凭据未设上</span> ${escapeHtml(d.creds_note)}</p>`;
   }
   if (d.deleted_old_volume === false) {
     html += '<p class="hint" style="margin:8px 0 0">'

@@ -507,3 +507,157 @@ def test_page_renders_ssh_command_after_reinstall():
     for field in ("ssh_command", "ssh_user", "key_name", "known_hosts_hint"):
         assert f"d.{field}" in block, f"结果面板没有用到 {field}"
     assert "原私钥继续可用" in block
+
+
+# ---------- 重装后设置凭据 ----------
+
+REAL_ED25519 = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIMxGgW4kZ8HLmGpQnbnFhc6TThRRW3TnkS1EYQ8jSJZG"
+    " me@laptop"
+)
+
+
+def _online_ssm():
+    client = MagicMock()
+    client.describe_instance_information.return_value = {
+        "InstanceInformationList": [
+            {"InstanceId": IID, "PingStatus": "Online", "PlatformType": "Linux"}
+        ]
+    }
+    client.send_command.return_value = {"Command": {"CommandId": "cmd-1"}}
+    client.get_command_invocation.return_value = {"Status": "Success"}
+    return client
+
+
+def test_no_credentials_means_no_ssm_call(monkeypatch):
+    """不改凭据时一次 SSM 都不该调 —— 大多数实例没挂实例配置文件。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm") as factory:
+        out = reinstall.reinstall(CREDS, "us-east-1", IID)
+        factory.assert_not_called()
+
+    assert out["creds_applied"] is False
+    assert out["set_password"] is False
+
+
+def test_password_applied_after_reinstall(monkeypatch):
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr("aws_helper.core.respw._POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    ssm = _online_ssm()
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=ssm):
+        out = reinstall.reinstall(
+            CREDS, "us-east-1", IID, new_password="Str0ng!Pass1"
+        )
+        script = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+
+    assert out["creds_applied"] is True
+    assert out["set_password"] is True
+    assert out["login_user"] == "root"
+    assert "chpasswd" in script
+
+
+def test_public_key_applied_after_reinstall(monkeypatch):
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr("aws_helper.core.respw._POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    ssm = _online_ssm()
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=ssm):
+        out = reinstall.reinstall(
+            CREDS, "us-east-1", IID, new_public_key=REAL_ED25519
+        )
+        script = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+
+    assert out["set_public_key"] is True
+    assert "authorized_keys" in script
+
+
+def test_credentials_applied_only_after_success(monkeypatch):
+    """重装失败就不该去设凭据 —— 那台机器可能根本没有根卷。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["failed"])
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm") as factory:
+        with pytest.raises(reinstall.ReinstallError):
+            reinstall.reinstall(CREDS, "us-east-1", IID, new_password="Str0ng!Pass1")
+        factory.assert_not_called()
+
+
+def test_agent_never_returns_does_not_fail_reinstall(monkeypatch):
+    """根卷已经换好了，Agent 没回来只是凭据没设上，不能算重装失败。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr(reinstall, "_AGENT_WAIT", 0)
+    monkeypatch.setattr(reinstall, "_AGENT_POLL", 0)
+    session = _reinstall_session(["succeeded"])
+    offline = MagicMock()
+    offline.describe_instance_information.return_value = {"InstanceInformationList": []}
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=offline):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID, new_password="Str0ng!Pass1")
+
+    assert out["state"] == "succeeded"
+    assert out["creds_applied"] is False
+    assert "重置密码" in out["creds_note"]
+
+
+def test_credential_failure_surfaces_reason(monkeypatch):
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr("aws_helper.core.respw._POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    ssm = _online_ssm()
+    ssm.get_command_invocation.return_value = {
+        "Status": "Failed",
+        "StandardErrorContent": "sshd -t 校验失败",
+    }
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=ssm):
+        out = reinstall.reinstall(CREDS, "us-east-1", IID, new_password="Str0ng!Pass1")
+
+    assert out["state"] == "succeeded"
+    assert out["creds_applied"] is False
+    assert "sshd -t" in out["creds_note"]
+
+
+def test_password_never_in_result(monkeypatch):
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr("aws_helper.core.respw._POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=_online_ssm()):
+        out = reinstall.reinstall(
+            CREDS, "us-east-1", IID, new_password="TopSecret9!"
+        )
+
+    assert "TopSecret9!" not in str(out)
+
+
+def test_ssh_command_reflects_password_login(monkeypatch):
+    """设了密码就不用再提示 -i 私钥，否则用户以为还得找密钥文件。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr("aws_helper.core.respw._POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=_online_ssm()):
+        out = reinstall.reinstall(
+            CREDS, "us-east-1", IID, new_password="Str0ng!Pass1"
+        )
+
+    assert out["ssh_command"] == "ssh root@1.2.3.4"
+    assert ".pem" not in out["ssh_command"]
+
+
+def test_invalid_public_key_rejected_before_reinstall(monkeypatch):
+    """公钥不合法要在换根卷之前就挡住 —— 卷换完了再报错已经不可逆。"""
+    monkeypatch.setattr(reinstall, "_POLL_INTERVAL", 0)
+    session = _reinstall_session(["succeeded"])
+    with patch.object(reinstall.aws, "ec2", return_value=session), \
+            patch("aws_helper.core.respw._ssm", return_value=_online_ssm()):
+        with pytest.raises(Exception):
+            reinstall.reinstall(
+                CREDS, "us-east-1", IID, new_public_key="ssh-ed25519 bogus!!"
+            )

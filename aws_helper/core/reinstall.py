@@ -37,6 +37,10 @@ _POLL_INTERVAL = 10
 
 _TERMINAL = ("succeeded", "failed", "failed-detached")
 
+# 重装后 SSM Agent 要等新系统起来才重新注册，实测 1-3 分钟。
+_AGENT_WAIT = 300
+_AGENT_POLL = 15
+
 
 class ReinstallError(RuntimeError):
     """重装失败。"""
@@ -227,6 +231,58 @@ def _wait_task(
     )
 
 
+def _apply_new_credentials(
+    creds: aws.Credentials,
+    region: str,
+    instance_id: str,
+    login_user: str,
+    password: str,
+    public_key: str,
+    progress: ProgressFn,
+) -> dict[str, Any]:
+    """重装完设置新凭据。
+
+    只能走 SSM：user-data 只有停机才能改（停机会丢掉未绑弹性 IP 的公网地址），
+    而实例的 KeyName 属性根本不可修改。SSM 是唯一既保住 IP 又能改凭据的路。
+
+    Agent 要等新系统起来并重新注册，所以先轮询等它回来。等不到不算重装失败 ——
+    根卷已经换好了，只是凭据没设上，报告里说清楚让用户手动补。
+    """
+    from . import respw
+
+    deadline = time.time() + _AGENT_WAIT
+    while time.time() < deadline:
+        status = respw.ssm_status(creds, region, instance_id)
+        if status["registered"]:
+            break
+        progress(f"等待 SSM Agent 回来（{status.get('ping_status') or '未注册'}）")
+        time.sleep(_AGENT_POLL)
+    else:
+        return {
+            "applied": False,
+            "reason": (
+                f"重装成功，但等了 {_AGENT_WAIT}s SSM Agent 仍未在新系统上注册，"
+                "凭据没能设置。可稍后在实例页用「重置密码」重试"
+            ),
+        }
+
+    progress("设置新的登录凭据")
+    try:
+        respw.reset_password(
+            creds,
+            region,
+            instance_id,
+            password=password,
+            user=login_user,
+            public_key=public_key,
+            progress=progress,
+        )
+    except respw.PasswordResetError as exc:
+        return {"applied": False, "reason": f"重装成功，但设置凭据失败: {exc}"}
+
+    return {"applied": True, "reason": ""}
+
+
 def reinstall(
     creds: aws.Credentials,
     region: str,
@@ -235,6 +291,8 @@ def reinstall(
     image_id: str = "",
     delete_old_volume: bool = True,
     progress: ProgressFn = _noop,
+    new_password: str = "",
+    new_public_key: str = "",
 ) -> dict[str, Any]:
     """重装系统。image_key/image_id 都不传 = 用原镜像重铺。
 
@@ -242,6 +300,16 @@ def reinstall(
     通常就是不要那些数据了。想留证据可以传 delete_old_volume=False。
     """
     progress("检查重装前提")
+    if new_public_key:
+        # 必须在换根卷之前校验：卷一换就不可逆了，等设凭据时才发现公钥是废的，
+        # 用户已经丢了整个根卷还登不进去。
+        from . import respw
+
+        try:
+            new_public_key = respw.validate_public_key(new_public_key)
+        except respw.PasswordResetError as exc:
+            raise ReinstallError(str(exc)) from exc
+
     checks = preflight(creds, region, instance_id, image_key, image_id)
     if not checks["ok"]:
         raise ReinstallError("；".join(checks["problems"]))
@@ -297,6 +365,28 @@ def reinstall(
     else:
         ssh_command = f"ssh -i {key_name or '<私钥>'}.pem {ssh_user}@{public_ip}"
 
+    creds_applied = False
+    creds_note = ""
+    login_user = ""
+    if new_password or new_public_key:
+        login_user = "Administrator" if windows else "root"
+        outcome = _apply_new_credentials(
+            creds,
+            region,
+            instance_id,
+            login_user,
+            new_password,
+            new_public_key,
+            progress,
+        )
+        creds_applied = outcome["applied"]
+        creds_note = outcome["reason"]
+        if creds_applied and public_ip and not windows:
+            if new_password:
+                ssh_command = f"ssh {login_user}@{public_ip}"
+            else:
+                ssh_command = f"ssh -i <你的私钥> {login_user}@{public_ip}"
+
     return {
         "instance_id": instance_id,
         "task_id": task_id,
@@ -312,6 +402,11 @@ def reinstall(
         "ssh_user": ssh_user,
         "os_family": checks["os_family"],
         "ssh_command": ssh_command,
+        "creds_applied": creds_applied,
+        "creds_note": creds_note,
+        "login_user": login_user,
+        "set_password": creds_applied and bool(new_password),
+        "set_public_key": creds_applied and bool(new_public_key),
         # 主机密钥随根卷一起重建，老的 known_hosts 记录会导致连接被拒
         "known_hosts_hint": (
             f"ssh-keygen -R {public_ip}" if public_ip and not windows else ""

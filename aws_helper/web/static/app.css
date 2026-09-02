@@ -248,6 +248,10 @@ td.mono, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-siz
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 22px;
+  /* 内容高过视口时弹窗内部滚动。没有这两行的话 flex 居中会把顶部推成负值，
+     底部的确认/取消按钮被挤出屏幕，用户点不到也滚不到。 */
+  max-height: 90vh;
+  overflow-y: auto;
 }
 
 .bar { height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin: 12px 0; }

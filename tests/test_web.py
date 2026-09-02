@@ -906,3 +906,230 @@ def test_instances_page_shows_login_column():
     assert "function credCell" in html
     assert "showPassword" in html
     assert 'colspan="8"' not in html, "加了一列，空态的 colspan 也要跟着改"
+
+
+# ---------- 重装时重设凭据 ----------
+
+REAL_PUBKEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIMxGgW4kZ8HLmGpQnbnFhc6TThRRW3TnkS1EYQ8jSJZG"
+    " me@laptop"
+)
+
+
+def _reinstall_result(**over):
+    base = {
+        "instance_id": "i-1",
+        "task_id": "rrvt-1",
+        "state": "succeeded",
+        "image_id": "ami-new",
+        "image_label": "Ubuntu 24.04",
+        "deleted_old_volume": True,
+        "elapsed_sec": 12,
+        "private_ip": "10.0.0.5",
+        "public_ip": "1.2.3.4",
+        "kept_volumes": [],
+        "key_name": "prod-key",
+        "ssh_user": "ubuntu",
+        "os_family": "linux",
+        "ssh_command": "ssh root@1.2.3.4",
+        "creds_applied": True,
+        "creds_note": "",
+        "login_user": "root",
+        "set_password": False,
+        "set_public_key": False,
+    }
+    base.update(over)
+    return base
+
+
+def test_reinstall_rejects_weak_password(client):
+    """重装后设的密码要开着 SSH 密码登录，弱口令等于把机器交出去。"""
+    c, aid, app_module = client
+    r = c.post(
+        "/api/instances/reinstall",
+        json={
+            "account_id": aid,
+            "region": "us-east-1",
+            "instance_id": "i-1",
+            "root_password": "123456",
+        },
+    )
+    assert r.status_code == 400
+    assert "密码" in r.json()["error"]
+
+
+def test_reinstall_rejects_bad_public_key(client):
+    """乱填的公钥写进去不报错，但登录静默失败 —— 必须当场挡住。"""
+    c, aid, app_module = client
+    r = c.post(
+        "/api/instances/reinstall",
+        json={
+            "account_id": aid,
+            "region": "us-east-1",
+            "instance_id": "i-1",
+            "ssh_public_key": "-----BEGIN OPENSSH PRIVATE KEY-----",
+        },
+    )
+    assert r.status_code == 400
+    assert "私钥" in r.json()["error"]
+
+
+def test_reinstall_password_forwarded_and_recorded(client):
+    """重装时设的密码要传给 core，并且记进凭据表让面板能查。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.reinstall, "reinstall") as fake:
+        fake.return_value = _reinstall_result(set_password=True)
+        wait_task(
+            c,
+            c.post(
+                "/api/instances/reinstall",
+                json={
+                    "account_id": aid,
+                    "region": "us-east-1",
+                    "instance_id": "i-1",
+                    "root_password": "Str0ng!Pass1",
+                },
+            ).json()["task_id"],
+        )
+        assert fake.call_args.kwargs["new_password"] == "Str0ng!Pass1"
+
+    row = app_module.store.instance_creds(aid, "us-east-1", "i-1")
+    assert row["auth_method"] == "password"
+    assert row["login_user"] == "root"
+    assert app_module.store.instance_password(aid, "us-east-1", "i-1") == "Str0ng!Pass1"
+
+
+def test_reinstall_public_key_forwarded(client):
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.reinstall, "reinstall") as fake:
+        fake.return_value = _reinstall_result(set_public_key=True)
+        wait_task(
+            c,
+            c.post(
+                "/api/instances/reinstall",
+                json={
+                    "account_id": aid,
+                    "region": "us-east-1",
+                    "instance_id": "i-1",
+                    "ssh_public_key": REAL_PUBKEY,
+                },
+            ).json()["task_id"],
+        )
+        assert fake.call_args.kwargs["new_public_key"] == REAL_PUBKEY
+
+    row = app_module.store.instance_creds(aid, "us-east-1", "i-1")
+    assert row["auth_method"] == "key"
+    assert row["has_password"] is False
+
+
+def test_reinstall_without_creds_keeps_key_record(client):
+    """不改凭据的重装照旧记密钥登录，登录用户跟着新系统变。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.reinstall, "reinstall") as fake:
+        fake.return_value = _reinstall_result(creds_applied=False)
+        wait_task(
+            c,
+            c.post(
+                "/api/instances/reinstall",
+                json={"account_id": aid, "region": "us-east-1", "instance_id": "i-1"},
+            ).json()["task_id"],
+        )
+
+    row = app_module.store.instance_creds(aid, "us-east-1", "i-1")
+    assert row["auth_method"] == "key"
+    assert row["login_user"] == "ubuntu"
+
+
+def test_failed_credential_application_not_recorded_as_password(client):
+    """SSM 没设上就不能记成密码登录 —— 面板会显示一个登不进去的密码。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.reinstall, "reinstall") as fake:
+        fake.return_value = _reinstall_result(
+            creds_applied=False,
+            creds_note="重装成功，但等了 300s SSM Agent 仍未注册",
+        )
+        wait_task(
+            c,
+            c.post(
+                "/api/instances/reinstall",
+                json={
+                    "account_id": aid,
+                    "region": "us-east-1",
+                    "instance_id": "i-1",
+                    "root_password": "Str0ng!Pass1",
+                },
+            ).json()["task_id"],
+        )
+
+    row = app_module.store.instance_creds(aid, "us-east-1", "i-1")
+    assert row["auth_method"] == "key", "凭据没设上就不能记成密码"
+    assert row["has_password"] is False
+
+
+def test_reinstall_password_not_in_log(client):
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.reinstall, "reinstall") as fake:
+        fake.return_value = _reinstall_result(set_password=True)
+        wait_task(
+            c,
+            c.post(
+                "/api/instances/reinstall",
+                json={
+                    "account_id": aid,
+                    "region": "us-east-1",
+                    "instance_id": "i-1",
+                    "root_password": "Str0ng!Pass1",
+                },
+            ).json()["task_id"],
+        )
+
+    logs = c.get("/api/logs").json()["logs"]
+    assert "Str0ng!Pass1" not in str(logs)
+
+
+def test_reinstall_dialog_has_credential_section():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "ri-cred-mode" in html
+    assert "ri-password" in html
+    assert "ri-pubkey" in html
+    assert "function riSsmProbe" in html
+    assert "root_password: password" in html
+    assert "ssh_public_key: pubkey" in html
+
+
+def test_result_shows_single_login_user():
+    """设了新凭据就不能再摆镜像默认用户 —— 会出现「登录用户 ubuntu」和
+    「公钥已写入 root」自相矛盾，用户不知道该用哪个登录。浏览器实测过。
+    """
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "d.ssh_user && !d.creds_applied" in html
+
+
+def test_modal_scrolls_when_taller_than_viewport():
+    """弹窗高过视口时必须能内部滚动。
+
+    加了凭据区后重装弹窗实测 841px，超过 720p 视口。没有 max-height +
+    overflow 的话 flex 居中会把顶部推成负值（实测 -61px），确认按钮被挤出
+    屏幕且无法滚到 —— 用户根本点不了。
+    """
+    from pathlib import Path
+
+    css = Path("aws_helper/web/static/app.css").read_text()
+    box = css.split(".mask .box {")[1].split("}")[0]
+    assert "max-height" in box
+    assert "overflow-y: auto" in box

@@ -361,6 +361,9 @@ Lightsail 栏需要：`lightsail:GetRegions` `lightsail:GetBundles` `lightsail:G
 
 重装系统需要：`ec2:CreateReplaceRootVolumeTask` `ec2:DescribeReplaceRootVolumeTasks`，
 另外预检要 `ec2:DescribeInstances` 和 `ec2:DescribeImages`（这两个开机流程已经在用）。
+重装时勾了「设 root 密码」或「写入 SSH 公钥」还要上面那三个 SSM 权限 ——
+这一步只能走 SSM：改 user-data 要求实例停机（会丢公网 IP），而 `KeyName`
+属性根本不可修改。
 
 Bedrock 栏需要：`bedrock:ListFoundationModels`、`bedrock:ListInferenceProfiles`，
 调用测试还要 `bedrock:InvokeModel`（Converse 走同一权限），且需在 Bedrock 控制台的
@@ -412,6 +415,10 @@ root 密码只存在于 user-data 里，不记下来开完机就找不回来了�
 重置密码、重装、终止三个时机会同步更新或删除这份记录 —— 实例 ID 会被 AWS 复用，
 终止不删会让下一台同 ID 的机器显示错的凭据。
 
+重装时勾了「设 root 密码」会记下新密码，勾了「写入 SSH 公钥」记成密钥登录。
+**只有 SSM 真的设成功才改记录** —— Agent 没回来就写成密码登录的话，
+面板会显示一个登不进去的密码。
+
 ## 凭据存储
 
 AWS Secret Access Key 和代理地址用 Fernet 加密后存 Postgres，页面只显示掩码。
@@ -441,7 +448,7 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-679 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+717 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、

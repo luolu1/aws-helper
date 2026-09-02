@@ -132,6 +132,57 @@ Ubuntu 是 `ubuntu`、Debian 是 `admin`、Amazon Linux / RHEL 是 `ec2-user`，
 **原私钥继续可用。** 换根卷不影响实例的 KeyName 属性，新根卷的 cloud-init
 照旧从 IMDS 取同一个公钥，不需要重新生成密钥对。
 
+**重装时可以顺手换掉登录凭据**
+
+弹窗里「重装后的登录凭据」三选一：
+
+| 选项 | 做什么 |
+|---|---|
+| 沿用原密钥对（默认） | 什么都不改，原私钥在新系统里照旧可用 |
+| 设一个 root 密码 | 重装完设密码并打开 SSH 密码登录，之后 `ssh root@IP` 即可 |
+| 写入我自己的 SSH 公钥 | 把你粘的公钥**追加**进新系统的 `authorized_keys` |
+
+**这一步走 SSM，不走 user-data。** 这不是偷懒，是只有这条路走得通：
+
+- `ModifyInstanceAttribute` 改 user-data **要求实例处于 stopped 状态**，
+  而停机会让没绑弹性 IP 的实例丢掉公网地址 —— 重装的卖点正是"IP 不变"
+- 实例的 `KeyName` 属性**根本不在可修改属性列表里**，换密钥对这条路不存在
+
+所以点开弹窗会先探一次 SSM 注册状态，用不了就把这两个选项**禁掉并显示原因**，
+而不是让你填完点了才发现设不上。重装本身不受影响，确认按钮照常可用。
+
+```
+改凭据不可用  实例未注册到 SSM。需要挂带 AmazonSSMManagedInstanceCore
+             的 IAM 实例配置文件（控制台「操作 → 安全 → 修改 IAM 角色」）
+重装本身不受影响，原密钥对在新系统里照旧可用。
+```
+
+**顺序在这里有讲究。** 换根卷完成后 SSM Agent 要等新系统起来才重新注册，
+实测 1-3 分钟，所以会轮询等它回来（上限 5 分钟）再下发命令。**等不到不算重装失败** ——
+根卷已经换好了，只是凭据没设上，结果面板会标出来让你之后用「重置密码」补：
+
+```
+凭据未设上  重装成功，但等了 300s SSM Agent 仍未在新系统上注册，
+           凭据没能设置。可稍后在实例页用「重置密码」重试
+```
+
+**公钥当场校验，不合法就不动根卷。** 乱填的公钥写进 `authorized_keys` 不报错，
+但登录时静默失败。所以在下发换根卷之前先验：类型前缀在白名单里、主体是合法
+base64、且 base64 内部声明的类型和前缀一致（把两把键拼起来能过 base64 检查）。
+粘成私钥是最常见的误操作，报错会直接点明。
+
+**写 authorized_keys 的权限必须对。** OpenSSH 的 `StrictModes` 默认开启，
+`.ssh` 目录或文件属主不对、权限过宽时会**静默拒绝**该公钥，日志里只有一句
+`Authentication refused: bad ownership or modes`。所以目录 700、文件 600、
+属主设成目标用户，家目录从 `getent passwd` 读而不是假设 `/home/<user>`
+（root 的家是 `/root`）。这些都在真实 sshd 上验证过。
+
+**追加而不是覆盖** —— 覆盖会踢掉 AWS 密钥对注入的那把公钥，你原来的私钥就废了。
+重复执行也不会堆积同一把公钥。
+
+设了新凭据时结果面板只显示一个登录用户，不再摆镜像的默认用户 ——
+「登录用户 ubuntu」和「公钥已写入 root」并排出现只会让人不知道该用哪个。
+
 **主机密钥会重建**，旧的 `known_hosts` 记录会让连接被拒，所以结果里直接给出
 要执行的清理命令：
 
@@ -139,7 +190,8 @@ Ubuntu 是 `ubuntu`、Debian 是 `admin`、Amazon Linux / RHEL 是 `ec2-user`，
 ssh-keygen -R 1.2.3.4
 ```
 
-Windows 实例给的是 RDP 地址而不是 SSH 命令。
+Windows 实例给的是 RDP 地址而不是 SSH 命令，也不支持写入公钥
+（EC2Launch 不读 `authorized_keys`，静默不生效比直接拒绝更难查）。
 
 **重置实例登录密码**
 
@@ -935,12 +987,13 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-679 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+717 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
 DDNS 一键脚本（两层 bash 语法检查 + 对着假 Cloudflare 真实执行）、
-SSM 重置密码（前提检查与脚本内容）、重装系统（架构校验与失败态）、
+SSM 重置密码（前提检查与脚本内容）、重装系统（架构校验与失败态、
+重装后设密码/写公钥、SSH 公钥格式校验、authorized_keys 权限与追加语义）、
 部署脚本静态检查。
 
 代理相关测试会起一个真实的 SOCKS5 服务器（支持 RFC 1929 认证），
@@ -984,7 +1037,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                679 项测试
+tests/                717 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

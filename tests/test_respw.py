@@ -321,3 +321,156 @@ def test_progress_is_reported(monkeypatch):
 
     assert any("SSM" in s for s in seen)
     assert any("下发" in s for s in seen)
+
+
+# ---------- SSH 公钥校验 ----------
+
+# 真实 ed25519 公钥。硬编码而不是每次 ssh-keygen：测试不该依赖外部二进制，
+# 而这串必须是 OpenSSH 真正产出的格式，校验函数会解析 base64 内部的类型名。
+REAL_ED25519 = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIMxGgW4kZ8HLmGpQnbnFhc6TThRRW3TnkS1EYQ8jSJZG"
+    " me@laptop"
+)
+
+
+def test_accepts_real_openssh_public_key():
+    out = respw.validate_public_key(REAL_ED25519)
+    assert out.startswith("ssh-ed25519 AAAAC3")
+    assert out.endswith("me@laptop")
+
+
+def test_public_key_newlines_are_flattened():
+    """从文件里复制常带换行，写进 authorized_keys 会拆成两条无效行。"""
+    out = respw.validate_public_key("ssh-ed25519\n" + REAL_ED25519.split(" ", 1)[1])
+    assert "\n" not in out
+
+
+def test_private_key_paste_is_caught():
+    """最常见的误操作是粘了私钥，报错必须点明。"""
+    with pytest.raises(respw.PasswordResetError, match="私钥"):
+        respw.validate_public_key(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabcd\n-----END OPENSSH PRIVATE KEY-----"
+        )
+
+
+def test_unknown_key_type_rejected():
+    with pytest.raises(respw.PasswordResetError, match="不支持的公钥类型"):
+        respw.validate_public_key("ssh-foo AAAAC3NzaC1lZDI1NTE5")
+
+
+def test_body_must_be_base64():
+    with pytest.raises(respw.PasswordResetError, match="base64"):
+        respw.validate_public_key("ssh-ed25519 not-base64!!!!")
+
+
+def test_type_prefix_must_match_body():
+    """把两把不同的键拼起来是能过 base64 的，但登录时静默失败。"""
+    body = REAL_ED25519.split(" ")[1]
+    with pytest.raises(respw.PasswordResetError, match="不符"):
+        respw.validate_public_key(f"ssh-rsa {body}")
+
+
+def test_empty_public_key_rejected():
+    with pytest.raises(respw.PasswordResetError, match="请粘贴"):
+        respw.validate_public_key("   ")
+
+
+# ---------- 写入 authorized_keys ----------
+
+
+def test_pubkey_script_sets_strict_modes_permissions():
+    """sshd 的 StrictModes 默认开启，权限过宽会静默拒绝该公钥。"""
+    script = respw._linux_script("root", public_key=REAL_ED25519)
+    assert "install -d -m 700" in script
+    assert "chmod 600" in script
+    assert 'chown "$target_user"' in script
+
+
+def test_pubkey_script_appends_not_overwrites():
+    """覆盖会踢掉 AWS 密钥对注入的那把公钥，用户原私钥就登不进了。"""
+    script = respw._linux_script("root", public_key=REAL_ED25519)
+    assert ">> \"$home/.ssh/authorized_keys\"" in script
+    assert "grep -qxF" in script
+
+
+def test_pubkey_script_resolves_home_from_passwd():
+    """不能假设 /home/<user>：root 是 /root，某些镜像的默认用户也不在 /home。"""
+    script = respw._linux_script("ubuntu", public_key=REAL_ED25519)
+    assert "getent passwd" in script
+    assert "/home/ubuntu" not in script
+
+
+def test_pubkey_only_script_has_no_chpasswd():
+    script = respw._linux_script("root", public_key=REAL_ED25519)
+    assert "chpasswd" not in script
+    assert "PubkeyAuthentication yes" in script
+
+
+def test_password_only_script_has_no_authorized_keys():
+    script = respw._linux_script("root", password="Str0ng!Pass1")
+    assert "authorized_keys" not in script
+    assert "chpasswd" in script
+
+
+def test_both_credentials_in_one_script():
+    script = respw._linux_script("root", password="Str0ng!Pass1", public_key=REAL_ED25519)
+    assert "chpasswd" in script
+    assert "authorized_keys" in script
+    # sshd 只重启一次，两段配置都写完之后
+    assert script.count("systemctl restart sshd") == 1
+
+
+def test_pubkey_fragment_sorts_after_password_fragment():
+    """两个片段都写 PermitRootLogin，OpenSSH 是首个生效，文件名顺序决定结果。
+
+    密码片段（00-aws-helper-password.conf）必须排在公钥片段
+    （00-aws-helper-pubkey.conf）之前，否则 prohibit-password 会先生效，
+    密码登录被静默挡掉 —— 用户设了密码却登不进去。实测 sshd -T 确认过。
+    """
+    script = respw._linux_script("root", password="Str0ng!Pass1", public_key=REAL_ED25519)
+    assert "00-aws-helper-password.conf" in script
+    assert "00-aws-helper-pubkey.conf" in script
+    assert "00-aws-helper-password.conf" < "00-aws-helper-pubkey.conf"
+
+
+def test_script_needs_at_least_one_credential():
+    with pytest.raises(respw.PasswordResetError, match="至少"):
+        respw._linux_script("root")
+
+
+def test_reset_accepts_public_key_only():
+    with patch.object(respw, "_ssm") as factory:
+        client = factory.return_value
+        client.describe_instance_information.return_value = _online()
+        client.send_command.return_value = {"Command": {"CommandId": "cmd-9"}}
+        client.get_command_invocation.return_value = {"Status": "Success"}
+        out = respw.reset_password(
+            CREDS, "us-east-1", IID, public_key=REAL_ED25519
+        )
+        script = client.send_command.call_args.kwargs["Parameters"]["commands"][0]
+
+    assert out["set_public_key"] is True
+    assert out["set_password"] is False
+    assert "authorized_keys" in script
+
+
+def test_reset_rejects_neither_credential():
+    with pytest.raises(respw.PasswordResetError, match="密码或 SSH 公钥"):
+        respw.reset_password(CREDS, "us-east-1", IID)
+
+
+def test_windows_rejects_public_key():
+    """EC2Launch 不读 authorized_keys，静默不生效比直接报错更难查。"""
+    with pytest.raises(respw.PasswordResetError, match="Windows"):
+        respw.reset_password(
+            CREDS, "us-east-1", IID, public_key=REAL_ED25519, is_windows=True
+        )
+
+
+def test_bad_public_key_rejected_before_any_aws_call():
+    """校验要在 SSM 之前，否则白跑一次注册状态查询。"""
+    with patch.object(respw, "_ssm") as factory:
+        with pytest.raises(respw.PasswordResetError):
+            respw.reset_password(CREDS, "us-east-1", IID, public_key="ssh-ed25519 zzz!")
+        factory.assert_not_called()

@@ -1132,13 +1132,36 @@ async def api_reinstall(request: Request, _: None = Guard):
     image_key = (body.get("image_key") or "").strip()
     image_id = (body.get("image_id") or "").strip()
     delete_old = bool(body.get("delete_old_volume", True))
+    new_password = body.get("root_password") or ""
+    new_public_key = (body.get("ssh_public_key") or "").strip()
+
+    # 重装后设的密码同样要开着 SSH 密码登录，弱口令等于把机器交出去。
+    if new_password:
+        try:
+            auth.validate_strength(new_password)
+        except auth.PasswordError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    if new_public_key:
+        try:
+            new_public_key = respw.validate_public_key(new_public_key)
+        except respw.PasswordResetError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     creds = store.credentials(account_id, region)
 
     def job(progress: Any) -> dict[str, Any]:
         try:
             result = reinstall.reinstall(
-                creds, region, instance_id, image_key, image_id, delete_old, progress
+                creds,
+                region,
+                instance_id,
+                image_key,
+                image_id,
+                delete_old,
+                progress,
+                new_password=new_password,
+                new_public_key=new_public_key,
             )
         except reinstall.ReinstallError as exc:
             store.log("reinstall", instance_id, False, str(exc)[:400])
@@ -1148,7 +1171,31 @@ async def api_reinstall(request: Request, _: None = Guard):
             cache.drop(*ec2_instances_key(account_id, region))
         # 换了系统登录用户可能变了（Ubuntu→ubuntu、Debian→admin），
         # 而根卷重铺后原来设的 root 密码也没了 —— 凭据记录改回密钥登录。
-        if result.get("ssh_user"):
+        # 但如果这次重装顺带设了新凭据且设置成功，就记新的那套。
+        applied = result.get("creds_applied")
+        if applied and new_password:
+            store.save_instance_creds(
+                account_id,
+                region,
+                instance_id,
+                auth_method="password",
+                login_user=result.get("login_user") or "root",
+                password=new_password,
+                os_family=result.get("os_family", "linux"),
+                note=f"重装于 {result['image_id']} 并设置密码",
+            )
+        elif applied and new_public_key:
+            store.save_instance_creds(
+                account_id,
+                region,
+                instance_id,
+                auth_method="key",
+                login_user=result.get("login_user") or "root",
+                key_name=result.get("key_name", ""),
+                os_family=result.get("os_family", "linux"),
+                note=f"重装于 {result['image_id']}，已写入自备公钥",
+            )
+        elif result.get("ssh_user"):
             store.save_instance_creds(
                 account_id,
                 region,
