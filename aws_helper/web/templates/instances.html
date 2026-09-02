@@ -279,6 +279,8 @@ const SNAP_PREFIX = 'inst_snapshot:';
 // 每个 (账号, 区域) 各存一份，来回切不会互相覆盖。留 12 份够用，
 // 超了丢最旧的 —— localStorage 只有 5MB 左右，实例多的账号一份就不小。
 const SNAP_MAX = 12;
+// 快照结构版本。给实例对象加字段就要 +1，否则旧快照会缺字段。
+const SNAP_VERSION = 2;
 
 function snapKey(s) {
   return `${SNAP_PREFIX}${s.account_id}|${s.region}`;
@@ -302,6 +304,7 @@ function pruneSnapshots() {
 function saveSnapshot() {
   try {
     localStorage.setItem(snapKey(sel()), JSON.stringify({
+      v: SNAP_VERSION,
       at: Date.now(),
       fingerprint: FINGERPRINT,
       instances: INSTANCES,
@@ -316,7 +319,12 @@ function saveSnapshot() {
 function loadSnapshot() {
   try {
     const raw = localStorage.getItem(snapKey(sel()));
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const snap = JSON.parse(raw);
+    // 版本不符就当没快照。加新字段时旧快照里没有它，渲染出来的行会缺东西
+    // 或者被判断成别的意思 —— 宁可让用户点一次刷新，也不要显示错的。
+    // 加字段时把 SNAP_VERSION 加 1。
+    return snap && snap.v === SNAP_VERSION ? snap : null;
   } catch (e) {
     return null;
   }
@@ -546,18 +554,30 @@ async function terminateWithCleanup(ids) {
   }
 }
 
+// 前端自己判断机型族，不依赖后端返回的 burstable 字段 —— 快照是持久化的，
+// 旧快照里没有后来新增的字段，只靠后端字段会让整个功能对老用户失效。
+const BURSTABLE_FAMILIES = ['t2', 't3', 't3a', 't4g'];
+
+function isBurstable(instanceType) {
+  const family = (instanceType || '').split('.')[0].toLowerCase();
+  return BURSTABLE_FAMILIES.includes(family);
+}
+
 // unlimited 会在 CPU 积分耗尽后按超额积分继续计费，所以标红并给一键改回。
 // 非 T 机型没有积分概念，显示横线而不是空白 —— 空白看着像没查到。
 function creditCell(i) {
-  if (!i.burstable) return '<span class="hint">—</span>';
-  if (i.cpu_credits === 'unlimited') {
-    return '<span class="tag err" style="font-size:11px">unlimited</span>'
-      + ` <button class="sm" onclick="setCreditMode(['${escapeHtml(i.instance_id)}'],'standard')">改回</button>`;
-  }
+  if (!isBurstable(i.instance_type)) return '<span class="hint">—</span>';
   if (i.cpu_credits === 'standard') {
     return '<span class="tag ok" style="font-size:11px">standard</span>';
   }
-  return '<span class="hint">未知</span>';
+  // unlimited 要标红。查不到当前值（缺 IAM 权限，或快照是加这个字段之前存的）
+  // 也照样给按钮 —— 不知道当前值不代表不能设成 standard。
+  const label = i.cpu_credits === 'unlimited' ? '改回' : '改为 standard';
+  const tag = i.cpu_credits === 'unlimited'
+    ? '<span class="tag err" style="font-size:11px">unlimited</span>'
+    : '<span class="hint">未知</span>';
+  return `${tag} <button class="sm"`
+    + ` onclick="setCreditMode(['${escapeHtml(i.instance_id)}'],'standard')">${label}</button>`;
 }
 
 async function setCreditMode(ids, mode) {  if (mode === 'standard' && !confirm(
@@ -579,11 +599,22 @@ async function setCreditMode(ids, mode) {  if (mode === 'standard' && !confirm(
 // 只挑选中的 T 实例：非 T 机型传给 ModifyInstanceCreditSpecification 会被
 // AWS 拒绝，整批都失败。
 function fixSelectedCredits() {
-  const ids = picked().filter(id => {
+  const chosen = picked();
+  if (!chosen.length) return toast('请先勾选实例', 'err');
+  const ids = chosen.filter(id => {
     const inst = INSTANCES.find(i => i.instance_id === id);
-    return inst && inst.burstable;
+    return inst && isBurstable(inst.instance_type);
   });
-  if (!ids.length) return toast('请勾选至少一台 T 系列实例', 'err');
+  if (!ids.length) {
+    const types = chosen.map(id => {
+      const inst = INSTANCES.find(i => i.instance_id === id);
+      return inst ? inst.instance_type : id;
+    });
+    return toast(
+      `勾选的 ${types.join('、')} 不是 T 系列（t2/t3/t3a/t4g），没有 CPU 积分概念`,
+      'err'
+    );
+  }
   setCreditMode(ids, 'standard');
 }
 

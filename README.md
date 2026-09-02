@@ -566,17 +566,27 @@ CreditSpecification={CpuCredits=standard}
 
 ```
 规格        CPU 积分
-t3.micro    unlimited  [改回]      ← 标红，点一下改成 standard
-t3.small    standard               ← 绿色
-c5.large    —                      ← 非突发机型，没有积分概念
+t3.micro    unlimited  [改回]         ← 标红，点一下改成 standard
+t3.small    standard                  ← 绿色
+t3.large    未知  [改为 standard]     ← 查不到当前值，但照样能改
+c5.large    —                         ← 非突发机型，没有积分概念
 ```
 
 勾选多台后点「改为 standard」可批量修改，会自动过滤掉非 T 机型 ——
-混在一起提交 AWS 会让整批失败。
+混在一起提交 AWS 会让整批失败。勾的全是非 T 机型时报错会**列出实际机型**
+（「勾选的 c5.large 不是 T 系列」），而不是笼统一句「请勾选 T 系列」。
+
+**是不是 T 系列由前端按机型名判断，不依赖后端字段。** 这里踩过一次：
+最初只看后端返回的 `burstable`，结果老用户浏览器里的快照存于加这个字段之前，
+`t3.micro` 被当成非 T，点批量改直接报「请勾选至少一台 T 系列实例」。
+所以快照带了结构版本号，加字段就 +1，版本不符时丢弃并提示重新加载 ——
+宁可让用户多点一次刷新，也不要用缺字段的数据渲染出错误的行。
 
 查积分模式是单独一次 `DescribeInstanceCreditSpecifications`（`DescribeInstances`
-的返回里没有这个字段），只对 T 实例发起；缺 `ec2:DescribeInstanceCreditSpecifications`
-权限时那一列留空，但实例列表照常显示 —— 不因为一个附加字段拉不到就整页失败。
+的返回里没有这个字段），只对 T 实例发起。缺
+`ec2:DescribeInstanceCreditSpecifications` 权限时显示「未知」，
+但**按钮照样给** —— 不知道当前值不代表不能设成 standard。实例列表也照常显示，
+不因为一个附加字段拉不到就整页失败。
 
 **关于测试**
 
@@ -1059,7 +1069,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-743 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+747 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -1109,7 +1119,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                743 项测试
+tests/                747 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

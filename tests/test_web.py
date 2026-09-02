@@ -1341,4 +1341,63 @@ def test_bulk_fix_filters_non_burstable():
 
     html = Path("aws_helper/web/templates/instances.html").read_text()
     body = html.split("function fixSelectedCredits()")[1].split("\n}")[0]
-    assert "inst.burstable" in body
+    assert "isBurstable(inst.instance_type)" in body
+
+
+def test_credit_cell_uses_instance_type_not_backend_flag():
+    """机型判断必须前端自己算。
+
+    用户实测报的 bug：t3.micro 点批量改报「请勾选至少一台 T 系列实例」。
+    原因是过滤条件读 inst.burstable，而这个字段是后端新加的 —— 用户
+    localStorage 里的快照存于加字段之前，没有它，整台机器被当成非 T。
+    """
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "function isBurstable" in html
+    assert "BURSTABLE_FAMILIES" in html
+    assert "!i.burstable" not in html, "不能只靠后端字段判断"
+    assert "inst.burstable" not in html, "不能只靠后端字段判断"
+
+    cell = html.split("function creditCell")[1].split("\n}")[0]
+    assert "isBurstable(i.instance_type)" in cell
+
+
+def test_unknown_credit_mode_still_offers_fix():
+    """查不到当前模式也要能改 —— 不知道当前值不代表不能设成 standard。
+
+    缺 IAM 权限、或快照存于加 cpu_credits 之前，都会落到这个分支。
+    """
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    cell = html.split("function creditCell")[1].split("\n}")[0]
+    assert "未知" in cell
+    unknown_part = cell.split("未知")[1]
+    assert "setCreditMode" in unknown_part, "未知状态也要给按钮"
+
+
+def test_snapshot_has_version_field():
+    """加字段就要 +1 版本，否则旧快照缺字段会渲染出错误的行。
+
+    这次 t3.micro 的 bug 根源就是旧快照被当成新结构用。
+    """
+    from pathlib import Path
+
+    for name in ("instances", "lightsail"):
+        html = Path(f"aws_helper/web/templates/{name}.html").read_text()
+        assert "SNAP_VERSION" in html, name
+        assert "v: SNAP_VERSION" in html, name
+        assert "=== SNAP_VERSION ? " in html or "parsed.v === SNAP_VERSION" in html, name
+
+
+def test_bulk_fix_error_names_the_types():
+    """报错要说清勾的是什么机型，而不是笼统一句「请勾选 T 系列」——
+    用户勾的明明是 t3.micro，那句提示只会让人困惑。
+    """
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    body = html.split("function fixSelectedCredits()")[1].split("\n}")[0]
+    assert "请先勾选实例" in body, "没勾任何实例和勾了非 T 是两种情况"
+    assert "types.join" in body, "要列出实际勾选的机型"

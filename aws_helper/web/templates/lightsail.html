@@ -85,6 +85,8 @@ let STATIC_IPS = [];
 // 刷新页面和重新登录都不该产生 AWS 调用 —— 频繁调用容易撞限流和风控。
 const SNAP_PREFIX = 'ls_snapshot:';
 const SNAP_MAX = 12;
+// 快照结构版本。给实例对象加字段就要 +1，否则旧快照会缺字段。
+const SNAP_VERSION = 1;
 
 // 每个 (账号, 区域) 各存一份，来回切不会互相覆盖
 function snapKey(s) {
@@ -109,7 +111,8 @@ function pruneSnapshots() {
 function saveSnapshot() {
   try {
     localStorage.setItem(snapKey(sel()), JSON.stringify({
-      at: Date.now(), instances: INSTANCES, static_ips: STATIC_IPS
+      v: SNAP_VERSION, at: Date.now(),
+      instances: INSTANCES, static_ips: STATIC_IPS
     }));
     pruneSnapshots();
   } catch (e) {
@@ -122,7 +125,9 @@ function showSnapshotOrPrompt() {
   let snap = null;
   try {
     const raw = localStorage.getItem(snapKey(sel()));
-    snap = raw ? JSON.parse(raw) : null;
+    const parsed = raw ? JSON.parse(raw) : null;
+    // 版本不符当作没快照，避免旧结构缺字段渲染出错的行
+    snap = parsed && parsed.v === SNAP_VERSION ? parsed : null;
   } catch (e) {
     snap = null;
   }
