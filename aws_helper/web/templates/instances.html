@@ -4,7 +4,7 @@
 {% block body %}
 <div class="card">
   <h2>实例列表</h2>
-  <p class="hint">选账号和区域后点刷新。勾选实例可批量执行电源操作，或对单台实例换 IP。</p>
+  <p class="hint">进页面和切换账号/区域都会自动加载。勾选实例可批量执行电源操作，或对单台实例换 IP。</p>
 
   {% if not accounts %}
   <div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div>
@@ -65,7 +65,7 @@
       </tr>
     </thead>
     <tbody id="rows">
-      <tr><td colspan="9" class="empty">点「刷新列表」加载</td></tr>
+      <tr><td colspan="9" class="empty">加载中…</td></tr>
     </tbody>
   </table>
 </div>
@@ -268,7 +268,15 @@ function resetFingerprint() {
   FINGERPRINT = '';
   INSTANCES = [];
   document.getElementById('rows').innerHTML = '';
+  refresh();
 }
+
+// 进页面就自动加载，不用手点「刷新列表」。
+// 不怕多打 AWS：后端对 DescribeInstances 有 10 秒缓存，同一 (账号, 区域)
+// 在窗口内重复进页面只命中缓存；而且页面会如实标出数据来自缓存还是刚拉的。
+document.addEventListener('DOMContentLoaded', () => {
+  if (document.getElementById('rows')) refresh();
+});
 
 async function refresh(opts) {
   const force = !!(opts && opts.force);

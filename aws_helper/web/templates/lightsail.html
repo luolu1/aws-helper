@@ -15,13 +15,13 @@
   <div class="grid g4">
     <label class="f">
       <span>账号</span>
-      <select id="account_id">
+      <select id="account_id" onchange="refresh({quiet:true})">
         {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
       </select>
     </label>
     <label class="f">
       <span>区域</span>
-      <select id="region">
+      <select id="region" onchange="refresh({quiet:true})">
         {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
       </select>
     </label>
@@ -59,7 +59,7 @@
       </tr>
     </thead>
     <tbody id="rows">
-      <tr><td colspan="9" class="empty">点「刷新列表」加载</td></tr>
+      <tr><td colspan="9" class="empty">加载中…</td></tr>
     </tbody>
   </table>
 </div>
@@ -86,16 +86,18 @@ function sel() {
   };
 }
 
-async function refresh() {
-  const s = sel();
-  const tbody = document.getElementById('rows');
-  tbody.innerHTML = '<tr><td colspan="9" class="empty">加载中…</td></tr>';
-  try {
-    const d = await api(`/api/lightsail/instances?account_id=${s.account_id}&region=${s.region}`);
-    INSTANCES = d.instances;
-    render();
-    renderStaticIps(d.static_ips);
-    toast(`找到 ${INSTANCES.length} 台轻量实例`, 'ok');
+  async function refresh(opts) {
+    const quiet = !!(opts && opts.quiet);
+    const s = sel();
+    const tbody = document.getElementById('rows');
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">加载中…</td></tr>';
+    try {
+      const d = await api(`/api/lightsail/instances?account_id=${s.account_id}&region=${s.region}`);
+      INSTANCES = d.instances;
+      render();
+      renderStaticIps(d.static_ips);
+      // 自动加载时不弹 toast —— 用户没主动点，不该有操作反馈打扰
+      if (!quiet) toast(`找到 ${INSTANCES.length} 台轻量实例`, 'ok');
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="9" class="empty">${escapeHtml(e.message)}</td></tr>`;
     toast(e.message, 'err');
@@ -177,5 +179,10 @@ async function power(action) {
     toast(e.message, 'err');
   }
 }
+
+// 进页面就自动加载，不用手点「刷新列表」。
+document.addEventListener('DOMContentLoaded', () => {
+  if (document.getElementById('rows')) refresh({ quiet: true });
+});
 </script>
 {% endblock %}

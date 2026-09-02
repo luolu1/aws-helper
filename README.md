@@ -400,6 +400,11 @@ vCPU 配额全为 0 是账号未完成验证或被限制的明确信号。
 
 页面会如实标出数据新鲜度（「数据缓存于 12 秒前」），旁边有强制刷新，不假装是刚拉的。
 
+**进页面自动加载。** 实例页和 Lightsail 页打开就拉数据，切换账号/区域也自动重载，
+不用手点「刷新列表」。这不会增加 AWS 调用：10 秒窗口内重复进页面只命中缓存，
+实测在缓存期内来回进出页面，`DescribeInstances` 调用数不变。自动加载不弹 toast ——
+用户没主动点，不该有操作反馈打扰。
+
 **自动换 IP 的调用去重**
 
 同一 (账号, 区域) 下的多条规则共用一次 `DescribeInstances`。原先每条规则各拉一次，
@@ -987,7 +992,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-717 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+721 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -1037,7 +1042,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                717 项测试
+tests/                721 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

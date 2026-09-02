@@ -1133,3 +1133,48 @@ def test_modal_scrolls_when_taller_than_viewport():
     box = css.split(".mask .box {")[1].split("}")[0]
     assert "max-height" in box
     assert "overflow-y: auto" in box
+
+
+# ---------- 进页面自动加载 ----------
+
+
+def test_instances_page_loads_without_clicking():
+    """进页面就该有数据。用户反馈：实例还得手动点刷新。
+
+    后端对 DescribeInstances 有 10 秒缓存，自动加载不会额外打 AWS。
+    """
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "DOMContentLoaded" in html
+    assert "点「刷新列表」加载" not in html, "空态文案还在暗示要手点"
+
+
+def test_switching_account_or_region_reloads():
+    """切账号/区域后旧数据已被清空，必须跟着重新拉，否则表格空着。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    body = html.split("function resetFingerprint()")[1].split("}")[0]
+    assert "refresh()" in body
+
+
+def test_lightsail_page_also_autoloads():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/lightsail.html").read_text()
+    assert "DOMContentLoaded" in html
+    assert "点「刷新列表」加载" not in html
+    assert 'onchange="refresh({quiet:true})"' in html
+
+
+def test_autoload_does_not_toast():
+    """自动加载不该弹 toast —— 用户没主动点，不该有操作反馈打扰。"""
+    from pathlib import Path
+
+    ls = Path("aws_helper/web/templates/lightsail.html").read_text()
+    assert "if (!quiet) toast(" in ls
+
+    inst = Path("aws_helper/web/templates/instances.html").read_text()
+    # instances 页原本就只在 force 或首次时提示，首次即自动加载那次
+    assert "if (force || first) toast(" in inst
