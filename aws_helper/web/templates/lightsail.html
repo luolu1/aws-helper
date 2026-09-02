@@ -15,13 +15,13 @@
   <div class="grid g4">
     <label class="f">
       <span>账号</span>
-      <select id="account_id" onchange="refresh({quiet:true})">
+      <select id="account_id" onchange="showSnapshotOrPrompt()">
         {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
       </select>
     </label>
     <label class="f">
       <span>区域</span>
-      <select id="region" onchange="refresh({quiet:true})">
+      <select id="region" onchange="showSnapshotOrPrompt()">
         {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
       </select>
     </label>
@@ -42,8 +42,9 @@
     <button class="sm" onclick="power('stop')">停止</button>
     <button class="sm" onclick="power('reboot')">重启</button>
     <button class="sm danger" onclick="power('delete')">删除</button>
-    <span style="flex:1"></span>
-    <span class="hint" id="count" style="margin:0"></span>
+      <span style="flex:1"></span>
+      <span class="hint" id="freshness" style="margin:0"></span>
+      <span class="hint" id="count" style="margin:0"></span>
   </div>
   {% endif %}
 </div>
@@ -78,6 +79,82 @@
 {% block script %}
 <script>
 let INSTANCES = [];
+let STATIC_IPS = [];
+
+// 上次结果存 localStorage，进页面直接渲染快照，不调 AWS。
+// 刷新页面和重新登录都不该产生 AWS 调用 —— 频繁调用容易撞限流和风控。
+const SNAP_PREFIX = 'ls_snapshot:';
+const SNAP_MAX = 12;
+
+// 每个 (账号, 区域) 各存一份，来回切不会互相覆盖
+function snapKey(s) {
+  return `${SNAP_PREFIX}${s.account_id}|${s.region}`;
+}
+
+function pruneSnapshots() {
+  const keys = Object.keys(localStorage).filter(k => k.startsWith(SNAP_PREFIX));
+  if (keys.length <= SNAP_MAX) return;
+  const aged = keys.map(k => {
+    let at = 0;
+    try {
+      at = (JSON.parse(localStorage.getItem(k)) || {}).at || 0;
+    } catch (e) {
+      at = 0;
+    }
+    return { k, at };
+  }).sort((a, b) => a.at - b.at);
+  aged.slice(0, keys.length - SNAP_MAX).forEach(x => localStorage.removeItem(x.k));
+}
+
+function saveSnapshot() {
+  try {
+    localStorage.setItem(snapKey(sel()), JSON.stringify({
+      at: Date.now(), instances: INSTANCES, static_ips: STATIC_IPS
+    }));
+    pruneSnapshots();
+  } catch (e) {
+    // localStorage 不可用时下次按无快照处理，不影响主流程
+  }
+}
+
+function showSnapshotOrPrompt() {
+  const tbody = document.getElementById('rows');
+  let snap = null;
+  try {
+    const raw = localStorage.getItem(snapKey(sel()));
+    snap = raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    snap = null;
+  }
+  if (!snap) {
+    INSTANCES = [];
+    STATIC_IPS = [];
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">点「刷新列表」加载</td></tr>';
+    document.getElementById('count').textContent = '共 0 台';
+    showStaleness(null);
+    return;
+  }
+  INSTANCES = snap.instances || [];
+  STATIC_IPS = snap.static_ips || [];
+  render();
+  renderStaticIps(STATIC_IPS);
+  showStaleness(snap.at);
+}
+
+// 快照可能很旧，必须如实标出年龄，否则用户会把旧状态当成当前状态
+function showStaleness(at) {
+  const el = document.getElementById('freshness');
+  if (!el) return;
+  if (!at) {
+    el.textContent = '尚未加载。为减少 AWS 调用，进页面不自动拉取。';
+    return;
+  }
+  const sec = Math.round((Date.now() - at) / 1000);
+  const ago = sec < 60 ? `${sec} 秒前`
+    : (sec < 3600 ? `${Math.round(sec / 60)} 分钟前` : `${Math.round(sec / 3600)} 小时前`);
+  el.innerHTML = `本地快照，取于 ${ago}（进页面不调用 AWS）`
+    + ` · <a href="#" onclick="refresh();return false">刷新列表</a>`;
+}
 
 function sel() {
   return {
@@ -94,9 +171,10 @@ function sel() {
     try {
       const d = await api(`/api/lightsail/instances?account_id=${s.account_id}&region=${s.region}`);
       INSTANCES = d.instances;
+      STATIC_IPS = d.static_ips || [];
       render();
-      renderStaticIps(d.static_ips);
-      // 自动加载时不弹 toast —— 用户没主动点，不该有操作反馈打扰
+      renderStaticIps(STATIC_IPS);
+      saveSnapshot();
       if (!quiet) toast(`找到 ${INSTANCES.length} 台轻量实例`, 'ok');
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="9" class="empty">${escapeHtml(e.message)}</td></tr>`;
@@ -180,9 +258,8 @@ async function power(action) {
   }
 }
 
-// 进页面就自动加载，不用手点「刷新列表」。
 document.addEventListener('DOMContentLoaded', () => {
-  if (document.getElementById('rows')) refresh({ quiet: true });
+  if (document.getElementById('rows')) showSnapshotOrPrompt();
 });
 </script>
 {% endblock %}

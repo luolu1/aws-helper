@@ -4,7 +4,11 @@
 {% block body %}
 <div class="card">
   <h2>实例列表</h2>
-  <p class="hint">进页面和切换账号/区域都会自动加载。勾选实例可批量执行电源操作，或对单台实例换 IP。</p>
+  <p class="hint">
+    进页面显示上次的结果（本地快照，不调 AWS）。要看最新状态点「刷新列表」——
+    这样刷新页面和重新登录都不会产生 AWS 调用。
+    勾选实例可批量执行电源操作，或对单台实例换 IP。
+  </p>
 
   {% if not accounts %}
   <div class="empty">还没有 AWS 账号，先去 <a href="/accounts">账号页面</a> 添加。</div>
@@ -64,9 +68,9 @@
         <th>操作</th>
       </tr>
     </thead>
-    <tbody id="rows">
-      <tr><td colspan="9" class="empty">加载中…</td></tr>
-    </tbody>
+      <tbody id="rows">
+        <tr><td colspan="9" class="empty">读取本地快照…</td></tr>
+      </tbody>
   </table>
 </div>
 
@@ -252,6 +256,9 @@
 <script>
 let INSTANCES = [];
 let ipTarget = null;
+let INSTANCE_CREDS = {};
+let SEL_ACCOUNT = '';
+let SEL_REGION = '';
 
 function sel() {
   return {
@@ -262,27 +269,114 @@ function sel() {
 
 let FINGERPRINT = '';
 
+// 上次拉到的结果存 localStorage，进页面直接渲染快照，**不打 AWS**。
+// 刷新页面、重新登录、服务重启都只是读快照 —— 后端那层 10 秒缓存挡不住 F5，
+// 而频繁调 DescribeInstances 容易撞上 AWS 的限流和风控。
+// 状态要更新只能靠手点「刷新列表」，或电源操作后的自动强制刷新。
+const SNAP_PREFIX = 'inst_snapshot:';
+// 每个 (账号, 区域) 各存一份，来回切不会互相覆盖。留 12 份够用，
+// 超了丢最旧的 —— localStorage 只有 5MB 左右，实例多的账号一份就不小。
+const SNAP_MAX = 12;
+
+function snapKey(s) {
+  return `${SNAP_PREFIX}${s.account_id}|${s.region}`;
+}
+
+function pruneSnapshots() {
+  const keys = Object.keys(localStorage).filter(k => k.startsWith(SNAP_PREFIX));
+  if (keys.length <= SNAP_MAX) return;
+  const aged = keys.map(k => {
+    let at = 0;
+    try {
+      at = (JSON.parse(localStorage.getItem(k)) || {}).at || 0;
+    } catch (e) {
+      at = 0;
+    }
+    return { k, at };
+  }).sort((a, b) => a.at - b.at);
+  aged.slice(0, keys.length - SNAP_MAX).forEach(x => localStorage.removeItem(x.k));
+}
+
+function saveSnapshot() {
+  try {
+    localStorage.setItem(snapKey(sel()), JSON.stringify({
+      at: Date.now(),
+      fingerprint: FINGERPRINT,
+      instances: INSTANCES,
+      creds: INSTANCE_CREDS
+    }));
+    pruneSnapshots();
+  } catch (e) {
+    // localStorage 满了或被禁用不影响主流程，下次进页面按无快照处理
+  }
+}
+
+function loadSnapshot() {
+  try {
+    const raw = localStorage.getItem(snapKey(sel()));
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // 切换账号或区域后旧指纹没有意义，必须清掉 —— 否则两边恰好同形
 // （比如都是空列表）会被误判成「没变」，页面继续显示上一个账号的内容。
 function resetFingerprint() {
   FINGERPRINT = '';
   INSTANCES = [];
   document.getElementById('rows').innerHTML = '';
-  refresh();
+  showSnapshotOrPrompt();
 }
 
-// 进页面就自动加载，不用手点「刷新列表」。
-// 不怕多打 AWS：后端对 DescribeInstances 有 10 秒缓存，同一 (账号, 区域)
-// 在窗口内重复进页面只命中缓存；而且页面会如实标出数据来自缓存还是刚拉的。
+// 有该 (账号, 区域) 的快照就渲染它，没有就提示手动加载。两条路都不碰 AWS。
+function showSnapshotOrPrompt() {
+  const snap = loadSnapshot();
+  const tbody = document.getElementById('rows');
+  if (!snap) {
+    INSTANCES = [];
+    FINGERPRINT = '';
+    INSTANCE_CREDS = {};
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">点「刷新列表」加载</td></tr>';
+    document.getElementById('count').textContent = '共 0 台';
+    showStaleness(null);
+    return;
+  }
+  FINGERPRINT = snap.fingerprint || '';
+  INSTANCES = snap.instances || [];
+  INSTANCE_CREDS = snap.creds || {};
+  // 密钥下载链接要用到这两个，平时由 loadCreds() 设；走快照时没调它。
+  const s = sel();
+  SEL_ACCOUNT = s.account_id;
+  SEL_REGION = s.region;
+  render();
+  showStaleness(snap.at);
+}
+
+// 快照可能是很久以前的，必须如实标出年龄，否则用户会把旧状态当成当前状态。
+function showStaleness(at) {
+  const el = document.getElementById('freshness');
+  if (!el) return;
+  if (!at) {
+    el.textContent = '尚未加载。为减少 AWS 调用，进页面不自动拉取。';
+    return;
+  }
+  const sec = Math.round((Date.now() - at) / 1000);
+  const ago = sec < 60 ? `${sec} 秒前`
+    : (sec < 3600 ? `${Math.round(sec / 60)} 分钟前` : `${Math.round(sec / 3600)} 小时前`);
+  el.innerHTML = `本地快照，数据取于 ${ago}（进页面不调用 AWS）`
+    + ` · <a href="#" onclick="refresh({force:true});return false">刷新列表</a>`;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-  if (document.getElementById('rows')) refresh();
+  if (document.getElementById('rows')) showSnapshotOrPrompt();
 });
 
 async function refresh(opts) {
   const force = !!(opts && opts.force);
   const s = sel();
   const tbody = document.getElementById('rows');
-  const first = !tbody.children.length;
+  const first = !tbody.querySelector('tr[data-id]');
   if (first) tbody.innerHTML = '<tr><td colspan="9" class="empty">加载中…</td></tr>';
   try {
     const q = `/api/instances?account_id=${s.account_id}&region=${s.region}`
@@ -294,11 +388,13 @@ async function refresh(opts) {
     await loadCreds();
     if (!data.changed) {
       render();
+      saveSnapshot();
       return;
     }
     FINGERPRINT = data.fingerprint;
     INSTANCES = data.instances;
     render();
+    saveSnapshot();
     if (force || first) toast(`找到 ${INSTANCES.length} 台实例`, 'ok');
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="9" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
@@ -447,8 +543,6 @@ async function terminateWithCleanup(ids) {
   }
 }
 
-let INSTANCE_CREDS = {};
-
 // 登录方式来自本地记录，不是 AWS —— AWS 不会告诉你 root 密码是什么。
 function credCell(id) {
   const c = INSTANCE_CREDS[id];
@@ -467,9 +561,6 @@ function credCell(id) {
   return `<span class="tag ok" style="font-size:11px">密钥</span>`
     + ` <span class="mono">${user}</span>${keyLink}`;
 }
-
-let SEL_ACCOUNT = '';
-let SEL_REGION = '';
 
 async function loadCreds() {
   const s = sel();

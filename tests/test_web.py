@@ -1135,46 +1135,112 @@ def test_modal_scrolls_when_taller_than_viewport():
     assert "overflow-y: auto" in box
 
 
-# ---------- 进页面自动加载 ----------
+# ---------- 进页面读本地快照，不调 AWS ----------
 
 
-def test_instances_page_loads_without_clicking():
-    """进页面就该有数据。用户反馈：实例还得手动点刷新。
+def test_instances_page_does_not_call_aws_on_load():
+    """进页面只读 localStorage 快照，不能自动打 AWS。
 
-    后端对 DescribeInstances 有 10 秒缓存，自动加载不会额外打 AWS。
+    用户要求：刷新页面和重新登录都不该产生 API 调用，否则容易触发风控。
+    后端那层 10 秒缓存挡不住 F5 —— 超过 10 秒的刷新就是一次真实调用。
     """
     from pathlib import Path
 
     html = Path("aws_helper/web/templates/instances.html").read_text()
-    assert "DOMContentLoaded" in html
-    assert "点「刷新列表」加载" not in html, "空态文案还在暗示要手点"
+    init = html.split("document.addEventListener('DOMContentLoaded'")[1].split("});")[0]
+    assert "showSnapshotOrPrompt()" in init
+    assert "refresh(" not in init, "进页面不能触发 refresh —— 那会打 AWS"
 
 
-def test_switching_account_or_region_reloads():
-    """切账号/区域后旧数据已被清空，必须跟着重新拉，否则表格空着。"""
+def test_switching_account_reads_snapshot_not_aws():
+    """切账号/区域也只读该组合的快照，不自动拉取。"""
     from pathlib import Path
 
     html = Path("aws_helper/web/templates/instances.html").read_text()
-    body = html.split("function resetFingerprint()")[1].split("}")[0]
-    assert "refresh()" in body
+    body = html.split("function resetFingerprint()")[1].split("\n}")[0]
+    assert "showSnapshotOrPrompt()" in body
+    assert "refresh()" not in body
 
 
-def test_lightsail_page_also_autoloads():
+def test_snapshot_age_is_shown():
+    """快照可能很旧，必须如实标出年龄，不能让用户把旧状态当成当前状态。"""
+    from pathlib import Path
+
+    for name in ("instances", "lightsail"):
+        html = Path(f"aws_helper/web/templates/{name}.html").read_text()
+        assert "function showStaleness" in html, name
+        assert "本地快照" in html, name
+        assert "进页面不调用 AWS" in html, name
+
+
+def test_refresh_persists_snapshot():
+    """手动刷新拿到的结果要存下来，否则下次进页面又是空的。"""
+    from pathlib import Path
+
+    inst = Path("aws_helper/web/templates/instances.html").read_text()
+    assert inst.count("saveSnapshot()") >= 3, "changed 与未 changed 两条路都要存"
+
+    ls = Path("aws_helper/web/templates/lightsail.html").read_text()
+    assert "saveSnapshot()" in ls
+
+
+def test_lightsail_also_snapshot_based():
     from pathlib import Path
 
     html = Path("aws_helper/web/templates/lightsail.html").read_text()
-    assert "DOMContentLoaded" in html
-    assert "点「刷新列表」加载" not in html
-    assert 'onchange="refresh({quiet:true})"' in html
+    init = html.split("document.addEventListener('DOMContentLoaded'")[1].split("});")[0]
+    assert "showSnapshotOrPrompt()" in init
+    assert "refresh(" not in init
+    assert 'onchange="showSnapshotOrPrompt()"' in html
 
 
-def test_autoload_does_not_toast():
-    """自动加载不该弹 toast —— 用户没主动点，不该有操作反馈打扰。"""
+def test_power_actions_still_force_refresh():
+    """电源操作后必须真的回源 —— 状态刚变，这时候拿快照就是错的。"""
     from pathlib import Path
 
-    ls = Path("aws_helper/web/templates/lightsail.html").read_text()
-    assert "if (!quiet) toast(" in ls
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    body = html.split("async function refreshAfterAction()")[1].split("}")[0]
+    assert "force: true" in body
 
-    inst = Path("aws_helper/web/templates/instances.html").read_text()
-    # instances 页原本就只在 force 或首次时提示，首次即自动加载那次
-    assert "if (force || first) toast(" in inst
+
+def test_creds_cached_in_snapshot():
+    """登录方式列也要进快照，否则走快照时那一列全是「未记录」。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "creds: INSTANCE_CREDS" in html
+    assert "INSTANCE_CREDS = snap.creds || {}" in html
+
+
+def test_snapshot_vars_declared_before_use():
+    """let 有暂时性死区：快照函数在顶部赋值，声明必须也在顶部。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    decl = html.index("let INSTANCE_CREDS")
+    use = html.index("INSTANCE_CREDS = snap.creds")
+    assert decl < use, "声明必须在快照函数之前，否则 ReferenceError"
+
+
+def test_snapshots_are_keyed_per_account_region():
+    """每个 (账号, 区域) 各存一份。共用一个键的话切区域会互相覆盖 ——
+    浏览器实测过：切到 B 加载后再切回 A，A 的快照已经没了。
+    """
+    from pathlib import Path
+
+    for name, prefix in (("instances", "inst_snapshot:"), ("lightsail", "ls_snapshot:")):
+        html = Path(f"aws_helper/web/templates/{name}.html").read_text()
+        assert f"SNAP_PREFIX = '{prefix}'" in html, name
+        assert "${SNAP_PREFIX}${s.account_id}|${s.region}" in html, name
+        assert "localStorage.setItem(snapKey(sel())" in html, name
+
+
+def test_snapshots_are_pruned():
+    """localStorage 只有 5MB 左右，快照不能无限堆积。"""
+    from pathlib import Path
+
+    for name in ("instances", "lightsail"):
+        html = Path(f"aws_helper/web/templates/{name}.html").read_text()
+        assert "function pruneSnapshots" in html, name
+        assert "SNAP_MAX" in html, name
+        assert "sort((a, b) => a.at - b.at)" in html, name
