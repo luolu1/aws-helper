@@ -44,8 +44,9 @@
     <button class="sm" onclick="power('start')">开机</button>
     <button class="sm" onclick="power('stop')">关机</button>
     <button class="sm" onclick="power('reboot')">重启</button>
-    <button class="sm danger" onclick="power('terminate')">终止</button>
-    <span style="flex:1"></span>
+      <button class="sm danger" onclick="power('terminate')">终止</button>
+      <button class="sm" onclick="fixSelectedCredits()" title="把选中的 T 实例改成 standard，避免超额积分计费">改为 standard</button>
+      <span style="flex:1"></span>
     <span class="hint" id="freshness" style="margin:0"></span>
     <span class="hint" id="count" style="margin:0"></span>
   </div>
@@ -65,11 +66,12 @@
         <th>公网 IP</th>
         <th>内网 IP</th>
         <th>登录方式</th>
+        <th>CPU 积分</th>
         <th>操作</th>
       </tr>
     </thead>
       <tbody id="rows">
-        <tr><td colspan="9" class="empty">读取本地快照…</td></tr>
+        <tr><td colspan="10" class="empty">读取本地快照…</td></tr>
       </tbody>
   </table>
 </div>
@@ -337,7 +339,7 @@ function showSnapshotOrPrompt() {
     INSTANCES = [];
     FINGERPRINT = '';
     INSTANCE_CREDS = {};
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">点「刷新列表」加载</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">点「刷新列表」加载</td></tr>';
     document.getElementById('count').textContent = '共 0 台';
     showStaleness(null);
     return;
@@ -377,7 +379,7 @@ async function refresh(opts) {
   const s = sel();
   const tbody = document.getElementById('rows');
   const first = !tbody.querySelector('tr[data-id]');
-  if (first) tbody.innerHTML = '<tr><td colspan="9" class="empty">加载中…</td></tr>';
+  if (first) tbody.innerHTML = '<tr><td colspan="10" class="empty">加载中…</td></tr>';
   try {
     const q = `/api/instances?account_id=${s.account_id}&region=${s.region}`
       + `&fingerprint=${encodeURIComponent(FINGERPRINT)}` + (force ? '&force=1' : '');
@@ -397,7 +399,7 @@ async function refresh(opts) {
     saveSnapshot();
     if (force || first) toast(`找到 ${INSTANCES.length} 台实例`, 'ok');
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="9" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
     toast(e.message, 'err');
   }
 }
@@ -431,6 +433,7 @@ function rowHtml(i) {
       <td class="mono">${escapeHtml(i.public_ip || '-')}</td>
       <td class="mono">${escapeHtml(i.private_ip || '-')}</td>
       <td>${credCell(i.instance_id)}</td>
+      <td>${creditCell(i)}</td>
       <td>
         <button class="sm" onclick="openIp('${escapeHtml(i.instance_id)}','${escapeHtml(i.public_ip || '')}')">换 IP</button>
         <button class="sm" onclick="openResetPw('${escapeHtml(i.instance_id)}','${escapeHtml(i.name || '')}','${i.platform === 'windows' ? 1 : 0}')">重置密码</button>
@@ -444,7 +447,7 @@ function render() {
   const tbody = document.getElementById('rows');
   document.getElementById('count').textContent = `共 ${INSTANCES.length} 台`;
   if (!INSTANCES.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">该区域没有实例</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">该区域没有实例</td></tr>';
     return;
   }
 
@@ -541,6 +544,47 @@ async function terminateWithCleanup(ids) {
     Progress.finish();
     toast(e.message, 'err');
   }
+}
+
+// unlimited 会在 CPU 积分耗尽后按超额积分继续计费，所以标红并给一键改回。
+// 非 T 机型没有积分概念，显示横线而不是空白 —— 空白看着像没查到。
+function creditCell(i) {
+  if (!i.burstable) return '<span class="hint">—</span>';
+  if (i.cpu_credits === 'unlimited') {
+    return '<span class="tag err" style="font-size:11px">unlimited</span>'
+      + ` <button class="sm" onclick="setCreditMode(['${escapeHtml(i.instance_id)}'],'standard')">改回</button>`;
+  }
+  if (i.cpu_credits === 'standard') {
+    return '<span class="tag ok" style="font-size:11px">standard</span>';
+  }
+  return '<span class="hint">未知</span>';
+}
+
+async function setCreditMode(ids, mode) {  if (mode === 'standard' && !confirm(
+      `把 ${ids.length} 台实例改成 standard？\n\n`
+      + 'CPU 积分用完后会降速，但不会产生超额积分费用。')) return;
+  try {
+    const d = await api('/api/instances/credit-mode', {
+      method: 'POST',
+      json: { ...sel(), instance_ids: ids, mode }
+    });
+    toast(`已改为 ${mode}，成功 ${d.succeeded.length} 台`
+      + (d.failed.length ? `，失败 ${d.failed.length} 台` : ''), d.failed.length ? 'err' : 'ok');
+    await refresh({ force: true });
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+// 只挑选中的 T 实例：非 T 机型传给 ModifyInstanceCreditSpecification 会被
+// AWS 拒绝，整批都失败。
+function fixSelectedCredits() {
+  const ids = picked().filter(id => {
+    const inst = INSTANCES.find(i => i.instance_id === id);
+    return inst && inst.burstable;
+  });
+  if (!ids.length) return toast('请勾选至少一台 T 系列实例', 'err');
+  setCreditMode(ids, 'standard');
 }
 
 // 登录方式来自本地记录，不是 AWS —— AWS 不会告诉你 root 密码是什么。

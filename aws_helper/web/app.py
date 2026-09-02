@@ -1218,6 +1218,34 @@ async def api_reinstall(request: Request, _: None = Guard):
     return {"ok": True, "task_id": task_id}
 
 
+@app.post("/api/instances/credit-mode")
+async def api_credit_mode(request: Request, _: None = Guard):
+    """改 T 实例的 CPU 积分模式。unlimited 会按超额积分计费，standard 只降速。"""
+    body = await request.json()
+    account_id = int(body["account_id"])
+    region = body["region"]
+    ids = body.get("instance_ids") or []
+    mode = body.get("mode") or "standard"
+    creds = store.credentials(account_id, region)
+
+    try:
+        result = launch.set_credit_mode(creds, region, ids, mode)
+    except launch.LaunchError as exc:
+        store.log("credit-mode", ",".join(ids), False, str(exc)[:400])
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    # 积分模式变了，实例列表里那一列也得跟着变，缓存必须作废
+    cache.drop(*ec2_instances_key(account_id, region))
+    store.log(
+        "credit-mode",
+        ",".join(ids),
+        not result["failed"],
+        f"改为 {mode}，成功 {len(result['succeeded'])}"
+        + (f"，失败: {'; '.join(result['failed'])}" if result["failed"] else ""),
+    )
+    return {"ok": True, **result}
+
+
 @app.post("/api/instances/power")
 async def api_power(request: Request, _: None = Guard):
     body = await request.json()

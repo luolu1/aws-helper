@@ -71,6 +71,7 @@ Bedrock 没有实例概念，只有模型和 token 计费。所以各栏有自�
 | DDNS 解析 | 填好配置生成一键部署脚本给任意机器用，或交面板托管；Cloudflare，A / AAAA |
 | 批量与 IPv6 | 一次开多台共用密钥对，可选自建 VPC + IGW + v4/v6 双栈路由 |
 | 计费保护 | 终止实例时连带清理弹性 IP、残留卷、安全组、自建 VPC，防止继续计费 |
+| CPU 积分 | T 系列强制 standard，不产生超额积分账单；已有实例可查看并一键改回 |
 | 账号探测 | 分项检查凭据、账号状态、开机权限、vCPU 配额与当前用量 |
 
 安全设计：AWS Secret Key 和代理地址用 Fernet 加密落盘，登录密码走 PBKDF2-SHA256
@@ -537,6 +538,45 @@ Ubuntu / Amazon Linux 的 AMI ID 优先通过发行方发布的 SSM 公共参数
 这是刻意的默认值，代价要清楚：实例上任何监听端口都直接暴露在公网。
 配合开机脚本里的 root 密码登录，等于一台全端口开放 + 密码登录 root 的机器。
 生产环境建议取消勾选，只开实际需要的端口。
+
+**T 系列强制 standard 模式，不会产生超额积分账单**
+
+T 系列（t2/t3/t3a/t4g）是突发性能机型：平时攒 CPU 积分，需要时突发。积分耗尽后
+有两种行为，取决于 `CreditSpecification`：
+
+| 模式 | 积分用完后 | 计费 |
+|---|---|---|
+| `standard` | 降到基准性能（t3.micro 是 2 核各 10%） | 不会多收钱 |
+| `unlimited` | 继续全速跑，透支「超额积分」 | **按超额积分额外计费** |
+
+**AWS 的默认值是坑：** T3/T3a/T4g 默认 `unlimited`，只有 T2 默认 `standard`。
+而且官方文档明确写了 —— 用 API/CLI 开机时走账号级默认值，只有控制台的选择才会
+覆盖它。面板走 API，所以不显式传就是 `unlimited`。
+
+跑满 CPU 的负载（编译、转码、被刷）在 `unlimited` 下会持续产生计划外费用，
+而账单要到月底才显眼。所以面板**开机时对 T 系列显式传 `standard`**：
+
+```
+CreditSpecification={CpuCredits=standard}
+```
+
+只对 T 系列传 —— 非突发机型（c5、m6i 等）传这个参数 AWS 会直接拒绝请求。
+
+**已有实例也能看和改。** 实例列表多了「CPU 积分」列：
+
+```
+规格        CPU 积分
+t3.micro    unlimited  [改回]      ← 标红，点一下改成 standard
+t3.small    standard               ← 绿色
+c5.large    —                      ← 非突发机型，没有积分概念
+```
+
+勾选多台后点「改为 standard」可批量修改，会自动过滤掉非 T 机型 ——
+混在一起提交 AWS 会让整批失败。
+
+查积分模式是单独一次 `DescribeInstanceCreditSpecifications`（`DescribeInstances`
+的返回里没有这个字段），只对 T 实例发起；缺 `ec2:DescribeInstanceCreditSpecifications`
+权限时那一列留空，但实例列表照常显示 —— 不因为一个附加字段拉不到就整页失败。
 
 **关于测试**
 
@@ -1019,7 +1059,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-727 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+743 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -1069,7 +1109,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                727 项测试
+tests/                743 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

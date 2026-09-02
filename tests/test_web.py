@@ -1244,3 +1244,101 @@ def test_snapshots_are_pruned():
         assert "function pruneSnapshots" in html, name
         assert "SNAP_MAX" in html, name
         assert "sort((a, b) => a.at - b.at)" in html, name
+
+
+# ---------- CPU 积分模式 ----------
+
+
+def test_credit_mode_endpoint_requires_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_module = build_app(monkeypatch, tmp_path / "credit-anon")
+    c = TestClient(app_module.app)
+    assert c.post("/api/instances/credit-mode", json={}).status_code == 401
+
+
+def test_credit_mode_rejects_bad_mode(client):
+    c, aid, app_module = client
+    r = c.post(
+        "/api/instances/credit-mode",
+        json={
+            "account_id": aid,
+            "region": "us-east-1",
+            "instance_ids": ["i-1"],
+            "mode": "cheap",
+        },
+    )
+    assert r.status_code == 400
+    assert "standard" in r.json()["error"]
+
+
+def test_credit_mode_invalidates_cache(client):
+    """积分模式变了，列表里那一列也得变，缓存必须作废。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    with patch.object(app_module.launch, "set_credit_mode") as fake:
+        fake.return_value = {"mode": "standard", "succeeded": ["i-1"], "failed": []}
+        app_module.cache.fetch(
+            app_module.ec2_instances_key(aid, "us-east-1"), 60, lambda: ["stale"]
+        )
+        assert app_module.cache.size() >= 1
+        r = c.post(
+            "/api/instances/credit-mode",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "instance_ids": ["i-1"],
+                "mode": "standard",
+            },
+        )
+
+    assert r.json()["ok"] is True
+    assert app_module.cache.size() == 0
+
+
+def test_launch_api_sends_standard_credit_spec(client):
+    """走完整 HTTP 开机链路，断言真的把 standard 发给了 AWS。
+
+    不能断言 moto 的返回值 —— 它对所有机型都回 standard，把修复删掉照样通过。
+    """
+    c, aid, app_module = client
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "name": "credit-node",
+                "instance_type": "t3.micro",
+            },
+        ).json()["task_id"],
+    )
+    iid = task["result"]["instances"][0]["instance_id"]
+    items = c.get(
+        f"/api/instances?account_id={aid}&region=us-east-1"
+    ).json()["instances"]
+    row = next(i for i in items if i["instance_id"] == iid)
+    # 这两个字段是本次新增的，moto 也能验证：字段存在且分类正确
+    assert row["burstable"] is True
+    assert "cpu_credits" in row
+
+
+def test_instances_page_shows_credit_column():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    assert "<th>CPU 积分</th>" in html
+    assert "function creditCell" in html
+    assert "function setCreditMode" in html
+    assert 'colspan="9"' not in html, "加了一列，空态 colspan 也要跟着改"
+
+
+def test_bulk_fix_filters_non_burstable():
+    """非 T 机型传给 ModifyInstanceCreditSpecification 会整批失败。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/instances.html").read_text()
+    body = html.split("function fixSelectedCredits()")[1].split("\n}")[0]
+    assert "inst.burstable" in body

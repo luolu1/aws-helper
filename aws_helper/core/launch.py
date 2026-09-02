@@ -13,6 +13,17 @@ from .userdata import ScriptOptions, render
 
 ProgressFn = Callable[[str], None]
 
+# 突发性能机型族。这些机型的 CPU 积分模式默认值不统一：AWS 对 T2 默认
+# standard，对 T3/T3a/T4g 默认 unlimited，而 unlimited 会在积分耗尽后
+# 继续按超额积分计费。判断只看族前缀，因为非突发机型传 CreditSpecification
+# 会被 AWS 直接拒绝。
+_BURSTABLE_FAMILIES = ("t2", "t3", "t3a", "t4g")
+
+
+def is_burstable(instance_type: str) -> bool:
+    family = instance_type.split(".", 1)[0].lower()
+    return family in _BURSTABLE_FAMILIES
+
 
 def _noop(_: str) -> None:
     return None
@@ -406,6 +417,13 @@ def _run_instances(
         ],
     }
 
+    # T 系列强制 standard。AWS 对 T3/T3a/T4g 的默认值是 unlimited，
+    # 那会在 CPU 积分耗尽后继续按超额积分计费 —— 突发流量或跑满 CPU 就产生
+    # 计划外账单。standard 模式积分用完只降速，绝不多收钱。
+    # 只对 T 系列传：非突发机型传这个参数 AWS 会直接报错。
+    if is_burstable(req.instance_type):
+        params["CreditSpecification"] = {"CpuCredits": "standard"}
+
     # 空 UserData 就别传（Windows 路径），传空串等于给 cloud-init 一份空脚本
     if user_data:
         params["UserData"] = user_data
@@ -494,6 +512,58 @@ def _code(exc: ClientError) -> str:
     return exc.response.get("Error", {}).get("Code", "")
 
 
+def _credit_modes(session: Any, instance_ids: list[str]) -> dict[str, str]:
+    """查每台 T 实例的 CPU 积分模式。
+
+    单独一次调用而不是从 describe_instances 里读 —— DescribeInstances 的返回
+    里根本没有这个字段。只查突发机型：非 T 机型传进去会报 InvalidInstanceID。
+    查不到不算失败，那一列显示为空好过整个列表拉不出来。
+    """
+    if not instance_ids:
+        return {}
+    try:
+        resp = session.describe_instance_credit_specifications(
+            InstanceIds=instance_ids
+        )
+    except ClientError:
+        return {}
+    return {
+        item["InstanceId"]: item.get("CpuCredits", "")
+        for item in resp.get("InstanceCreditSpecifications", [])
+    }
+
+
+def set_credit_mode(
+    creds: aws.Credentials, region: str, instance_ids: list[str], mode: str
+) -> dict[str, Any]:
+    """改 CPU 积分模式。unlimited 会按超额积分计费，standard 只降速。"""
+    if mode not in ("standard", "unlimited"):
+        raise LaunchError("积分模式只能是 standard 或 unlimited")
+    if not instance_ids:
+        raise LaunchError("请选择实例")
+
+    session = aws.ec2(creds, region)
+    try:
+        resp = session.modify_instance_credit_specification(
+            InstanceCreditSpecifications=[
+                {"InstanceId": i, "CpuCredits": mode} for i in instance_ids
+            ]
+        )
+    except ClientError as exc:
+        raise LaunchError(f"修改积分模式失败: {exc}") from exc
+
+    return {
+        "mode": mode,
+        "succeeded": [
+            x["InstanceId"] for x in resp.get("SuccessfulInstanceCreditSpecifications", [])
+        ],
+        "failed": [
+            f"{x['InstanceId']}: {(x.get('Error') or {}).get('Message', '未知错误')}"
+            for x in resp.get("UnsuccessfulInstanceCreditSpecifications", [])
+        ],
+    }
+
+
 def list_instances(creds: aws.Credentials, region: str) -> list[dict[str, Any]]:
     """列出区域内所有非终止实例。"""
     session = aws.ec2(creds, region)
@@ -505,6 +575,13 @@ def list_instances(creds: aws.Credentials, region: str) -> list[dict[str, Any]]:
             }
         ]
     )
+    burstable_ids = [
+        inst["InstanceId"]
+        for res in resp.get("Reservations", [])
+        for inst in res.get("Instances", [])
+        if is_burstable(inst.get("InstanceType", ""))
+    ]
+    credits = _credit_modes(session, burstable_ids)
     out: list[dict[str, Any]] = []
     for res in resp.get("Reservations", []):
         for inst in res.get("Instances", []):
@@ -533,6 +610,8 @@ def list_instances(creds: aws.Credentials, region: str) -> list[dict[str, Any]]:
                     # 直接不存在（不是空串）—— 重置密码要用它决定发 shell
                     # 还是 PowerShell 脚本。
                     "platform": inst.get("Platform") or "linux",
+                    "burstable": is_burstable(inst.get("InstanceType", "")),
+                    "cpu_credits": credits.get(inst["InstanceId"], ""),
                     "iam_profile": (inst.get("IamInstanceProfile") or {}).get("Arn", ""),
                     "launch_time": (
                         inst["LaunchTime"].isoformat()

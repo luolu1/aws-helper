@@ -248,3 +248,224 @@ def _state(creds, instance_id: str) -> str:
     session = aws.ec2(creds)
     resp = session.describe_instances(InstanceIds=[instance_id])
     return resp["Reservations"][0]["Instances"][0]["State"]["Name"]
+
+
+# ---------- CPU 积分模式（unlimited 会产生超额账单） ----------
+
+
+def test_burstable_family_detection():
+    """只看族前缀。非 T 机型传 CreditSpecification 会被 AWS 拒绝。"""
+    for t in ("t2.micro", "t3.micro", "t3a.small", "t4g.nano", "T3.LARGE"):
+        assert launch.is_burstable(t), t
+    for t in ("c5.large", "m6i.large", "c6g.medium", "r5.xlarge", ""):
+        assert not launch.is_burstable(t), t
+
+
+def test_t_instance_launches_as_standard(mock_ec2, creds, ubuntu_ami):
+    """T 实例必须显式设成 standard。
+
+    AWS 对 T3/T3a/T4g 的默认值是 unlimited —— 积分耗尽后按超额积分继续计费，
+    跑满 CPU 就产生计划外账单。standard 只降速，不多收钱。
+
+    注意：这里断言的是**发出的请求参数**，不是 moto 的返回值。moto 对所有
+    机型都返回 standard，把修复整段删掉它照样"通过" —— 那种断言证明不了
+    任何事。真实 AWS 的默认值是 unlimited。
+    """
+    results = launch.launch(
+        creds,
+        launch.LaunchRequest(
+            name="t-node", region="us-east-1", instance_type="t3.micro"
+        ),
+    )
+    assert results[0].instance_id.startswith("i-")
+
+    from unittest.mock import MagicMock
+
+    session = MagicMock()
+    session.run_instances.return_value = {"Instances": [{"InstanceId": "i-1"}]}
+    session.describe_images.return_value = {"Images": [{"RootDeviceName": "/dev/sda1"}]}
+    launch._run_instances(
+        session,
+        launch.LaunchRequest(name="t", region="us-east-1", instance_type="t3.micro"),
+        "ami-1",
+        "k",
+        "sg-1",
+        None,
+        "",
+    )
+    sent = session.run_instances.call_args.kwargs
+    assert sent["CreditSpecification"] == {"CpuCredits": "standard"}
+
+
+def test_credit_spec_omitted_for_non_burstable():
+    """非突发机型不能传这个参数，传了 AWS 直接报错。"""
+    from unittest.mock import MagicMock
+
+    for itype, expect in (
+        ("t3.micro", {"CpuCredits": "standard"}),
+        ("t2.small", {"CpuCredits": "standard"}),
+        ("t4g.nano", {"CpuCredits": "standard"}),
+        ("c5.large", None),
+        ("m6i.large", None),
+    ):
+        session = MagicMock()
+        session.run_instances.return_value = {"Instances": [{"InstanceId": "i-1"}]}
+        session.describe_images.return_value = {
+            "Images": [{"RootDeviceName": "/dev/sda1"}]
+        }
+        req = launch.LaunchRequest(
+            name="n", region="us-east-1", instance_type=itype
+        )
+        launch._run_instances(session, req, "ami-1", "k", "sg-1", None, "")
+        got = session.run_instances.call_args.kwargs.get("CreditSpecification")
+        assert got == expect, f"{itype}: {got}"
+
+
+def test_list_reports_credit_mode(creds):
+    """列表要带上积分模式。用 stub 而不是 moto —— moto 对所有机型都回
+    standard，无法验证真正读到了 API 返回的值。
+    """
+    from unittest.mock import MagicMock, patch
+
+    session = MagicMock()
+    session.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-9",
+                        "InstanceType": "t3.micro",
+                        "State": {"Name": "running"},
+                    }
+                ]
+            }
+        ]
+    }
+    session.describe_instance_credit_specifications.return_value = {
+        "InstanceCreditSpecifications": [
+            {"InstanceId": "i-9", "CpuCredits": "unlimited"}
+        ]
+    }
+    with patch.object(launch.aws, "ec2", return_value=session):
+        items = launch.list_instances(creds, "us-east-1")
+
+    assert items[0]["burstable"] is True
+    assert items[0]["cpu_credits"] == "unlimited", "要如实反映 AWS 返回的模式"
+    sent = session.describe_instance_credit_specifications.call_args.kwargs
+    assert sent["InstanceIds"] == ["i-9"]
+
+
+def test_non_burstable_marked_and_not_queried(mock_ec2, creds, ubuntu_ami):
+    """非 T 机型不查积分模式 —— 省一次 API，而且传进去会报错。"""
+    from unittest.mock import MagicMock, patch
+
+    session = MagicMock()
+    session.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-1",
+                        "InstanceType": "c5.large",
+                        "State": {"Name": "running"},
+                    }
+                ]
+            }
+        ]
+    }
+    with patch.object(launch.aws, "ec2", return_value=session):
+        items = launch.list_instances(creds, "us-east-1")
+
+    assert session.describe_instance_credit_specifications.call_count == 0
+    assert items[0]["burstable"] is False
+    assert items[0]["cpu_credits"] == ""
+
+
+def test_credit_query_failure_does_not_break_list(creds):
+    """缺 ec2:DescribeInstanceCreditSpecifications 权限时那一列留空，
+    但整个实例列表必须照常返回 —— 不能因为一个附加字段拉不到就全挂。
+    """
+    from unittest.mock import MagicMock, patch
+
+    from botocore.exceptions import ClientError
+
+    session = MagicMock()
+    session.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-2",
+                        "InstanceType": "t3.micro",
+                        "State": {"Name": "running"},
+                    }
+                ]
+            }
+        ]
+    }
+    session.describe_instance_credit_specifications.side_effect = ClientError(
+        {"Error": {"Code": "UnauthorizedOperation", "Message": "no perm"}},
+        "DescribeInstanceCreditSpecifications",
+    )
+    with patch.object(launch.aws, "ec2", return_value=session):
+        items = launch.list_instances(creds, "us-east-1")
+
+    assert len(items) == 1
+    assert items[0]["burstable"] is True
+    assert items[0]["cpu_credits"] == ""
+
+
+def test_set_credit_mode_rejects_bad_value(creds):
+    with pytest.raises(launch.LaunchError, match="standard 或 unlimited"):
+        launch.set_credit_mode(creds, "us-east-1", ["i-1"], "cheap")
+
+
+def test_set_credit_mode_rejects_empty_ids(creds):
+    with pytest.raises(launch.LaunchError, match="请选择实例"):
+        launch.set_credit_mode(creds, "us-east-1", [], "standard")
+
+
+def test_set_credit_mode_sends_standard(creds):
+    """moto 没实现 ModifyInstanceCreditSpecification，所以断言发出的参数。"""
+    from unittest.mock import MagicMock, patch
+
+    session = MagicMock()
+    session.modify_instance_credit_specification.return_value = {
+        "SuccessfulInstanceCreditSpecifications": [{"InstanceId": "i-1"}],
+        "UnsuccessfulInstanceCreditSpecifications": [],
+    }
+    with patch.object(launch.aws, "ec2", return_value=session):
+        out = launch.set_credit_mode(creds, "us-east-1", ["i-1", "i-2"], "standard")
+
+    sent = session.modify_instance_credit_specification.call_args.kwargs
+    assert sent["InstanceCreditSpecifications"] == [
+        {"InstanceId": "i-1", "CpuCredits": "standard"},
+        {"InstanceId": "i-2", "CpuCredits": "standard"},
+    ]
+    assert out["mode"] == "standard"
+    assert out["succeeded"] == ["i-1"]
+
+
+def test_set_credit_mode_reports_partial_failure(creds):
+    """部分失败要带上原因，不能笼统说「失败」。"""
+    from unittest.mock import MagicMock, patch
+
+    session = MagicMock()
+    session.modify_instance_credit_specification.return_value = {
+        "SuccessfulInstanceCreditSpecifications": [{"InstanceId": "i-1"}],
+        "UnsuccessfulInstanceCreditSpecifications": [
+            {
+                "InstanceId": "i-2",
+                "Error": {
+                    "Code": "InvalidInstanceType",
+                    "Message": "not a burstable instance",
+                },
+            }
+        ],
+    }
+    with patch.object(launch.aws, "ec2", return_value=session):
+        out = launch.set_credit_mode(creds, "us-east-1", ["i-1", "i-2"], "standard")
+
+    assert out["succeeded"] == ["i-1"]
+    assert len(out["failed"]) == 1
+    assert "not a burstable instance" in out["failed"][0]

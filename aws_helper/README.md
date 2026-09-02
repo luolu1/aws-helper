@@ -342,7 +342,13 @@ ec2:CreateSecurityGroup      ec2:AuthorizeSecurityGroupIngress
 ec2:DescribeSecurityGroups   ec2:DescribeVpcs             ec2:DescribeSubnets
 ec2:AllocateAddress          ec2:AssociateAddress         ec2:ReleaseAddress
 ec2:DescribeAddresses        ec2:CreateTags               ec2:DescribeVolumes
+ec2:DescribeInstanceCreditSpecifications
+ec2:ModifyInstanceCreditSpecification
 ```
+
+后两个用于 CPU 积分模式：T 系列开机时强制传 `standard`（AWS 对 T3/T3a/T4g
+的默认值是 `unlimited`，积分耗尽后按超额积分额外计费），列表里显示当前模式，
+并支持一键改回。缺 `Describe` 那项只会让「CPU 积分」列留空，实例列表照常显示。
 
 勾选 IPv6 还需要：`CreateVpc` `CreateSubnet` `CreateInternetGateway`
 `AttachInternetGateway` `CreateRoute` `DescribeRouteTables` `AssociateRouteTable`
@@ -456,7 +462,7 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-727 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+743 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
