@@ -96,8 +96,6 @@ def _check_host(host: str) -> str:
 
 
 def _validate(req: GuardRequest) -> tuple[GuardRequest, str, int]:
-    if not req.instance_id.strip():
-        raise GuardScriptError("缺少实例 ID")
     if not req.report_url.strip():
         raise GuardScriptError("缺少上报地址")
     if not req.token.strip():
@@ -147,7 +145,13 @@ CONF="${GUARD_ENV_FILE:-/etc/aws-helper-guard.env}"
 
 : "${GUARD_REPORT_URL:?配置缺少 GUARD_REPORT_URL}"
 : "${GUARD_TOKEN:?配置缺少 GUARD_TOKEN}"
-: "${GUARD_INSTANCE_ID:?配置缺少 GUARD_INSTANCE_ID}"
+# 创建时部署不知道实例 ID，开机后从 IMDS 读取。手工生成脚本仍会写死 ID，
+# 优先使用配置值，IMDS 只在它为空时兜底。
+if [ -z "${GUARD_INSTANCE_ID:-}" ]; then
+    GUARD_INSTANCE_ID=$(curl -fsS --max-time 3 \
+        http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
+fi
+: "${GUARD_INSTANCE_ID:?配置缺少实例 ID，且无法从 EC2 IMDS 读取}"
 GUARD_HOST="${GUARD_HOST:-www.baidu.com}"
 GUARD_PORT="${GUARD_PORT:-443}"
 GUARD_INTERVAL="${GUARD_INTERVAL:-60}"

@@ -62,6 +62,7 @@ Bedrock 没有实例概念，只有模型和 token 计费。所以各栏有自�
 | 功能 | 说明 |
 |---|---|
 | 一键开机 | 系统类别 → 架构 → 镜像 → 规格 四级选择，镜像和规格实时从 AWS 拉取 |
+| 开机即部署 | 创建时可勾选自动换 IP 探测器和 DDNS，写进 cloud-init 开机自动装好 |
 | Windows 支持 | Windows Server 2019/2022/2025（含简体中文），自动禁用 Linux 专属字段 |
 | 开机脚本 | 走 EC2 原生 UserData，cloud-init 首次启动以 root 执行，可存模板复用 |
 | 换 IP | 弹性 IP 重分配（不停机）或停机重启换动态 IP，支持 IP 段白/黑名单 |
@@ -264,9 +265,33 @@ Windows 走 `AWS-RunPowerShellScript` + `Set-LocalUser`。
 
 ### agent 模式：实例自己判断被墙
 
-在自动换 IP 页选好实例，点「开启实例侧探测」，配置探测目标、间隔、失败阈值和
-换 IP 方式，面板生成一段一键部署脚本，复制到实例上以 root 执行即可。装完是一个
-systemd 服务（`aws-helper-guard`），常驻循环探测。
+有两条部署路径：
+
+**A. 创建实例时勾选**（推荐，省一步）—— 在一键开机页的「开机时顺带部署服务」
+卡片勾上，配好探测目标、间隔、阈值和换 IP 方式，脚本会内联进 cloud-init，
+开机自动装好，规则也自动建好。不用登录机器。
+
+**B. 给已有实例部署** —— 在自动换 IP 页选好实例，点「开启实例侧探测」，
+面板生成一段一键部署脚本，复制到实例上以 root 执行。
+
+两条路装出来的东西完全一样：一个 systemd 服务（`aws-helper-guard`），常驻循环探测。
+
+创建时部署有个顺序问题：`user-data` 必须在 `RunInstances` 之前定稿，那时实例 ID
+还不存在。所以脚本改为开机后**从 EC2 元数据服务（IMDS）自己读**实例 ID，上报时
+带上，面板按 (凭证, 实例 ID) 定位规则。手工生成的脚本仍然写死 ID，两者不冲突 ——
+配置里有值就用它，IMDS 只在为空时兜底。
+
+代价说清楚：**同一批创建的实例共用一个上报凭证**。其中一台被入侵后，可以冒充
+同批的另一台触发换 IP。跨批次和跨账号都拦得住，批内拦不住 —— 要批内隔离就得给
+每台不同的 `user-data`，而 `RunInstances` 一次只接受一份。介意的话用路径 B，
+每台单独生成。
+
+**部署失败不会影响开机。** 部署段用 `|| echo ...` 兜住，失败只留日志在
+`/var/log/aws-helper-autoip-deploy.log`，不会中止整段 `user-data` ——
+否则你自己写的开机脚本（永远排在最后）就不执行了。
+
+**Windows 不支持这两个服务**（都是 bash + systemd）。切到 Windows 镜像时勾选框
+会自动取消并禁用，而不是静默忽略让你以为装好了。
 
 **探测正常时一个包都不发。** 这是刻意的：正常状态是绝大多数时候，每次都上报
 纯属浪费面板资源和流量。只在连续失败达到阈值时才 POST 一次。
@@ -894,12 +919,19 @@ aws-helper logout-all    # 只下线所有会话，不改密码
 | 动作 | 给实例换一个新 IP | 让域名指向新 IP |
 | 对象 | AWS 上的实例 | 面板所在的这台机器 |
 
-### 两种用法
+### 三种用法
 
-左侧「通用 → DDNS 解析」，填 DNS 供应商、区域根域名、完整主机名、API Token，
-勾选要更新 A（IPv4）还是 AAAA（IPv6）。然后二选一：
+**一、创建 EC2 时顺带部署**
 
-**一、生成一键脚本（给别的机器用）**
+一键开机页勾「部署 DDNS 更新器（Cloudflare）」并填好根域名、完整主机名、Token，
+开机脚本会自动把 `ddns-update` 装进新实例，作为 systemd timer 运行。
+**只在创建 1 台时可用**：同批实例共用一份 cloud-init，也就共用一个主机名，
+多台同时跑会互相把 DNS 记录改成自己的 IP，面板会在创建前直接拒绝。
+
+另外两种在左侧「通用 → DDNS 解析」，填 DNS 供应商、区域根域名、完整主机名、
+API Token，勾选要更新 A（IPv4）还是 AAAA（IPv6）：
+
+**二、生成一键脚本（给别的机器用）**
 
 点「生成一键脚本」，页面直接给出一段自包含的 bash，复制或下载到目标机器上
 以 root 执行即可：
@@ -935,7 +967,7 @@ journalctl -u ddns-update -n 50           # 看日志
 **脚本里含明文 API Token**，等同于该区域 DNS 的修改权限。传输别走公开渠道，
 部署完建议删掉脚本文件并 `history -c`。
 
-**二、交给面板托管（更新面板这台机器）**
+**三、交给面板托管（更新面板这台机器）**
 
 点「交给面板托管」，规则存进数据库，面板后台每 60 秒扫一遍，同步的是
 **面板所在这台机器**的公网 IP。保存时会实际调一次 API 校验。
@@ -1143,7 +1175,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-799 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+814 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -1177,6 +1209,7 @@ aws_helper/
   core/ddns.py        DNS 供应商接口 + Cloudflare 实现 + 取本机公网 IP
   core/ddns_script.py 生成自包含的 DDNS 一键部署脚本（bash + curl）
   core/guard_script.py 生成实例侧被墙探测脚本（bash + curl + systemd）
+  core/launch_deploy.py 开机时把上面两个脚本内联进 cloud-init
   core/respw.py       通过 SSM 重置实例登录密码
   core/reinstall.py   重装系统（ReplaceRootVolume）+ 前置校验
   autoip.py           自动换 IP 监控循环 + 处理实例上报
@@ -1195,7 +1228,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                799 项测试
+tests/                814 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

@@ -53,6 +53,8 @@ class LaunchRequest:
     root_password: str | None = None
     packages: list[str] = field(default_factory=list)
     set_hostname: bool = True
+    # 面板附带部署的服务段（autoip 探测器、DDNS 更新器），内联进 user-data
+    deploy_blocks: list[str] = field(default_factory=list)
     # 密钥对：留空则新建并返回私钥
     key_name: str | None = None
     tags: dict[str, str] = field(default_factory=dict)
@@ -129,6 +131,7 @@ def launch(
                 root_password=req.root_password,
                 hostname=req.name if req.set_hostname else None,
                 packages=req.packages,
+                deploy_blocks=req.deploy_blocks,
             )
         )
 

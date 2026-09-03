@@ -842,15 +842,40 @@ class Store:
         )
         return token
 
-    def rule_by_agent_token(self, token: str) -> dict[str, Any] | None:
-        """按上报凭证找规则。凭证不对返回 None，不透露规则是否存在。"""
+    def rule_by_agent_token(
+        self, token: str, instance_id: str = ""
+    ) -> dict[str, Any] | None:
+        """按上报凭证找规则。凭证不对返回 None，不透露规则是否存在。
+
+        开机时批量部署的实例共用一个凭证（user-data 在 RunInstances 之前
+        定稿，那时实例 ID 还不存在），所以同一摘要可能对应多条规则。带上
+        实例 ID 才能定位到具体哪一台；不带时只在唯一匹配下返回。
+        """
         if not token:
             return None
-        row = self._fetchone(
-            "SELECT * FROM ip_rules WHERE agent_token_hash=%s",
+        rows = self._fetchall(
+            "SELECT * FROM ip_rules WHERE agent_token_hash=%s ORDER BY id",
             (self._hash_token(token),),
         )
-        return self._clean_rule(row) if row else None
+        if not rows:
+            return None
+        if instance_id:
+            for row in rows:
+                if row["instance_id"] == instance_id:
+                    return self._clean_rule(row)
+            return None
+        return self._clean_rule(rows[0]) if len(rows) == 1 else None
+
+    def save_agent_token_hash(self, rule_id: int, token: str) -> None:
+        """把已知明文的凭证摘要写到规则上。
+
+        开机时批量部署用：一份 user-data 带同一个凭证，实例 ID 要等
+        RunInstances 返回才知道，那时给每台各建一条规则、共用这个摘要。
+        """
+        self._execute(
+            "UPDATE ip_rules SET agent_token_hash=%s WHERE id=%s",
+            (self._hash_token(token), rule_id),
+        )
 
     def touch_agent(
         self, rule_id: int, *, reported: bool = False, detail: str = ""

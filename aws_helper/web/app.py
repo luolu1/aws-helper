@@ -49,6 +49,7 @@ from ..core import (
     guard_script,
     ipchange,
     launch,
+    launch_deploy,
     lightsail,
     reinstall,
     respw,
@@ -267,6 +268,7 @@ def launch_page(request: Request, _: None = Guard):
             "os_families": aws.OS_FAMILIES,
             "architectures": aws.ARCHITECTURES,
             "scripts": store.list_scripts(),
+            "default_target": guard_script.DEFAULT_TARGET,
         },
     )
 
@@ -1398,6 +1400,15 @@ async def api_launch(request: Request, _: None = Guard):
     if not req.name:
         return JSONResponse({"ok": False, "error": "实例名称必填"}, status_code=400)
 
+    # 开机时附带部署 autoip / DDNS。凭证按这一批签发 —— user-data 必须在
+    # RunInstances 之前定稿，那时实例 ID 还不存在。
+    agent_token = secrets.token_urlsafe(32) if body.get("deploy_autoip") else ""
+    try:
+        deploy_blocks, autoip_cfg = _deploy_blocks(body, req, agent_token)
+    except (launch_deploy.DeployError, ScriptError, guard_script.GuardScriptError,
+            ddns_script.ScriptError, RuntimeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
     # 提前校验脚本，避免开机跑到一半才报错
     try:
         render(
@@ -1406,10 +1417,13 @@ async def api_launch(request: Request, _: None = Guard):
                 root_password=req.root_password,
                 hostname=req.name,
                 packages=req.packages,
+                deploy_blocks=deploy_blocks,
             )
         )
     except ScriptError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    req.deploy_blocks = deploy_blocks
 
     def job(progress: Any) -> dict[str, Any]:
         try:
@@ -1432,6 +1446,8 @@ async def api_launch(request: Request, _: None = Guard):
                 name=res.name,
                 os_family=res.os_family,
             )
+            if autoip_cfg is not None:
+                _create_agent_rule(account_id, region, res.instance_id, autoip_cfg)
             store.log(
                 "launch",
                 res.instance_id,
@@ -1453,11 +1469,63 @@ async def api_launch(request: Request, _: None = Guard):
                     "os_family": r.os_family,
                 }
                 for r in results
-            ]
+            ],
+            "deployed_autoip": autoip_cfg is not None,
+            "deployed_ddns": bool(body.get("deploy_ddns")),
         }
 
     task_id = manager.submit("launch", f"开机 {req.name} x{req.count}", job)
     return {"ok": True, "task_id": task_id}
+
+
+def _deploy_blocks(
+    body: dict[str, Any], req: launch.LaunchRequest, agent_token: str
+) -> tuple[list[str], launch_deploy.AutoipDeploy | None]:
+    """按勾选项渲染要内联进 user-data 的部署段。
+
+    Windows 直接拒绝：这两个脚本都是 bash + systemd，装不上去，
+    静默跳过会让用户以为装好了。
+    """
+    blocks: list[str] = []
+    autoip_cfg: launch_deploy.AutoipDeploy | None = None
+    windows = req.image_key.startswith("windows") or "windows" in (req.image_key or "")
+
+    if agent_token:
+        if windows:
+            raise launch_deploy.DeployError("Windows 实例不支持自动换 IP 探测器")
+        autoip_cfg = launch_deploy.parse_autoip(
+            body.get("autoip") or {}, _report_url(), agent_token
+        )
+        blocks.append(launch_deploy.render_autoip_block(autoip_cfg))
+
+    if body.get("deploy_ddns"):
+        if windows:
+            raise launch_deploy.DeployError("Windows 实例不支持 DDNS 更新器")
+        ddns_cfg = launch_deploy.parse_ddns(body.get("ddns") or {}, req.count)
+        blocks.append(launch_deploy.render_ddns_block(ddns_cfg))
+
+    return blocks, autoip_cfg
+
+
+def _create_agent_rule(
+    account_id: int,
+    region: str,
+    instance_id: str,
+    cfg: launch_deploy.AutoipDeploy,
+) -> None:
+    """给刚开好的实例建一条 agent 模式规则，共用这一批的上报凭证。"""
+    rule_id = store.save_ip_rule(
+        account_id=account_id,
+        region=region,
+        instance_id=instance_id,
+        enabled=1,
+        strategy=cfg.strategy,
+        probe_mode="agent",
+        agent_target=cfg.target,
+        agent_interval_sec=cfg.interval_sec,
+        agent_fail_threshold=cfg.fail_threshold,
+    )
+    store.save_agent_token_hash(rule_id, cfg.token)
 
 
 # ---------------- 换 IP API ----------------

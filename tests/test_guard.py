@@ -61,10 +61,26 @@ def _req(**over):
     return gs.GuardRequest(**base)
 
 
-def test_script_requires_instance_and_token():
-    for missing in ("instance_id", "report_url", "token"):
+def test_script_requires_url_and_token():
+    for missing in ("report_url", "token"):
         with pytest.raises(gs.GuardScriptError):
             gs.render_script(_req(**{missing: ""}))
+
+
+def test_instance_id_may_be_empty_for_launch_time_deploy():
+    """开机时部署拿不到实例 ID —— user-data 在 RunInstances 之前就得定稿。
+
+    脚本改为开机后从 IMDS 自己读，所以生成时允许留空。
+    """
+    script = gs.render_script(_req(instance_id=""))
+    assert "GUARD_INSTANCE_ID=''" in script
+    assert "169.254.169.254/latest/meta-data/instance-id" in script
+
+
+def test_explicit_instance_id_wins_over_imds():
+    """手工生成的脚本写死了 ID，不能被 IMDS 覆盖 —— 那台机器可能不是它。"""
+    body = gs._guard_body()
+    assert 'if [ -z "${GUARD_INSTANCE_ID:-}" ]; then' in body
 
 
 def test_script_rejects_non_http_url():

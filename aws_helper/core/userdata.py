@@ -49,6 +49,9 @@ class ScriptOptions:
     hostname: str | None = None
     packages: list[str] = field(default_factory=list)
     run_as_root: bool = True
+    # 面板附带部署的服务段（autoip 探测器、DDNS 更新器）。排在用户脚本之前，
+    # 这样用户脚本里可以引用它们装好的东西。
+    deploy_blocks: list[str] = field(default_factory=list)
 
 
 class ScriptError(ValueError):
@@ -102,6 +105,9 @@ def render(opts: ScriptOptions) -> str:
     if opts.root_password:
         lines.append(_ROOT_LOGIN_BLOCK.format(password=_escape_sq(opts.root_password)))
         lines.append("")
+
+    if opts.deploy_blocks:
+        lines += [*opts.deploy_blocks, ""]
 
     if opts.custom_script.strip():
         lines += ["# --- 用户自定义脚本 ---", opts.custom_script.rstrip(), ""]

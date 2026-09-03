@@ -52,32 +52,23 @@ async def report(
     if _store is None:
         return JSONResponse({"ok": False, "error": "服务未就绪"}, status_code=503)
 
-    rule = _store.rule_by_agent_token(x_guard_token)
-    if rule is None:
-        # 不说明是凭证错还是规则没了 —— 这个端口在公网上，别给探测者线索
-        return JSONResponse({"ok": False, "error": "凭证无效"}, status_code=401)
-
     try:
         body = await request.json()
-    except Exception:
+    except ValueError:
         body = {}
 
     kind = str(body.get("kind") or "alive")[:32]
     detail = str(body.get("detail") or "")[:400]
     claimed = str(body.get("instance_id") or "")
 
-    # 凭证是按实例发的，实例 ID 对不上说明脚本被复制到了别的机器 ——
-    # 那台机器的网络状况不能代表这台，照它上报换 IP 是错的。
-    if claimed and claimed != rule["instance_id"]:
-        _store.log(
-            "autoip",
-            rule["instance_id"],
-            False,
-            f"上报的实例 ID {claimed} 与凭证不匹配，已拒绝",
-        )
-        return JSONResponse(
-            {"ok": False, "error": "实例 ID 与凭证不匹配"}, status_code=403
-        )
+    # 带上实例 ID 查：开机时批量部署的实例共用一个凭证（user-data 在
+    # RunInstances 之前定稿），同一摘要会对应多条规则，只有实例 ID 能定位到
+    # 具体哪一台。凭证对但实例 ID 不在这批里 → 脚本被复制到了别处，拒绝。
+    rule = _store.rule_by_agent_token(x_guard_token, claimed)
+    if rule is None:
+        # 不说明是凭证错、规则没了，还是实例不匹配 —— 这个端口在公网上，
+        # 别给探测者线索
+        return JSONResponse({"ok": False, "error": "凭证无效"}, status_code=401)
 
     result = autoip.handle_agent_report(_store, rule, kind, detail)
     return {"ok": True, **result}

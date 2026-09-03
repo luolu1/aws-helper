@@ -112,6 +112,98 @@
   </p>
 </div>
 
+<div class="card" id="deploy-card">
+  <h2>开机时顺带部署服务</h2>
+  <p class="hint">
+    勾选后把对应的一键脚本内联进 cloud-init，开机自动装好，不用再登录机器手动跑。
+    两者都是 bash + systemd，<strong>Windows 实例不支持</strong>。
+    部署失败不会影响开机，也不会中断你自己写的开机脚本，
+    失败原因留在实例的 <span class="mono">/var/log/aws-helper-*.log</span>。
+  </p>
+
+  <label class="chk">
+    <input type="checkbox" id="deploy_autoip" onchange="toggleDeploy()">
+    部署自动换 IP 探测器（被墙自愈）
+  </label>
+  <div id="deploy-autoip-box" style="display:none" class="mt">
+    <p class="hint">
+      实例自己朝境内探测，连不上才上报面板换 IP。开机后会自动在
+      <a href="/autoip">自动换 IP</a> 页出现一条 agent 规则。
+      实例 ID 由脚本从 EC2 元数据服务自己读取。
+    </p>
+    <div class="grid g4">
+      <label class="f">
+        <span>探测目标（留空用默认）</span>
+        <input type="text" id="lp-target" placeholder="{{ default_target }}">
+      </label>
+      <label class="f">
+        <span>探测间隔（秒，最低 20）</span>
+        <input type="number" id="lp-interval" value="60" min="20" max="3600">
+      </label>
+      <label class="f">
+        <span>连续失败几次上报</span>
+        <input type="number" id="lp-threshold" value="3" min="1" max="20">
+      </label>
+      <label class="f">
+        <span>换 IP 方式</span>
+        <select id="lp-strategy">
+          <option value="eip">弹性 IP（不停机）</option>
+          <option value="dynamic">停机重启换动态 IP</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <label class="chk mt">
+    <input type="checkbox" id="deploy_ddns" onchange="toggleDeploy()">
+    部署 DDNS 更新器（Cloudflare）
+  </label>
+  <div id="deploy-ddns-box" style="display:none" class="mt">
+    <p class="hint">
+      实例自己定时把公网 IP 同步到这个主机名。
+      <strong>一次只能给 1 台实例部署</strong> —— 同批实例共用一份 cloud-init，
+      也就共用同一个主机名，开起来会互相把记录改成自己的 IP。
+    </p>
+    <div class="grid g3">
+      <label class="f">
+        <span>区域根域名</span>
+        <input type="text" id="lp-zone" placeholder="example.com">
+      </label>
+      <label class="f">
+        <span>完整主机名</span>
+        <input type="text" id="lp-hostname" placeholder="node.example.com">
+      </label>
+      <label class="f">
+        <span>Cloudflare API Token</span>
+        <input type="password" id="lp-token" placeholder="需要 Zone → DNS → Edit 权限">
+      </label>
+    </div>
+    <div class="grid g3 mt">
+      <label class="f">
+        <span>同步间隔（秒）</span>
+        <input type="number" id="lp-ddns-interval" value="300" min="60" max="86400">
+      </label>
+      <label class="f">
+        <span>Account ID（可选）</span>
+        <input type="text" id="lp-cf-account" placeholder="32 位十六进制">
+      </label>
+      <div class="f">
+        <span>记录类型</span>
+        <div class="row" style="gap:12px">
+          <label class="chk"><input type="checkbox" id="lp-v4" checked> A（IPv4）</label>
+          <label class="chk"><input type="checkbox" id="lp-v6"> AAAA（IPv6）</label>
+          <label class="chk"><input type="checkbox" id="lp-proxied"> 走 CF 代理</label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="hint mt" id="deploy-win-note" style="display:none">
+    <span class="tag warn">Windows</span>
+    这两个服务对 Windows 无效，已自动取消勾选。
+  </p>
+</div>
+
 <div class="card" id="linux-only-card">
   <h2>开机脚本</h2>
   <p class="hint">
@@ -260,6 +352,7 @@ function applyOsMode(isWindows) {
   });
   const note = document.getElementById('win-note');
   if (note) note.style.display = isWindows ? '' : 'none';
+  toggleDeploy();
 }
 
 document.addEventListener('DOMContentLoaded', loadCatalog);
@@ -273,7 +366,10 @@ function togglePorts() {
     ? '当前安全组：<span class="tag warn">全部端口 + 全部协议对 0.0.0.0/0 开放</span> 取消勾选可改为只放通上面填写的端口。'
     : '当前安全组：<span class="tag ok">只放通指定端口</span> 勾选上面的复选框可改为全部放通。';
 }
-document.addEventListener('DOMContentLoaded', togglePorts);
+document.addEventListener('DOMContentLoaded', () => {
+  togglePorts();
+  toggleDeploy();
+});
 
 function applyTpl() {
   const opt = document.getElementById('tpl').selectedOptions[0];
@@ -286,6 +382,10 @@ function collect() {
   const isWindows = document.getElementById('os_family').value === 'windows';
   const ports = document.getElementById('open_ports').value
     .split(',').map(s => parseInt(s.trim(), 10)).filter(n => n >= 1 && n <= 65535);
+  const wantAutoip = !isWindows && document.getElementById('deploy_autoip').checked;
+  const wantDdns = !isWindows && document.getElementById('deploy_ddns').checked;
+  const num = id => parseInt(document.getElementById(id).value, 10);
+  const val = id => document.getElementById(id).value.trim();
   return {
     account_id: parseInt(document.getElementById('account_id').value, 10),
     region: document.getElementById('region').value,
@@ -303,8 +403,50 @@ function collect() {
     root_password: isWindows ? '' : document.getElementById('root_password').value.trim(),
     packages: isWindows
       ? []
-      : document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean)
+      : document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean),
+    deploy_autoip: wantAutoip,
+    deploy_ddns: wantDdns,
+    autoip: wantAutoip ? {
+      target: val('lp-target'),
+      interval_sec: num('lp-interval') || 60,
+      fail_threshold: num('lp-threshold') || 3,
+      strategy: document.getElementById('lp-strategy').value
+    } : null,
+    ddns: wantDdns ? {
+      zone: val('lp-zone'),
+      hostname: val('lp-hostname'),
+      token: document.getElementById('lp-token').value.trim(),
+      cf_account_id: val('lp-cf-account'),
+      interval_sec: num('lp-ddns-interval') || 300,
+      want_ipv4: document.getElementById('lp-v4').checked,
+      want_ipv6: document.getElementById('lp-v6').checked,
+      proxied: document.getElementById('lp-proxied').checked
+    } : null
   };
+}
+
+// Windows 装不了这两个服务（bash + systemd），勾了也要清掉 ——
+// 静默忽略会让用户以为装好了。
+function toggleDeploy() {
+  const isWindows = document.getElementById('os_family').value === 'windows';
+  const autoipBox = document.getElementById('deploy-autoip-box');
+  const ddnsBox = document.getElementById('deploy-ddns-box');
+  const autoip = document.getElementById('deploy_autoip');
+  const ddns = document.getElementById('deploy_ddns');
+
+  if (isWindows) {
+    autoip.checked = false;
+    ddns.checked = false;
+    autoip.disabled = true;
+    ddns.disabled = true;
+    document.getElementById('deploy-win-note').style.display = '';
+  } else {
+    autoip.disabled = false;
+    ddns.disabled = false;
+    document.getElementById('deploy-win-note').style.display = 'none';
+  }
+  autoipBox.style.display = autoip.checked ? '' : 'none';
+  ddnsBox.style.display = ddns.checked ? '' : 'none';
 }
 
 async function preview() {
@@ -325,7 +467,16 @@ async function doLaunch() {
   const c = collect();
   if (!c.name) return toast('实例名称必填', 'err');
   const sg = c.allow_all_ports ? '全部端口对 0.0.0.0/0 开放' : `仅放通 ${c.open_ports.join(', ')}`;
-  if (!confirm(`确认在 ${c.region} 创建 ${c.count} 台 ${c.instance_type}？\n安全组：${sg}\n会产生实际费用。`)) return;
+  if (c.deploy_ddns) {
+    if (!c.ddns.zone || !c.ddns.hostname) return toast('DDNS 需要填区域根域名和主机名', 'err');
+    if (!c.ddns.token) return toast('DDNS 需要填 Cloudflare API Token', 'err');
+    if (c.count > 1) return toast('DDNS 一次只能给 1 台实例部署，同批会抢同一个主机名', 'err');
+  }
+  const svc = [];
+  if (c.deploy_autoip) svc.push('自动换 IP 探测器');
+  if (c.deploy_ddns) svc.push(`DDNS（${c.ddns.hostname}）`);
+  const svcLine = svc.length ? `\n开机后自动部署：${svc.join('、')}` : '';
+  if (!confirm(`确认在 ${c.region} 创建 ${c.count} 台 ${c.instance_type}？\n安全组：${sg}${svcLine}\n会产生实际费用。`)) return;
 
   try {
     const r = await api('/api/launch', { method: 'POST', json: c });
@@ -367,6 +518,18 @@ function showResult(list, cfg) {
   hint += isWin
     ? '（Windows 用这个私钥在 EC2 控制台「获取 Windows 密码」处解密出 Administrator 密码）'
     : '（AWS 只在创建时返回一次私钥，请及时保存到本地并 chmod 600）';
+
+  // 部署是 cloud-init 里跑的，开机返回时通常还没装完 —— 说清楚要等，
+  // 否则用户立刻去看状态发现「未部署」会以为失败了。
+  if (cfg.deploy_autoip || cfg.deploy_ddns) {
+    const svc = [];
+    if (cfg.deploy_autoip) svc.push('<a href="/autoip">自动换 IP 探测器</a>');
+    if (cfg.deploy_ddns) svc.push('<a href="/ddns">DDNS 更新器</a>');
+    hint += `<br>已把 ${svc.join(' 和 ')} 写进开机脚本，`
+      + '装完通常要 1-3 分钟（等系统起来 + 装 curl）。'
+      + '之后在对应页面点「检测」确认状态；'
+      + '失败原因在实例的 <span class="mono">/var/log/aws-helper-*.log</span>。';
+  }
   document.getElementById('key-hint').innerHTML = hint;
 }
 

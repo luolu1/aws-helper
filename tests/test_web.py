@@ -1576,7 +1576,11 @@ def test_report_accepts_valid_token(client):
 
 
 def test_report_rejects_instance_id_mismatch(client):
-    """凭证按实例发。脚本被复制到别的机器时，那台的网络状况不代表这台。"""
+    """脚本被复制到别的机器时，那台的网络状况不代表这台，必须拒绝。
+
+    返回 401 而不是 403：这个端口在公网上，区分「凭证错」和「实例不匹配」
+    等于告诉探测者凭证是有效的。
+    """
     c, aid, app_module = client
     rid = _make_agent_rule(app_module, aid)
     token = app_module.store.issue_agent_token(rid)
@@ -1587,8 +1591,39 @@ def test_report_rejects_instance_id_mismatch(client):
         json={"kind": "blocked", "instance_id": "i-someone-else"},
         headers={"X-Guard-Token": token},
     )
-    assert r.status_code == 403
-    assert "不匹配" in r.json()["error"]
+    assert r.status_code == 401
+
+
+def test_batch_token_routes_by_instance_id(client):
+    """开机时批量部署的实例共用一个凭证，只有实例 ID 能定位到具体哪一台。"""
+    c, aid, app_module = client
+    first = _make_agent_rule(app_module, aid, "i-batch-a")
+    second = _make_agent_rule(app_module, aid, "i-batch-b")
+    token = app_module.store.issue_agent_token(first)
+    app_module.store.save_agent_token_hash(second, token)
+    rc = _report_client(app_module)
+
+    for iid, rid in (("i-batch-a", first), ("i-batch-b", second)):
+        r = rc.post(
+            "/report",
+            json={"kind": "alive", "instance_id": iid, "detail": "ok"},
+            headers={"X-Guard-Token": token},
+        )
+        assert r.status_code == 200, iid
+        assert app_module.store.ip_rule(rid)["agent_last_seen"] > 0, iid
+
+
+def test_batch_token_without_instance_id_is_ambiguous(client):
+    """同一凭证对应多台时不带实例 ID 无法定位，不能随便挑一条改 IP。"""
+    c, aid, app_module = client
+    first = _make_agent_rule(app_module, aid, "i-batch-a")
+    second = _make_agent_rule(app_module, aid, "i-batch-b")
+    token = app_module.store.issue_agent_token(first)
+    app_module.store.save_agent_token_hash(second, token)
+    rc = _report_client(app_module)
+
+    r = rc.post("/report", json={"kind": "alive"}, headers={"X-Guard-Token": token})
+    assert r.status_code == 401
 
 
 def test_report_blocked_triggers_ip_change(client):
@@ -1637,3 +1672,279 @@ def test_ddns_page_has_status_check():
     html = Path("aws_helper/web/templates/ddns.html").read_text()
     assert "function checkDdns" in html
     assert "排查方向" in html
+
+
+# ---------- 开机时顺带部署服务 ----------
+
+
+def _launch_body(aid, **over):
+    base = {
+        "account_id": aid,
+        "region": "us-east-1",
+        "name": "deploy-node",
+        "instance_type": "t3.micro",
+    }
+    base.update(over)
+    return base
+
+
+def test_launch_without_deploy_has_no_service_blocks(client, monkeypatch):
+    """不勾选时 user-data 里不该出现任何部署段。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    with patch.object(app_module.launch, "launch", wraps=app_module.launch.launch) as spy:
+        wait_task(c, c.post("/api/launch", json=_launch_body(aid)).json()["task_id"])
+        req = spy.call_args.args[1]
+
+    assert req.deploy_blocks == []
+
+
+def test_launch_embeds_autoip_agent(client, monkeypatch):
+    """勾选后探测器脚本要真的进 RunInstances 的 UserData。
+
+    断言的是**发给 AWS 的 UserData**，不是 req.deploy_blocks —— 后者是
+    路由层设的中间值，把 userdata 的渲染整段删掉它照样非空（控制实验证过）。
+    """
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    sent: dict[str, str] = {}
+    real = app_module.launch._run_instances
+
+    def spy(session, req, *a, **kw):
+        out = real(session, req, *a, **kw)
+        sent["user_data"] = a[-1] if a else kw.get("user_data", "")
+        return out
+
+    with patch.object(app_module.launch, "_run_instances", side_effect=spy):
+        task = wait_task(
+            c,
+            c.post(
+                "/api/launch",
+                json=_launch_body(
+                    aid,
+                    deploy_autoip=True,
+                    autoip={"target": "www.qq.com:443", "interval_sec": 30},
+                ),
+            ).json()["task_id"],
+        )
+
+    blob = sent["user_data"]
+    assert "GUARD_TOKEN=" in blob
+    assert "www.qq.com" in blob
+    assert "GUARD_INTERVAL=30" in blob
+    assert "http://panel:8766/report" in blob
+    assert task["result"]["deployed_autoip"] is True
+
+
+def test_launch_creates_agent_rule_per_instance(client, monkeypatch):
+    """开机成功后每台各建一条 agent 规则，共用这一批的凭证。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    task = wait_task(
+        c,
+        c.post(
+            "/api/launch",
+            json=_launch_body(aid, count=2, deploy_autoip=True, autoip={}),
+        ).json()["task_id"],
+    )
+    ids = {i["instance_id"] for i in task["result"]["instances"]}
+    rules = {
+        r["instance_id"]: r
+        for r in app_module.store.list_ip_rules()
+        if r["probe_mode"] == "agent"
+    }
+
+    assert ids <= set(rules), f"每台都要有规则: {ids} vs {set(rules)}"
+    for iid in ids:
+        assert rules[iid]["agent_deployed"] is True
+        assert rules[iid]["enabled"] == 1
+
+
+def test_launch_agent_token_works_for_whole_batch(client, monkeypatch):
+    """同批实例共用凭证，各自用自己的实例 ID 上报都要能通。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    with patch_launch_capture(app_module) as captured:
+        task = wait_task(
+            c,
+            c.post(
+                "/api/launch",
+                json=_launch_body(aid, count=2, deploy_autoip=True, autoip={}),
+            ).json()["task_id"],
+        )
+    token = captured["token"]
+    rc = _report_client(app_module)
+
+    for inst in task["result"]["instances"]:
+        r = rc.post(
+            "/report",
+            json={"kind": "alive", "instance_id": inst["instance_id"]},
+            headers={"X-Guard-Token": token},
+        )
+        assert r.status_code == 200, inst["instance_id"]
+
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def patch_launch_capture(app_module):
+    """抓出内联进 user-data 的上报凭证，用来验证批内路由。"""
+    import re
+    from unittest.mock import patch
+
+    captured: dict[str, str] = {}
+    real = app_module.launch.launch
+
+    def spy(creds, req, progress=None):
+        blob = "\n".join(req.deploy_blocks)
+        found = re.search(r"GUARD_TOKEN='?([A-Za-z0-9_\-]+)'?", blob)
+        if found:
+            captured["token"] = found.group(1)
+        return real(creds, req, progress) if progress else real(creds, req)
+
+    with patch.object(app_module.launch, "launch", side_effect=spy):
+        yield captured
+
+
+def test_launch_embeds_ddns_updater(client, monkeypatch):
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    from unittest.mock import patch
+
+    with patch.object(app_module.launch, "launch", wraps=app_module.launch.launch) as spy:
+        task = wait_task(
+            c,
+            c.post(
+                "/api/launch",
+                json=_launch_body(
+                    aid,
+                    deploy_ddns=True,
+                    ddns={
+                        "zone": "example.com",
+                        "hostname": "node.example.com",
+                        "token": "A" * 40,
+                    },
+                ),
+            ).json()["task_id"],
+        )
+        req = spy.call_args.args[1]
+
+    blob = "\n".join(req.deploy_blocks)
+    assert "DDNS_HOSTNAME=node.example.com" in blob
+    assert "CF_TOKEN=" in blob
+    assert task["result"]["deployed_ddns"] is True
+
+
+def test_ddns_block_reaches_user_data(client, monkeypatch):
+    """同样断言到 UserData 层，不停在中间值上。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    sent: dict[str, str] = {}
+    real = app_module.launch._run_instances
+
+    def spy(session, req, *a, **kw):
+        out = real(session, req, *a, **kw)
+        sent["user_data"] = a[-1] if a else kw.get("user_data", "")
+        return out
+
+    with patch.object(app_module.launch, "_run_instances", side_effect=spy):
+        wait_task(
+            c,
+            c.post(
+                "/api/launch",
+                json=_launch_body(
+                    aid,
+                    deploy_ddns=True,
+                    ddns={
+                        "zone": "example.com",
+                        "hostname": "node.example.com",
+                        "token": "A" * 40,
+                    },
+                ),
+            ).json()["task_id"],
+        )
+
+    assert "DDNS_HOSTNAME=node.example.com" in sent["user_data"]
+
+
+def test_ddns_deploy_rejected_for_multiple_instances(client, monkeypatch):
+    """同批共用一份 user-data，也就共用主机名，会互相抢 DNS 记录。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    r = c.post(
+        "/api/launch",
+        json=_launch_body(
+            aid,
+            count=3,
+            deploy_ddns=True,
+            ddns={"zone": "example.com", "hostname": "n.example.com", "token": "A" * 40},
+        ),
+    )
+    assert r.status_code == 400
+    assert "1 台" in r.json()["error"]
+
+
+def test_bad_ddns_config_rejected_before_launch(client, monkeypatch):
+    """配置错了要在开机之前挡住 —— 机器开起来了才报错等于白花钱。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    r = c.post(
+        "/api/launch",
+        json=_launch_body(
+            aid,
+            deploy_ddns=True,
+            ddns={"zone": "example.com", "hostname": "other.org", "token": "A" * 40},
+        ),
+    )
+    assert r.status_code == 400
+    assert "不属于区域" in r.json()["error"]
+
+    before = len(c.get(f"/api/instances?account_id={aid}&region=us-east-1").json()["instances"])
+    assert before == 0, "开机不该发生"
+
+
+def test_deploy_needs_report_url_configured(client, monkeypatch):
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "")
+    monkeypatch.setattr(app_module.ddns, "detect_ip", lambda *a, **k: "")
+
+    r = c.post("/api/launch", json=_launch_body(aid, deploy_autoip=True, autoip={}))
+    assert r.status_code == 400
+    assert "AWS_HELPER_REPORT_URL" in r.json()["error"]
+
+
+def test_deploy_blocks_run_before_user_script():
+    """用户脚本必须仍是最后执行的 —— userdata 的既有契约。"""
+    from aws_helper.core import launch_deploy as ld
+    from aws_helper.core.userdata import ScriptOptions, render
+
+    block = ld.render_autoip_block(
+        ld.AutoipDeploy(report_url="http://p:8766/report", token="t")
+    )
+    out = render(
+        ScriptOptions(custom_script="echo mine", deploy_blocks=[block], hostname="n")
+    )
+    assert out.index("自动换 IP 探测器") < out.index("用户自定义脚本")
+
+
+def test_launch_page_has_deploy_checkboxes():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/launch.html").read_text()
+    assert 'id="deploy_autoip"' in html
+    assert 'id="deploy_ddns"' in html
+    assert "function toggleDeploy" in html
+    assert "deploy_autoip: wantAutoip" in html
