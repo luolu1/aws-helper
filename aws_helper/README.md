@@ -1,6 +1,6 @@
 # AWS 小助手
 
-一键开机、换 IP、开机脚本。Web 面板 + 后台自动换 IP 监控。
+一键开机、换 IP、开机脚本。Web 面板 + 实例侧被墙自愈上报。
 
 ## 为什么写这个
 
@@ -217,23 +217,21 @@ Windows 自动禁用 BBR，因为这是 Linux 内核特性。
 
 ### 自动换 IP
 
-后台每 30 秒扫一遍规则，按各自间隔探测实例 TCP 端口，
-连续失败达到阈值就自动换 IP。也就是 IP 被墙后自动更换。
+探测由实例上的 `aws-helper-guard` 完成：从境内方向连国内站点，连续失败达到阈值
+才上报面板，面板换 IP。**面板自己不探测** —— 它在海外，从海外连实例一直是通的，
+判断不了被墙，还要为此周期性调 `DescribeInstances`。老版本的 `local` 模式已移除，
+升级后旧规则自动迁成 agent。
 
-每条规则可配：探测端口、检查间隔、失败阈值、换 IP 策略、允许/排除的 IP 段、最大尝试次数。
-探测恢复后失败计数清零，不会累积误触发。
+每条规则可配：探测目标、探测间隔、失败阈值、换 IP 策略、允许/排除的 IP 段、最大尝试次数。
+探测恢复后实例侧失败计数清零，不会累积误触发；面板侧换过 IP 有 30 分钟冷却。
 
-也可以脱离 Web 单独跑：
-
-```bash
-python3 -m aws_helper.autoip
-```
+部署路径两条：创建实例时勾选（写进 cloud-init），或在自动换 IP 页生成一键脚本。
 
 ## DDNS 动态解析
 
 本机公网 IP 变了自动更新 DNS 解析。域名托管在 Cloudflare，支持 A / AAAA。
 
-和自动换 IP 方向相反：自动换 IP 是实例被墙了换新 IP，DDNS 是本机 IP 变了让域名跟上。
+和自动换 IP 方向相反：自动换 IP 是实例上报被墙后换新 IP，DDNS 是本机 IP 变了让域名跟上。
 
 用 Cloudflare **API Token**（不是 Global API Key），权限 `Zone → DNS → Edit`，
 区域范围只勾目标域名。Token 用 Fernet 加密存库，接口不回传明文也不回传密文。
@@ -481,10 +479,10 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-836 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+820 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
-登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
+登录锁定、CLI 密码重置、实例上报换 IP 与冷却、旧 local 规则迁移、SQLite 迁移与序列校正、
 并发写入、缓存命中与失效、DDNS 解析同步与一键脚本生成、SSM 重置密码、
 重装系统。
 
@@ -516,7 +514,7 @@ aws_helper/
   core/respw.py      通过 SSM 重置实例登录密码
   core/reinstall.py  重装系统（ReplaceRootVolume）+ 前置校验
   tasks.py           后台任务与进度跟踪
-  autoip.py          自动换 IP 监控循环
+  autoip.py          处理实例上报并换 IP（无面板侧探测）
   web/app.py         FastAPI 路由
   web/report_app.py  实例上报专用端口（只有 /report 和 /health）
   web/templates/     左侧目录布局 + 十一个页面
