@@ -43,6 +43,7 @@ from ..cache import (
 )
 from ..core import (
     aws,
+    bbr,
     bedrock,
     ddns,
     ddns_script,
@@ -350,7 +351,13 @@ def api_catalog(
 @app.get("/scripts", response_class=HTMLResponse)
 def scripts_page(request: Request, _: None = Guard):
     return templates.TemplateResponse(
-        request, "scripts.html", {**_page_ctx("scripts"), "scripts": store.list_scripts()}
+        request,
+        "scripts.html",
+        {
+            **_page_ctx("scripts"),
+            "scripts": store.list_scripts(),
+            "presets": [{"name": bbr.TEMPLATE_NAME, "body": bbr.TEMPLATE_BODY}],
+        },
     )
 
 
@@ -1472,6 +1479,7 @@ async def api_launch(request: Request, _: None = Guard):
             ],
             "deployed_autoip": autoip_cfg is not None,
             "deployed_ddns": bool(body.get("deploy_ddns")),
+            "deployed_bbr": bool(body.get("deploy_bbr")),
         }
 
     task_id = manager.submit("launch", f"开机 {req.name} x{req.count}", job)
@@ -1489,6 +1497,11 @@ def _deploy_blocks(
     blocks: list[str] = []
     autoip_cfg: launch_deploy.AutoipDeploy | None = None
     windows = req.image_key.startswith("windows") or "windows" in (req.image_key or "")
+
+    if body.get("deploy_bbr"):
+        if windows:
+            raise launch_deploy.DeployError("Windows 实例不支持 BBR（Linux 内核特性）")
+        blocks.append("# --- 开启 BBR 加速 ---\n" + bbr.render())
 
     if agent_token:
         if windows:
@@ -1608,6 +1621,40 @@ def api_save_script(
     except ScriptError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     script_id = store.save_script(name.strip(), body, pkgs)
+    return {"ok": True, "id": script_id}
+
+
+@app.post("/api/scripts/id/{script_id}")
+def api_update_script(
+    script_id: int,
+    name: str = Form(...),
+    body: str = Form(""),
+    packages: str = Form(""),
+    _: None = Guard,
+):
+    """按 id 改模板。跟新建分开是因为这条允许改名 ——
+    走新建那条路（name 冲突合并）改名会变成新增一条，原记录还留着。
+    """
+    pkgs = [p.strip() for p in packages.replace(",", " ").split() if p.strip()]
+    try:
+        render(ScriptOptions(custom_script=body, packages=pkgs))
+    except ScriptError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    clean = name.strip()
+    if not clean:
+        return JSONResponse({"ok": False, "error": "模板名称必填"}, status_code=400)
+
+    # 改名撞上别的模板要明确报错。让唯一约束抛数据库异常的话，
+    # 用户看到的是一串 psycopg 报文。
+    taken = [s for s in store.list_scripts() if s["name"] == clean and s["id"] != script_id]
+    if taken:
+        return JSONResponse(
+            {"ok": False, "error": f"已有同名模板「{clean}」"}, status_code=400
+        )
+
+    if not store.update_script(script_id, clean, body, pkgs):
+        return JSONResponse({"ok": False, "error": "模板不存在"}, status_code=404)
     return {"ok": True, "id": script_id}
 
 

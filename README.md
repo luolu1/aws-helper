@@ -64,7 +64,8 @@ Bedrock 没有实例概念，只有模型和 token 计费。所以各栏有自�
 | 一键开机 | 系统类别 → 架构 → 镜像 → 规格 四级选择，镜像和规格实时从 AWS 拉取 |
 | 开机即部署 | 创建时可勾选自动换 IP 探测器和 DDNS，写进 cloud-init 开机自动装好 |
 | Windows 支持 | Windows Server 2019/2022/2025（含简体中文），自动禁用 Linux 专属字段 |
-| 开机脚本 | 走 EC2 原生 UserData，cloud-init 首次启动以 root 执行，可存模板复用 |
+| 开机脚本 | 走 EC2 原生 UserData，cloud-init 首次启动以 root 执行，模板可存可编辑 |
+| BBR 加速 | 开机勾选即开启 BBR + fq，只改 sysctl 不换内核；也可存成模板复用 |
 | 换 IP | 弹性 IP 重分配（不停机）或停机重启换动态 IP，支持 IP 段白/黑名单 |
 | 自动换 IP | 实例自己朝境内探测，被墙才上报，面板换 IP；也支持面板侧探测端口 |
 | 部署状态 | 自动换 IP 和 DDNS 都能在面板看部署状态，手动检测给出具体排查方向 |
@@ -697,6 +698,46 @@ moto 允许多个 EIP 同时绑到一个实例、`Ipv6AddressCount` 不生效等
 
 ---
 
+## BBR 加速与脚本模板编辑
+
+### BBR
+
+一键开机页的「开机时顺带部署服务」可勾选「开启 BBR 加速」。它在首次启动时：
+
+```conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+```
+
+BBR 对跨境、高延迟、高丢包的 TCP 链路提升明显；`fq` 是配套队列规则，BBR 依赖
+发包时机（pacing），只设拥塞控制算法不设 `fq`，效果会打折。
+
+这里**只改 sysctl，不换内核、不重启**。面板支持的 Ubuntu 22/24、Debian 12、
+Amazon Linux 2023 都是 5.10+，BBR 早已编译进内核。网上常见的 BBR 脚本会换内核，
+那会重启、可能开不了机，不适合悄悄放进 cloud-init。
+
+脚本先检查 `tcp_available_congestion_control` 是否有 bbr；没有就输出「当前内核不支持
+BBR，已跳过」且正常退出，不会影响开机。设置后还会回读当前算法，只有真的变成
+`bbr` 才报告成功。它是幂等的，重复执行不会堆积配置。
+
+也可以在「开机脚本」页点「BBR 加速」现成脚本，填进编辑区后按需要修改、预览、保存。
+
+### 脚本模板可编辑
+
+原来的「载入」实际只是填回编辑区，改名后会新建一条，用户看不出自己是在编辑还是
+复制。现在列表有明确的三种操作：
+
+| 操作 | 结果 |
+|---|---|
+| 编辑 | 按模板 ID 更新，可改名称、内容、预装包；改名仍是同一条记录 |
+| 复制一份 | 内容填回编辑区，名称自动加「副本」，保存时新建，不碰原模板 |
+| 删除 | 删除模板 |
+
+编辑改名撞上已有名称时会给出「已有同名模板」的可读错误，不会把 PostgreSQL 的
+`UniqueViolation` 原始报文露给页面。
+
+---
+
 ## 一键部署
 
 克隆仓库后执行安装脚本，两种方式二选一：
@@ -1175,7 +1216,7 @@ python3 -m pytest tests/ -q
 每个测试独占一个随机 schema，跑完自动 DROP —— 这样能验证真实的唯一约束、
 upsert 语义和级联删除，而不是 mock 掉 SQL 假装通过。
 
-814 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
+836 个测试。AWS 侧全部用 moto 模拟，不碰真实账号；数据库侧用真实 Postgres，
 不 mock SQL。覆盖开机全链路、UserData 注入与顺序、安全组端口、换 IP 两种策略、
 弹性 IP 泄漏与孤儿回收、凭据与代理加密、账号编辑、密码哈希与登录锁定、
 CLI 重置、SQLite 迁移与序列校正、并发写入、缓存与失效、DDNS 解析同步、
@@ -1216,6 +1257,7 @@ aws_helper/
   tasks.py            后台任务与进度跟踪
   core/aws.py         boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
   core/userdata.py    开机脚本渲染与校验
+  core/bbr.py         开启 BBR 拥塞控制（只改 sysctl，不换内核）
   core/launch.py      EC2 一键开机、实例列表、电源操作、终止清理
   core/ipchange.py    换 IP 两种策略、弹性 IP 清理
   core/lightsail.py   Lightsail 套餐、蓝图、实例、静态 IP
@@ -1228,7 +1270,7 @@ deploy/install.sh     一键部署（systemd / docker 两种方式）
 Dockerfile            容器镜像（非 root + healthcheck）
 docker-compose.yml    compose 服务定义
 requirements.txt      固定版本的运行时依赖
-tests/                814 项测试
+tests/                836 项测试
 ```
 
 更详细的功能说明见 [aws_helper/README.md](aws_helper/README.md)。

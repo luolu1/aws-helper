@@ -578,6 +578,32 @@ class Store:
             (name, body, json.dumps(packages or []), int(time.time())),
         )
 
+    def script(self, script_id: int) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT id,name,body,packages,created_at FROM scripts WHERE id=%s",
+            (script_id,),
+        )
+        if row is None:
+            return None
+        item = dict(row)
+        item["packages"] = json.loads(item["packages"])
+        return item
+
+    def update_script(
+        self, script_id: int, name: str, body: str, packages: list[str] | None = None
+    ) -> bool:
+        """按 id 改模板，允许改名。
+
+        跟 save_script 的区别是这条按 id 定位：save_script 走 name 冲突合并，
+        改名会变成新建一条，原来那条还留着。编辑必须按 id。
+        返回是否命中了记录。
+        """
+        row = self._fetchone(
+            "UPDATE scripts SET name=%s, body=%s, packages=%s WHERE id=%s RETURNING id",
+            (name, body, json.dumps(packages or []), script_id),
+        )
+        return row is not None
+
     def list_scripts(self) -> list[dict[str, Any]]:
         rows = self._fetchall(
             "SELECT id,name,body,packages,created_at FROM scripts ORDER BY id DESC"

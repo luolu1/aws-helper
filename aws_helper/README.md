@@ -185,6 +185,17 @@ CLI 只读写本地数据目录，不经过网络和登录校验，面板打不�
 
 可以先点「预览最终脚本」看完整内容再创建。常用脚本可存成模板复用。
 
+模板页现在区分「编辑」和「复制一份」：编辑按 ID 更新，可改名称、内容和预装包；
+复制一份会给名称加「副本」，保存为新模板，原模板不受影响。改名撞已有模板会显示
+可读错误，不把 Postgres 的原始唯一约束错误露给页面。
+
+内置有「BBR 加速」现成脚本：开启 `net.ipv4.tcp_congestion_control=bbr` 和
+`net.core.default_qdisc=fq`。它只改 sysctl、**不换内核也不重启**；先检查内核是否
+支持 BBR，设置后回读确认，重复执行不堆积配置。
+
+一键开机页也能勾选开机时开启 BBR。部署段排在用户脚本之前，用户脚本仍是最后执行。
+Windows 自动禁用 BBR，因为这是 Linux 内核特性。
+
 开启 root 密码登录用的是 `sshd_config.d/` drop-in 文件，不删除原有配置。
 主配置里硬编码了 `PasswordAuthentication no` 且不含 `Include` 时会就地修正。
 
@@ -470,7 +481,7 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-814 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+836 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
@@ -490,6 +501,7 @@ aws_helper/
   cli.py             密码重置 / 状态查看 / 下线全部会话
   core/aws.py        boto3 客户端工厂、SOCKS 代理、区域与镜像目录、账号探测
   core/userdata.py   开机脚本渲染与校验
+  core/bbr.py        开启 BBR 拥塞控制（只改 sysctl）
   core/launch.py     一键开机、实例列表、电源操作
   core/ipchange.py   换 IP 两种策略、EIP 清理
   core/lightsail.py  Lightsail 套餐、蓝图、实例、静态 IP

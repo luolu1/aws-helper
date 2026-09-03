@@ -1948,3 +1948,173 @@ def test_launch_page_has_deploy_checkboxes():
     assert 'id="deploy_ddns"' in html
     assert "function toggleDeploy" in html
     assert "deploy_autoip: wantAutoip" in html
+
+
+# ---------- BBR 加速 ----------
+
+
+def test_launch_embeds_bbr_when_checked(client, monkeypatch):
+    """勾选后 BBR 段要真的进 RunInstances 的 UserData。"""
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    sent: dict[str, str] = {}
+    real = app_module.launch._run_instances
+
+    def spy(session, req, *a, **kw):
+        out = real(session, req, *a, **kw)
+        sent["user_data"] = a[-1] if a else kw.get("user_data", "")
+        return out
+
+    with patch.object(app_module.launch, "_run_instances", side_effect=spy):
+        task = wait_task(
+            c,
+            c.post("/api/launch", json=_launch_body(aid, deploy_bbr=True)).json()["task_id"],
+        )
+
+    blob = sent["user_data"]
+    assert "net.ipv4.tcp_congestion_control = bbr" in blob
+    assert "net.core.default_qdisc = fq" in blob
+    assert task["result"]["deployed_bbr"] is True
+
+
+def test_launch_without_bbr_has_no_bbr_block(client):
+    from unittest.mock import patch
+
+    c, aid, app_module = client
+    sent: dict[str, str] = {}
+    real = app_module.launch._run_instances
+
+    def spy(session, req, *a, **kw):
+        out = real(session, req, *a, **kw)
+        sent["user_data"] = a[-1] if a else kw.get("user_data", "")
+        return out
+
+    with patch.object(app_module.launch, "_run_instances", side_effect=spy):
+        wait_task(c, c.post("/api/launch", json=_launch_body(aid)).json()["task_id"])
+
+    assert "tcp_congestion_control" not in sent["user_data"]
+
+
+def test_bbr_rejected_on_windows(client):
+    c, aid, app_module = client
+    r = c.post(
+        "/api/launch",
+        json=_launch_body(aid, image_key="windows-server-2022", deploy_bbr=True),
+    )
+    assert r.status_code == 400
+    assert "Windows" in r.json()["error"]
+
+
+def test_launch_page_has_bbr_checkbox():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/launch.html").read_text()
+    assert 'id="deploy_bbr"' in html
+    assert "deploy_bbr: !isWindows" in html
+    assert "不换内核" in html, "要说清不动内核，否则用户会担心开不了机"
+
+
+# ---------- 开机脚本模板可编辑 ----------
+
+
+def test_update_script_by_id_allows_rename(client):
+    """编辑必须按 id：走新建那条路（按 name 合并）改名会变成新增一条。"""
+    c, aid, app_module = client
+    sid = app_module.store.save_script("原名", "echo a", ["curl"])
+
+    r = c.post(
+        f"/api/scripts/id/{sid}",
+        data={"name": "新名", "body": "echo b", "packages": "wget vim"},
+    )
+    assert r.status_code == 200
+
+    scripts = app_module.store.list_scripts()
+    assert len(scripts) == 1, f"改名不该新增记录: {scripts}"
+    assert scripts[0]["id"] == sid
+    assert scripts[0]["name"] == "新名"
+    assert scripts[0]["body"] == "echo b"
+    assert scripts[0]["packages"] == ["wget", "vim"]
+
+
+def test_update_script_rejects_duplicate_name(client):
+    """改名撞上别的模板要给可读报错，不能让唯一约束抛 psycopg 报文。"""
+    c, aid, app_module = client
+    first = app_module.store.save_script("甲", "echo a")
+    app_module.store.save_script("乙", "echo b")
+
+    r = c.post(f"/api/scripts/id/{first}", data={"name": "乙", "body": "echo c"})
+    assert r.status_code == 400
+    assert "同名" in r.json()["error"]
+    assert app_module.store.script(first)["name"] == "甲", "失败不该改动原记录"
+
+
+def test_update_script_keeping_own_name_is_fine(client):
+    """只改内容不改名不能被自己的名字挡住。"""
+    c, aid, app_module = client
+    sid = app_module.store.save_script("固定名", "echo old")
+
+    r = c.post(f"/api/scripts/id/{sid}", data={"name": "固定名", "body": "echo new"})
+    assert r.status_code == 200
+    assert app_module.store.script(sid)["body"] == "echo new"
+
+
+def test_update_script_404_for_missing(client):
+    c, aid, app_module = client
+    r = c.post("/api/scripts/id/999999", data={"name": "x", "body": "echo x"})
+    assert r.status_code == 404
+
+
+def test_update_script_validates_body(client):
+    """自带 shebang 的脚本要在保存前挡住，跟新建一致。"""
+    c, aid, app_module = client
+    sid = app_module.store.save_script("模板", "echo ok")
+
+    r = c.post(
+        f"/api/scripts/id/{sid}", data={"name": "模板", "body": "#!/bin/bash\necho x"}
+    )
+    assert r.status_code == 400
+    assert app_module.store.script(sid)["body"] == "echo ok", "校验失败不该写入"
+
+
+def test_update_script_requires_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_module = build_app(monkeypatch, tmp_path / "script-anon")
+    c = TestClient(app_module.app)
+    assert c.post("/api/scripts/id/1", data={"name": "x"}).status_code == 401
+
+
+def test_scripts_page_has_edit_button():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/scripts.html").read_text()
+    assert "function edit(" in html
+    assert "onclick=\"edit({{ s.id }})\"" in html
+    assert "/api/scripts/id/${EDITING}" in html, "编辑要打到按 id 的接口"
+
+
+def test_scripts_page_offers_bbr_preset():
+    """现成脚本要能一键填进编辑区，不用用户自己去找 BBR 怎么开。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/scripts.html").read_text()
+    assert "function usePreset" in html
+    assert "preset-data" in html
+
+
+def test_scripts_preset_contains_bbr(client):
+    c, aid, app_module = client
+    page = c.get("/scripts").text
+    assert "BBR 加速" in page
+    assert "tcp_congestion_control" in page
+
+
+def test_copy_keeps_original_intact():
+    """复制一份要清成新建模式，否则直接保存会覆盖原模板。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/scripts.html").read_text()
+    body = html.split("function load(id)")[1].split("\n}")[0]
+    assert "副本" in body
+    assert "setMode(null)" in body

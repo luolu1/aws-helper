@@ -155,6 +155,16 @@
   </div>
 
   <label class="chk mt">
+    <input type="checkbox" id="deploy_bbr">
+    开启 BBR 加速（拥塞控制 + fq 队列）
+  </label>
+  <p class="hint" style="margin:4px 0 0 24px">
+    对跨境高延迟高丢包的链路提升明显。只改两条 sysctl，<strong>不换内核</strong> ——
+    面板用的镜像内核都在 5.10 以上，BBR 早就编译进去了。
+    内核不支持时脚本会跳过并说明，不会让开机失败。
+  </p>
+
+  <label class="chk mt">
     <input type="checkbox" id="deploy_ddns" onchange="toggleDeploy()">
     部署 DDNS 更新器（Cloudflare）
   </label>
@@ -406,6 +416,7 @@ function collect() {
       : document.getElementById('packages').value.split(/[\s,]+/).filter(Boolean),
     deploy_autoip: wantAutoip,
     deploy_ddns: wantDdns,
+    deploy_bbr: !isWindows && document.getElementById('deploy_bbr').checked,
     autoip: wantAutoip ? {
       target: val('lp-target'),
       interval_sec: num('lp-interval') || 60,
@@ -433,16 +444,20 @@ function toggleDeploy() {
   const ddnsBox = document.getElementById('deploy-ddns-box');
   const autoip = document.getElementById('deploy_autoip');
   const ddns = document.getElementById('deploy_ddns');
+  const bbrBox = document.getElementById('deploy_bbr');
 
   if (isWindows) {
     autoip.checked = false;
     ddns.checked = false;
+    bbrBox.checked = false;
     autoip.disabled = true;
     ddns.disabled = true;
+    bbrBox.disabled = true;
     document.getElementById('deploy-win-note').style.display = '';
   } else {
     autoip.disabled = false;
     ddns.disabled = false;
+    bbrBox.disabled = false;
     document.getElementById('deploy-win-note').style.display = 'none';
   }
   autoipBox.style.display = autoip.checked ? '' : 'none';
@@ -475,6 +490,7 @@ async function doLaunch() {
   const svc = [];
   if (c.deploy_autoip) svc.push('自动换 IP 探测器');
   if (c.deploy_ddns) svc.push(`DDNS（${c.ddns.hostname}）`);
+  if (c.deploy_bbr) svc.push('BBR 加速');
   const svcLine = svc.length ? `\n开机后自动部署：${svc.join('、')}` : '';
   if (!confirm(`确认在 ${c.region} 创建 ${c.count} 台 ${c.instance_type}？\n安全组：${sg}${svcLine}\n会产生实际费用。`)) return;
 
@@ -521,10 +537,11 @@ function showResult(list, cfg) {
 
   // 部署是 cloud-init 里跑的，开机返回时通常还没装完 —— 说清楚要等，
   // 否则用户立刻去看状态发现「未部署」会以为失败了。
-  if (cfg.deploy_autoip || cfg.deploy_ddns) {
+  if (cfg.deploy_autoip || cfg.deploy_ddns || cfg.deploy_bbr) {
     const svc = [];
     if (cfg.deploy_autoip) svc.push('<a href="/autoip">自动换 IP 探测器</a>');
     if (cfg.deploy_ddns) svc.push('<a href="/ddns">DDNS 更新器</a>');
+    if (cfg.deploy_bbr) svc.push('BBR 加速');
     hint += `<br>已把 ${svc.join(' 和 ')} 写进开机脚本，`
       + '装完通常要 1-3 分钟（等系统起来 + 装 curl）。'
       + '之后在对应页面点「检测」确认状态；'

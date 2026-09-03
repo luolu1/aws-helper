@@ -3,14 +3,25 @@
 
 {% block body %}
 <div class="card">
-  <h2>保存开机脚本模板</h2>
+  <h2 id="editor-title">保存开机脚本模板</h2>
   <p class="hint">
     存好的模板可以在「一键开机」页面一键套用。不要写 <span class="mono">#!/bin/bash</span>，
     渲染时会自动加上。脚本以 root 身份执行。
   </p>
+
+  <div class="row" style="margin-bottom:10px">
+    <span class="hint" style="margin:0">现成脚本：</span>
+    {% for p in presets %}
+    <button class="sm" onclick="usePreset('{{ p.name }}')">{{ p.name }}</button>
+    {% endfor %}
+    <span style="flex:1"></span>
+    <span class="tag" id="edit-tag" style="display:none">编辑中</span>
+    <button class="sm" id="cancel-edit" style="display:none" onclick="resetEditor()">取消编辑</button>
+  </div>
+
   <div class="grid g2">
     <label class="f">
-      <span>模板名称（同名会覆盖）</span>
+      <span id="name-label">模板名称（同名会覆盖）</span>
       <input type="text" id="name" placeholder="docker-基础环境">
     </label>
     <label class="f">
@@ -28,7 +39,7 @@ sysctl -p"></textarea>
   <div class="row mt">
     <button onclick="preview()">预览渲染结果</button>
     <span style="flex:1"></span>
-    <button class="primary" onclick="save()">保存模板</button>
+    <button class="primary" id="save-btn" onclick="save()">保存模板</button>
   </div>
 </div>
 
@@ -42,7 +53,7 @@ sysctl -p"></textarea>
   <h2>已保存的模板</h2>
   {% if scripts %}
   <table>
-    <thead><tr><th>名称</th><th>软件包</th><th>脚本预览</th><th style="width:120px">操作</th></tr></thead>
+    <thead><tr><th>名称</th><th>软件包</th><th>脚本预览</th><th style="width:220px">操作</th></tr></thead>
     <tbody>
       {% for s in scripts %}
       <tr>
@@ -53,7 +64,8 @@ sysctl -p"></textarea>
           {{ s.body[:90] or '（空）' }}
         </td>
         <td>
-          <button class="sm" onclick="load({{ s.id }})">载入</button>
+          <button class="sm" onclick="edit({{ s.id }})">编辑</button>
+          <button class="sm" onclick="load({{ s.id }})" title="填进编辑区当作新模板的起点">复制一份</button>
           <button class="sm danger" onclick="del({{ s.id }})">删除</button>
         </td>
       </tr>
@@ -66,20 +78,64 @@ sysctl -p"></textarea>
 </div>
 
 <script id="script-data" type="application/json">{{ scripts | tojson }}</script>
+<script id="preset-data" type="application/json">{{ presets | tojson }}</script>
 {% endblock %}
 
 {% block script %}
 <script>
 const SCRIPTS = JSON.parse(document.getElementById('script-data').textContent);
+const PRESETS = JSON.parse(document.getElementById('preset-data').textContent);
 
+// 正在编辑哪条。null = 新建模式。编辑模式走 /api/scripts/{id}（按 id 改，
+// 允许改名），新建走 /api/scripts（按名字合并）。
+let EDITING = null;
+
+function fill(name, body, packages) {
+  document.getElementById('name').value = name;
+  document.getElementById('body').value = body;
+  document.getElementById('packages').value = (packages || []).join(' ');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function setMode(editing) {
+  EDITING = editing;
+  const on = editing !== null;
+  document.getElementById('editor-title').textContent = on ? '编辑模板' : '保存开机脚本模板';
+  document.getElementById('save-btn').textContent = on ? '保存修改' : '保存模板';
+  document.getElementById('name-label').textContent = on
+    ? '模板名称（可以改名）' : '模板名称（同名会覆盖）';
+  document.getElementById('edit-tag').style.display = on ? '' : 'none';
+  document.getElementById('cancel-edit').style.display = on ? '' : 'none';
+}
+
+function edit(id) {
+  const s = SCRIPTS.find(x => x.id === id);
+  if (!s) return;
+  fill(s.name, s.body, s.packages);
+  setMode(id);
+  toast(`正在编辑「${s.name}」，改名也会保存到这一条`);
+}
+
+// 复制一份：内容进编辑区但清空名字，避免直接保存把原模板覆盖了
 function load(id) {
   const s = SCRIPTS.find(x => x.id === id);
   if (!s) return;
-  document.getElementById('name').value = s.name;
-  document.getElementById('body').value = s.body;
-  document.getElementById('packages').value = (s.packages || []).join(' ');
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-  toast('已载入到编辑区，修改后保存会覆盖同名模板');
+  fill(`${s.name} 副本`, s.body, s.packages);
+  setMode(null);
+  toast('已复制到编辑区，改个名字保存为新模板');
+}
+
+function usePreset(name) {
+  const p = PRESETS.find(x => x.name === name);
+  if (!p) return;
+  fill(p.name, p.body, []);
+  setMode(null);
+  toast(`已载入「${p.name}」，可直接保存或先改内容`);
+}
+
+function resetEditor() {
+  fill('', '', []);
+  setMode(null);
 }
 
 async function save() {
@@ -89,9 +145,10 @@ async function save() {
   form.append('name', name);
   form.append('body', document.getElementById('body').value);
   form.append('packages', document.getElementById('packages').value);
+  const url = EDITING === null ? '/api/scripts' : `/api/scripts/id/${EDITING}`;
   try {
-    await api('/api/scripts', { method: 'POST', form });
-    toast('已保存', 'ok');
+    await api(url, { method: 'POST', form });
+    toast(EDITING === null ? '已保存' : '已更新', 'ok');
     setTimeout(() => location.reload(), 700);
   } catch (e) {
     toast(e.message, 'err');
