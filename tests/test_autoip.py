@@ -1,322 +1,112 @@
-"""自动换 IP 监控逻辑测试。"""
+"""自动换 IP：只保留实例侧 agent 上报的测试。"""
 
 from __future__ import annotations
 
-import socket
 import time
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from aws_helper import autoip
-from aws_helper.core import launch
 
 
-@pytest.fixture
-def env(mock_ec2, ubuntu_ami, store, creds):
-    aid = store.add_account("t", "testing", "testing", "us-east-1")
-    inst = launch.launch(creds, launch.LaunchRequest(name="mon", region="us-east-1"))[0]
-    return store, aid, inst
+def _rule(**over):
+    base = {
+        "id": 7,
+        "account_id": 1,
+        "region": "us-east-1",
+        "instance_id": "i-0abc",
+        "enabled": 1,
+        "strategy": "eip",
+        "allow_cidrs": [],
+        "deny_cidrs": [],
+        "max_attempts": 3,
+        "last_change": 0,
+        "agent_interval_sec": 60,
+    }
+    base.update(over)
+    return base
 
 
-def _rule(store, aid, instance_id, **over):
-    kw = dict(
-        account_id=aid,
-        region="us-east-1",
-        instance_id=instance_id,
-        enabled=1,
-        strategy="eip",
-        check_port=22,
-        interval_sec=0,
-        fail_threshold=2,
-        max_attempts=2,
-    )
-    kw.update(over)
-    store.save_ip_rule(**kw)
-    return store.list_ip_rules()[0]
+def test_heartbeat_does_not_change_ip():
+    """正常上报只更新心跳，不能触发换 IP。"""
+    store = MagicMock()
+    with patch.object(autoip.ipchange, "change_ip") as change:
+        out = autoip.handle_agent_report(store, _rule(), "alive", "探测正常")
+        change.assert_not_called()
+
+    assert out["action"] == "heartbeat"
+    store.touch_agent.assert_called_once()
 
 
-def test_probe_detects_open_port():
-    """起一个真实监听端口，探测应报可达。"""
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    port = srv.getsockname()[1]
-    try:
-        result = autoip.probe("127.0.0.1", "tcp", port)
-        assert result.ok
-    finally:
-        srv.close()
+def test_started_does_not_change_ip():
+    """脚本启动上报和心跳一样，只用于显示部署状态。"""
+    store = MagicMock()
+    with patch.object(autoip.ipchange, "change_ip") as change:
+        out = autoip.handle_agent_report(store, _rule(), "started", "启动")
+        change.assert_not_called()
+
+    assert out == {"action": "heartbeat", "kind": "started"}
 
 
-def test_probe_detects_closed_port():
-    result = autoip.probe("127.0.0.1", "tcp", 1, timeout=1.0)
-    assert not result.ok
-    assert "不可达" in result.detail
+def test_blocked_report_changes_ip():
+    """连续失败达到阈值后，实例报 blocked 才换 IP。"""
+    store = MagicMock()
+    with patch.object(autoip.ipchange, "change_ip") as change:
+        change.return_value = MagicMock(old_ip="1.1.1.1", new_ip="2.2.2.2", attempts=1)
+        out = autoip.handle_agent_report(store, _rule(), "blocked", "连不上国内站点")
 
-
-def test_probe_empty_ip():
-    result = autoip.probe("", "tcp", 22)
-    assert not result.ok
-    assert "没有公网 IP" in result.detail
-
-
-def test_icmp_mode_falls_back_to_tcp():
-    """容器里没有 CAP_NET_RAW，icmp 模式必须退回 tcp 而不是崩溃。"""
-    result = autoip.probe("127.0.0.1", "icmp", 1, timeout=1.0)
-    assert "tcp/1" in result.detail
-
-
-@pytest.fixture
-def always_down(monkeypatch):
-    """强制探测失败。
-
-    moto 分配的地址落在 127.0.0.0/8，本机可路由，真实探测结果不确定，
-    所以触发逻辑的测试必须把探测结果固定下来。
-    """
-    monkeypatch.setattr(
-        autoip, "probe", lambda *a, **k: autoip.ProbeResult(False, "强制失败")
-    )
-
-
-def test_failure_below_threshold_only_counts(env, always_down):
-    store, aid, inst = env
-    rule = _rule(store, aid, inst.instance_id, fail_threshold=3)
-
-    out = autoip.check_rule(store, rule)
-    assert out["action"] == "fail"
-    assert out["count"] == 1
-    assert store.list_ip_rules()[0]["fail_count"] == 1
-
-
-def test_threshold_reached_triggers_change(env, always_down):
-    """连续失败达到阈值后必须真的换掉 IP。"""
-    store, aid, inst = env
-    old_ip = inst.public_ip
-
-    first = autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=0)
-    assert first["action"] == "fail"
-
-    second = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=0)
-    assert second["action"] == "changed", second
-    assert second["old_ip"] == old_ip
-    assert second["new_ip"] != old_ip
-
-    live = launch.list_instances(store.credentials(aid, "us-east-1"), "us-east-1")
-    actual = [i for i in live if i["instance_id"] == inst.instance_id][0]
-    assert actual["public_ip"] == second["new_ip"]
-
-    rule = store.list_ip_rules()[0]
-    assert rule["fail_count"] == 0
-    assert rule["last_change"] > 0
-
-
-def test_recovery_resets_fail_count(env, monkeypatch):
-    """探测恢复后失败计数必须清零，否则会累积到阈值误触发换 IP。"""
-    store, aid, inst = env
-    monkeypatch.setattr(
-        autoip, "probe", lambda *a, **k: autoip.ProbeResult(False, "down")
-    )
-    autoip.check_rule(store, _rule(store, aid, inst.instance_id, fail_threshold=5))
-    assert store.list_ip_rules()[0]["fail_count"] == 1
-
-    monkeypatch.setattr(autoip, "probe", lambda *a, **k: autoip.ProbeResult(True, "up"))
-    out = autoip.check_rule(store, store.list_ip_rules()[0])
-    assert out["action"] == "ok"
-    assert store.list_ip_rules()[0]["fail_count"] == 0
-
-
-def test_change_is_logged(env, always_down):
-    store, aid, inst = env
-    autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=0)
-    autoip.check_rule(store, store.list_ip_rules()[0], cooldown=0)
-    logs = store.list_logs()
-    assert any(l["kind"] == "autoip" and l["ok"] == 1 for l in logs)
-
-
-def test_cooldown_prevents_back_to_back_changes(env, always_down):
-    """刚换过 IP 不能立刻再换。
-
-    新 IP 的路由生效和服务启动都需要时间，此时探测仍然失败是正常的。
-    继续换只会白烧弹性 IP 配额（默认每区域 5 个）并反复停机。
-    """
-    store, aid, inst = env
-    autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=1800)
-    first = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
-    assert first["action"] == "changed"
-
-    store.update_rule_state(store.list_ip_rules()[0]["id"], fail_count=5)
-    second = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
-    assert second["action"] == "cooldown"
-    assert second["retry_after"] > 0
-
-
-def test_cooldown_expires(env, always_down):
-    store, aid, inst = env
-    autoip.check_rule(store, _rule(store, aid, inst.instance_id), cooldown=1800)
-    autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
-
-    rule_id = store.list_ip_rules()[0]["id"]
-    store.update_rule_state(
-        rule_id, fail_count=5, last_change=int(time.time()) - 3600
-    )
-    out = autoip.check_rule(store, store.list_ip_rules()[0], cooldown=1800)
     assert out["action"] == "changed"
+    assert out["new_ip"] == "2.2.2.2"
+    assert store.touch_agent.call_args.kwargs["reported"] is True
 
 
-def test_probe_retries_before_declaring_failure():
-    """探测失败要重试，避免瞬时抖动触发换 IP。"""
-    result = autoip.probe("127.0.0.1", "tcp", 1, timeout=0.5, attempts=3)
-    assert not result.ok
-    assert "连续 3 次" in result.detail
-
-
-def test_probe_single_attempt_still_supported():
-    result = autoip.probe("127.0.0.1", "tcp", 1, timeout=0.5, attempts=1)
-    assert not result.ok
-    assert "连续 1 次" in result.detail
-
-
-def test_interval_not_reached_skips(env):
-    store, aid, inst = env
-    rule = _rule(store, aid, inst.instance_id, interval_sec=3600)
-    store.update_rule_state(rule["id"], last_check=int(time.time()))
-    out = autoip.check_rule(store, store.list_ip_rules()[0])
-    assert out["action"] == "skip"
-
-
-def test_stopped_instance_is_skipped(env):
-    store, aid, inst = env
-    creds = store.credentials(aid, "us-east-1")
-    launch.power(creds, "us-east-1", "stop", [inst.instance_id])
-
-    out = autoip.check_rule(store, _rule(store, aid, inst.instance_id))
-    assert out["action"] == "skip"
-    assert "stopped" in out["reason"]
-
-
-def test_missing_instance_reports_error(env):
-    store, aid, _ = env
-    out = autoip.check_rule(store, _rule(store, aid, "i-00000000000000000"))
-    assert out["action"] == "error"
-    logs = store.list_logs()
-    assert any(l["ok"] == 0 for l in logs)
-
-
-def test_run_once_covers_enabled_rules_only(env):
-    store, aid, inst = env
-    _rule(store, aid, inst.instance_id)
-    store.save_ip_rule(
-        account_id=aid, region="us-east-1", instance_id="i-disabled", enabled=0
-    )
-    results = autoip.run_once(store)
-    assert len(results) == 1
-
-
-def test_monitor_start_stop(store):
-    monitor = autoip.Monitor(store, tick=1)
-    assert not monitor.running
-    monitor.start()
-    assert monitor.running
-    monitor.stop()
-    time.sleep(1.4)
-    assert not monitor.running
-
-
-def test_monitor_survives_bad_rule(mock_ec2, store):
-    """规则指向不存在的实例时，监控线程不能崩掉。"""
-    aid = store.add_account("t", "testing", "testing", "us-east-1")
-    store.save_ip_rule(
-        account_id=aid,
-        region="us-east-1",
-        instance_id="i-00000000000000000",
-        enabled=1,
-        interval_sec=0,
-    )
-    monitor = autoip.Monitor(store, tick=1)
-    monitor.start()
-    time.sleep(1.5)
-    assert monitor.running
-    monitor.stop()
-
-
-def test_run_once_shares_instance_list_across_rules(env, monkeypatch, creds):
-    """同一 (账号,区域) 的多条规则只该拉一次实例清单。
-
-    这是最容易触发风控的地方：规则是无人值守一直跑的，N 条规则原先就是
-    N 次 DescribeInstances，规则越多越危险。
-    """
-    store, aid, inst = env
-    # 唯一约束是 (账号, 区域, 实例)，所以要用不同实例才能建出多条规则
-    others = launch.launch(
-        creds, launch.LaunchRequest(name="mon2", region="us-east-1", count=2)
-    )
-    for target in [inst, *others]:
-        store.save_ip_rule(
-            account_id=aid,
-            region="us-east-1",
-            instance_id=target.instance_id,
-            enabled=1,
-            interval_sec=0,
-            fail_threshold=99,
+def test_blocked_report_respects_cooldown():
+    """新 IP 路由还没生效时不能连续换，白烧 EIP 配额。"""
+    store = MagicMock()
+    recent = int(time.time()) - 60
+    with patch.object(autoip.ipchange, "change_ip") as change:
+        out = autoip.handle_agent_report(
+            store, _rule(last_change=recent), "blocked", "连不上"
         )
+        change.assert_not_called()
 
-    calls = []
-    real = launch.list_instances
-
-    def counting(creds, region, *a, **kw):
-        calls.append(region)
-        return real(creds, region, *a, **kw)
-
-    monkeypatch.setattr(autoip.launch, "list_instances", counting)
-    out = autoip.run_once(store)
-
-    assert len(store.list_ip_rules(enabled_only=True)) == 3
-    assert len(out) == 3
-    assert len(calls) == 1, f"3 条同区域规则只该拉一次，实际拉了 {len(calls)} 次"
+    assert out["action"] == "cooldown"
+    assert out["retry_after"] > 0
 
 
-def test_run_once_still_separates_regions(env, monkeypatch):
-    """不同区域不能共用清单 —— 那是另一个区域的实例。"""
-    store, aid, inst = env
-    store.save_ip_rule(
-        account_id=aid, region="us-east-1", instance_id=inst.instance_id,
-        enabled=1, interval_sec=0, fail_threshold=99,
-    )
-    store.save_ip_rule(
-        account_id=aid, region="eu-west-1", instance_id=inst.instance_id,
-        enabled=1, interval_sec=0, fail_threshold=99,
-    )
+def test_disabled_rule_ignores_blocked_report():
+    store = MagicMock()
+    with patch.object(autoip.ipchange, "change_ip") as change:
+        out = autoip.handle_agent_report(store, _rule(enabled=0), "blocked", "x")
+        change.assert_not_called()
 
-    seen_regions = []
-
-    def counting(creds, region, *a, **kw):
-        seen_regions.append(region)
-        return {}
-
-    monkeypatch.setattr(autoip.launch, "list_instances", counting)
-    autoip.run_once(store)
-
-    assert sorted(seen_regions) == ["eu-west-1", "us-east-1"]
+    assert out["action"] == "skip"
+    assert out["reason"] == "规则已停用"
 
 
-def test_check_rule_ignores_stale_shared_list(env, monkeypatch):
-    """共享清单超过 30 秒就必须重拉。
+def test_change_failure_is_returned_and_logged():
+    """换 IP 失败要给实例脚本可读结果，也要进审计日志。"""
+    store = MagicMock()
+    with patch.object(autoip.ipchange, "change_ip", side_effect=RuntimeError("配额用尽")):
+        out = autoip.handle_agent_report(store, _rule(), "blocked", "x")
 
-    一轮里每条失败规则要跑两次 5s TCP 探测，整轮可能上百秒。拿旧 IP 去探测
-    会记一次假失败，累积到阈值就白换一次 IP、白烧弹性 IP 配额。
-    """
-    store, aid, inst = env
-    rule = _rule(store, aid, inst.instance_id, fail_threshold=99)
+    assert out == {"action": "error", "reason": "配额用尽"}
+    store.log.assert_called_once()
 
-    calls = []
 
-    def counting(creds, region, *a, **kw):
-        calls.append(region)
-        return {}
+def test_blocked_report_invalidates_instance_cache():
+    """换完 IP 后实例列表缓存不能继续显示旧 IP。"""
+    store = MagicMock()
+    with patch.object(autoip.ipchange, "change_ip") as change, \
+            patch.object(autoip.cache, "drop") as drop:
+        change.return_value = MagicMock(old_ip="1.1.1.1", new_ip="2.2.2.2", attempts=1)
+        autoip.handle_agent_report(store, _rule(), "blocked", "x")
 
-    monkeypatch.setattr(autoip.launch, "list_instances", counting)
+    drop.assert_called_once()
 
-    stale = {(aid, "us-east-1"): (time.time() - 60, {})}
-    autoip.check_rule(store, rule, seen=stale)
 
-    assert len(calls) == 1, "过期的共享清单不能复用"
+def test_module_has_no_panel_probe_or_monitor():
+    """local 已下线：不能保留 TCP socket 探测、DescribeInstances 或后台线程。"""
+    assert not hasattr(autoip, "probe")
+    assert not hasattr(autoip, "check_rule")
+    assert not hasattr(autoip, "run_once")
+    assert not hasattr(autoip, "Monitor")

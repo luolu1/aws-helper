@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import time
-from unittest.mock import MagicMock, patch
-
 import pytest
 
-from aws_helper import autoip
 from aws_helper.core import guard_script as gs
 
 
@@ -165,101 +161,3 @@ def test_env_file_is_600_before_write():
     chmod_at = script.index(f"chmod 600 {gs.ENV_PATH}")
     write_at = script.index("GUARD_TOKEN=")
     assert touch_at < chmod_at < write_at
-
-
-# ---------- 面板侧处理上报 ----------
-
-
-def _rule(**over):
-    base = {
-        "id": 7,
-        "account_id": 1,
-        "region": "us-east-1",
-        "instance_id": "i-0abc",
-        "enabled": 1,
-        "strategy": "eip",
-        "probe_mode": "agent",
-        "allow_cidrs": [],
-        "deny_cidrs": [],
-        "max_attempts": 3,
-        "last_change": 0,
-        "agent_interval_sec": 60,
-    }
-    base.update(over)
-    return base
-
-
-def test_agent_mode_skips_panel_probe():
-    """面板在海外，从海外连实例通常一直是通的，用这个信号判断被墙是错的。"""
-    store = MagicMock()
-    with patch.object(autoip, "probe") as p:
-        out = autoip.check_rule(store, _rule())
-        p.assert_not_called()
-    assert out["action"] == "skip"
-    store.credentials.assert_not_called()
-
-
-def test_local_mode_still_probes(monkeypatch):
-    store = MagicMock()
-    store.list_ip_rules.return_value = []
-    rule = _rule(probe_mode="local", interval_sec=0, last_check=0, check_mode="tcp",
-                 check_port=22, fail_count=0, fail_threshold=3)
-    with patch.object(autoip.launch, "list_instances") as li, \
-            patch.object(autoip, "probe") as p:
-        li.return_value = [
-            {"instance_id": "i-0abc", "state": "running", "public_ip": "1.1.1.1"}
-        ]
-        p.return_value = autoip.ProbeResult(True, "ok")
-        autoip.check_rule(store, rule)
-        p.assert_called_once()
-
-
-def test_heartbeat_does_not_change_ip():
-    store = MagicMock()
-    with patch.object(autoip.ipchange, "change_ip") as ci:
-        out = autoip.handle_agent_report(store, _rule(), "alive", "探测正常")
-        ci.assert_not_called()
-    assert out["action"] == "heartbeat"
-    store.touch_agent.assert_called_once()
-    assert store.touch_agent.call_args.kwargs.get("reported") in (None, False)
-
-
-def test_blocked_report_changes_ip():
-    store = MagicMock()
-    with patch.object(autoip.ipchange, "change_ip") as ci:
-        ci.return_value = MagicMock(old_ip="1.1.1.1", new_ip="2.2.2.2", attempts=1)
-        out = autoip.handle_agent_report(store, _rule(), "blocked", "连不上")
-
-    assert out["action"] == "changed"
-    assert out["new_ip"] == "2.2.2.2"
-    store.touch_agent.assert_called_once()
-    assert store.touch_agent.call_args.kwargs["reported"] is True
-
-
-def test_blocked_report_respects_cooldown():
-    """实例侧也会退避，但两边各有一层才拦得住重装脚本、多次部署。"""
-    store = MagicMock()
-    recent = int(time.time()) - 60
-    with patch.object(autoip.ipchange, "change_ip") as ci:
-        out = autoip.handle_agent_report(
-            store, _rule(last_change=recent), "blocked", "连不上"
-        )
-        ci.assert_not_called()
-    assert out["action"] == "cooldown"
-    assert out["retry_after"] > 0
-
-
-def test_disabled_rule_ignores_report():
-    store = MagicMock()
-    with patch.object(autoip.ipchange, "change_ip") as ci:
-        out = autoip.handle_agent_report(store, _rule(enabled=0), "blocked", "x")
-        ci.assert_not_called()
-    assert out["action"] == "skip"
-
-
-def test_change_failure_is_reported_not_swallowed():
-    store = MagicMock()
-    with patch.object(autoip.ipchange, "change_ip", side_effect=RuntimeError("配额用尽")):
-        out = autoip.handle_agent_report(store, _rule(), "blocked", "x")
-    assert out["action"] == "error"
-    assert "配额用尽" in out["reason"]

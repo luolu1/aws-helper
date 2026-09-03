@@ -102,21 +102,27 @@ def test_ip_rule_upsert_is_idempotent(store):
         instance_id="i-1",
         enabled=1,
         strategy="eip",
-        check_mode="tcp",
-        check_port=22,
-        interval_sec=300,
-        fail_threshold=3,
+        agent_target="www.baidu.com:443",
+        agent_interval_sec=60,
+        agent_fail_threshold=3,
         allow_cidrs=["1.0.0.0/8"],
         deny_cidrs=[],
         max_attempts=3,
     )
     r1 = store.save_ip_rule(**kw)
-    r2 = store.save_ip_rule(**{**kw, "check_port": 443})
+    r2 = store.save_ip_rule(**{**kw, "agent_target": "www.qq.com:443"})
     assert r1 == r2
     rules = store.list_ip_rules()
     assert len(rules) == 1
-    assert rules[0]["check_port"] == 443
+    assert rules[0]["agent_target"] == "www.qq.com:443"
     assert rules[0]["allow_cidrs"] == ["1.0.0.0/8"]
+
+
+def test_new_rule_defaults_to_agent_probe(store):
+    """面板侧探测已下线，新规则必须是 agent —— 否则永远等不到上报。"""
+    aid = store.add_account("a", "AKIA1", "sk", "us-east-1")
+    store.save_ip_rule(account_id=aid, region="us-east-1", instance_id="i-1")
+    assert store.list_ip_rules()[0]["probe_mode"] == "agent"
 
 
 def test_rule_state_updates(store):

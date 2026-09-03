@@ -108,9 +108,8 @@ CREATE TABLE IF NOT EXISTS ip_rules (
     fail_count INTEGER NOT NULL DEFAULT 0,
     last_check BIGINT NOT NULL DEFAULT 0,
     last_change BIGINT NOT NULL DEFAULT 0,
-    -- 探测放到实例上跑（agent 模式）时用到的字段。
-    -- probe 模式 local=面板自己探测，agent=实例上的脚本探测并上报。
-    probe_mode TEXT NOT NULL DEFAULT 'local',
+    -- 探测只由实例上的 agent 做，面板不再从海外 TCP 探测。
+    probe_mode TEXT NOT NULL DEFAULT 'agent',
     -- 上报凭证只存 SHA-256 摘要，明文只在生成脚本那一刻返回一次。
     -- 面板暴露在公网，库被读到也不能让人伪造上报触发换 IP。
     agent_token_hash TEXT NOT NULL DEFAULT '',
@@ -197,7 +196,7 @@ CREATE INDEX IF NOT EXISTS idx_login_history_created
 # 老库不会自动长出新字段 —— 这里逐条 ADD COLUMN IF NOT EXISTS 补齐。
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("ddns_rules", "cf_account_id", "TEXT NOT NULL DEFAULT ''"),
-    ("ip_rules", "probe_mode", "TEXT NOT NULL DEFAULT 'local'"),
+    ("ip_rules", "probe_mode", "TEXT NOT NULL DEFAULT 'agent'"),
     ("ip_rules", "agent_token_hash", "TEXT NOT NULL DEFAULT ''"),
     ("ip_rules", "agent_target", "TEXT NOT NULL DEFAULT ''"),
     ("ip_rules", "agent_interval_sec", "INTEGER NOT NULL DEFAULT 60"),
@@ -317,6 +316,9 @@ class Store:
                 conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}"
                 )
+            # 面板侧探测已下线。ADD COLUMN 的 DEFAULT 只作用于新行，
+            # 升级上来的老规则仍是 'local'，不改就永远不会被上报驱动。
+            conn.execute("UPDATE ip_rules SET probe_mode='agent' WHERE probe_mode<>'agent'")
             conn.commit()
 
     # ---------- SQLite 迁移 ----------
@@ -774,7 +776,7 @@ class Store:
         "allow_cidrs": "[]",
         "deny_cidrs": "[]",
         "max_attempts": 3,
-        "probe_mode": "local",
+        "probe_mode": "agent",
         "agent_target": "",
         "agent_interval_sec": 60,
         "agent_fail_threshold": 3,

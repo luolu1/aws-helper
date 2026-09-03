@@ -429,25 +429,26 @@ def test_data_survives_reconnect(tmp_path, monkeypatch):
 
 
 @requires_db
-def test_monitor_survives_database_outage(store):
-    """库短暂不可用时监控线程不能死掉。
+def test_ddns_monitor_survives_database_outage(store):
+    """库短暂不可用时 DDNS 监控线程不能死掉。
 
     错误处理里的 store.log() 自己也要连库，会二次抛出 ——
-    未捕获就会让线程永久退出，自动换 IP 之后再也不工作。
+    未捕获就会让线程永久退出，DDNS 之后再也不更新。
+    自动换 IP 已改为实例上报驱动，面板侧没有轮询线程了。
     """
-    from aws_helper import autoip
+    from aws_helper import ddnsmon
 
-    monitor = autoip.Monitor(store, tick=1)
+    monitor = ddnsmon.Monitor(store, tick=1)
 
     calls: list[int] = []
 
-    def boom(_store, cooldown=autoip.DEFAULT_COOLDOWN):
+    def boom(_store):
         calls.append(1)
         raise RuntimeError("connection closed")
 
-    original_run = autoip.run_once
+    original_run = ddnsmon.run_once
     original_log = type(store).log
-    autoip.run_once = boom
+    ddnsmon.run_once = boom
     # 连日志也写不进去，模拟数据库整体不可用
     type(store).log = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down"))
     try:
@@ -457,7 +458,7 @@ def test_monitor_survives_database_outage(store):
         assert len(calls) >= 2, "线程没有继续下一轮"
     finally:
         type(store).log = original_log
-        autoip.run_once = original_run
+        ddnsmon.run_once = original_run
         monitor.stop()
 
 
