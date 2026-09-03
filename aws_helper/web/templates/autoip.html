@@ -5,93 +5,23 @@
 <div class="card">
   <h2>自动换 IP</h2>
   <p class="hint">
-    后台每 30 秒扫一遍规则。对启用的实例按间隔探测 TCP 端口，
-    连续失败达到阈值就自动换 IP —— 也就是 IP 被墙后自动更换。
-    每次探测内部会重试 2 次以避开瞬时抖动；换过 IP 后有 30 分钟冷却，
-    避免新 IP 路由还没生效就反复换，白烧弹性 IP 配额（默认每区域 5 个）。
+    只保留实例侧探测：脚本装在实例上，从境内方向 TCP 连国内站点；
+    连续失败达到阈值才上报面板换 IP。面板不再从海外探测实例，
+    因为那既判断不了「被墙」，又会产生无意义的 AWS API 调用。
+    探测正常时不上报，只有低频心跳用来显示部署状态。
   </p>
+  {% if accounts %}
   <div class="row">
-    <span class="tag {{ 'ok' if monitor_on else 'err' }}" id="mon-tag">
-      监控{{ '运行中' if monitor_on else '已停止' }}
+    <button class="primary" onclick="openAgent()">开启实例侧探测</button>
+    <span class="hint" style="margin:0">
+      选好实例后生成一键部署脚本；也可以在「一键开机」页创建实例时直接勾选部署。
     </span>
-    <button class="sm" onclick="mon('start')">启动监控</button>
-    <button class="sm" onclick="mon('stop')">停止监控</button>
-    <button class="sm" onclick="runNow()">立即检查一轮</button>
   </div>
+  {% endif %}
 </div>
 
 {% if not accounts %}
 <div class="card"><div class="empty">先去 <a href="/accounts">账号页面</a> 添加 AWS 账号。</div></div>
-{% else %}
-<div class="card">
-  <h2>添加 / 更新规则</h2>
-  <p class="hint">同一个（账号 + 区域 + 实例）只会存一条规则，重复提交是更新。</p>
-  <div class="grid g3">
-    <label class="f">
-      <span>账号</span>
-      <select id="account_id">
-        {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
-      </select>
-    </label>
-    <label class="f">
-      <span>区域</span>
-      <select id="region" onchange="loadInstances()">
-        {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
-      </select>
-    </label>
-    <label class="f">
-      <span>实例</span>
-      <div class="row" style="gap:6px">
-        <select id="instance_id" style="flex:1"><option value="">点右侧加载</option></select>
-        <button class="sm" onclick="loadInstances()">加载</button>
-      </div>
-    </label>
-  </div>
-
-  <div class="grid g4 mt">
-    <label class="f">
-      <span>换 IP 策略</span>
-      <select id="strategy">
-        <option value="eip">弹性 IP（不停机）</option>
-        <option value="dynamic">停机重启换动态 IP</option>
-      </select>
-    </label>
-    <label class="f">
-      <span>探测端口</span>
-      <input type="number" id="check_port" value="22" min="1" max="65535">
-    </label>
-    <label class="f">
-      <span>检查间隔（秒）</span>
-      <input type="number" id="interval_sec" value="300" min="30">
-    </label>
-    <label class="f">
-      <span>连续失败几次后换</span>
-      <input type="number" id="fail_threshold" value="3" min="1" max="20">
-    </label>
-  </div>
-
-  <div class="grid g3 mt">
-    <label class="f">
-      <span>允许的 IP 段（逗号分隔）</span>
-      <input type="text" id="allow_cidrs" placeholder="留空不限制">
-    </label>
-    <label class="f">
-      <span>排除的 IP 段（逗号分隔）</span>
-      <input type="text" id="deny_cidrs" placeholder="52.0.0.0/8">
-    </label>
-    <label class="f">
-      <span>每次换 IP 最多尝试</span>
-      <input type="number" id="max_attempts" value="3" min="1" max="20">
-    </label>
-  </div>
-
-  <div class="row mt">
-    <label class="chk"><input type="checkbox" id="enabled" checked> 启用这条规则</label>
-    <span style="flex:1"></span>
-    <button class="primary" onclick="saveRule()">保存规则</button>
-    <button onclick="openAgent()">开启实例侧探测（推荐）</button>
-  </div>
-</div>
 {% endif %}
 
 <div class="mask" id="ag-mask">
@@ -105,7 +35,29 @@
       用来让面板区分「一切正常」和「脚本挂了」。
     </p>
 
-    <div class="grid g2">
+    <div class="grid g3">
+      <label class="f">
+        <span>账号</span>
+        <select id="ag-account">
+          {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="f">
+        <span>区域</span>
+        <select id="ag-region" onchange="loadAgentInstances()">
+          {% for code, name in regions.items() %}<option value="{{ code }}">{{ code }} — {{ name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="f">
+        <span>实例</span>
+        <div class="row" style="gap:6px">
+          <select id="ag-instance" style="flex:1"><option value="">点加载</option></select>
+          <button class="sm" onclick="loadAgentInstances()">加载</button>
+        </div>
+      </label>
+    </div>
+
+    <div class="grid g2 mt">
       <label class="f">
         <span>探测目标（留空用默认）</span>
         <input type="text" id="ag-target" placeholder="{{ default_target }}">
@@ -197,6 +149,7 @@
         <td>
           <button class="sm" onclick="checkAgent({{ r.id }})">检测</button>
           <button class="sm" onclick="regenAgent({{ r.id }})">重新生成脚本</button>
+          <button class="sm danger" onclick="delRule({{ r.id }})">删除</button>
         </td>
       </tr>
       <tr class="ag-detail" data-detail="{{ r.id }}" style="display:none">
@@ -209,157 +162,61 @@
   <div class="empty">还没有实例侧探测的规则。上面选好实例后点「开启实例侧探测」。</div>
   {% endif %}
 </div>
-
-<div class="card">
-  <h2>现有规则</h2>
-  {% if rules %}
-  <table>
-    <thead>
-      <tr>
-        <th>状态</th><th>实例</th><th>区域</th><th>策略</th><th>探测</th>
-        <th>间隔/阈值</th><th>失败计数</th><th>最近换 IP</th><th>操作</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for r in rules %}
-      <tr>
-        <td><span class="tag {{ 'ok' if r.enabled else 'err' }}">{{ '启用' if r.enabled else '停用' }}</span></td>
-        <td class="mono">{{ r.instance_id }}</td>
-        <td class="mono">{{ r.region }}</td>
-        <td>{{ 'EIP' if r.strategy == 'eip' else '重启' }}</td>
-        <td class="mono">tcp/{{ r.check_port }}</td>
-        <td class="mono">{{ r.interval_sec }}s / {{ r.fail_threshold }}次</td>
-        <td class="mono">{{ r.fail_count }}</td>
-        <td class="mono">{{ r.last_change and (r.last_change | string) or '-' }}</td>
-        <td><button class="sm danger" onclick="delRule({{ r.id }})">删除</button></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <div class="empty">还没有规则</div>
-  {% endif %}
-</div>
-
-<div class="card" id="run-card" style="display:none">
-  <h2>本轮检查结果</h2>
-  <pre class="out" id="run-out"></pre>
-</div>
 {% endblock %}
 
 {% block script %}
 <script>
-async function loadInstances() {
-  const account_id = parseInt(document.getElementById('account_id').value, 10);
-  const region = document.getElementById('region').value;
-  const sel = document.getElementById('instance_id');
+async function delRule(id) {
+  if (!confirm('删除这条实例侧探测规则？实例上的旧脚本会因凭证失效而无法再上报。')) return;
+  try {
+    await api('/api/ip-rules/' + id, { method: 'DELETE' });
+    toast('规则已删除，实例上的旧脚本已失效', 'ok');
+    setTimeout(() => location.reload(), 500);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// ---------- 实例侧探测 ----------
+
+async function loadAgentInstances() {
+  const accountId = parseInt(document.getElementById('ag-account').value, 10);
+  const region = document.getElementById('ag-region').value;
+  const sel = document.getElementById('ag-instance');
   sel.innerHTML = '<option value="">加载中…</option>';
   try {
-    const d = await api(`/api/instances?account_id=${account_id}&region=${region}`);
-    if (!d.instances.length) {
-      sel.innerHTML = '<option value="">该区域没有实例</option>';
-      return;
-    }
-    sel.innerHTML = d.instances.map(i =>
-      `<option value="${escapeHtml(i.instance_id)}">${escapeHtml(i.name || i.instance_id)} — ${escapeHtml(i.public_ip || '无IP')} (${escapeHtml(i.state)})</option>`
-    ).join('');
+    const d = await api(`/api/instances?account_id=${accountId}&region=${region}`);
+    const running = d.instances.filter(i => i.state === 'running');
+    sel.innerHTML = running.length
+      ? running.map(i => `<option value="${escapeHtml(i.instance_id)}">${escapeHtml(i.name || i.instance_id)} — ${escapeHtml(i.public_ip || '无公网 IP')}</option>`).join('')
+      : '<option value="">没有运行中的实例</option>';
   } catch (e) {
     sel.innerHTML = '<option value="">加载失败</option>';
     toast(e.message, 'err');
   }
 }
 
-async function saveRule() {
-  const instance_id = document.getElementById('instance_id').value;
-  if (!instance_id) return toast('请先选择实例', 'err');
-  const parse = id => document.getElementById(id).value.split(',').map(s => s.trim()).filter(Boolean);
-  const num = id => parseInt(document.getElementById(id).value, 10);
-  try {
-    await api('/api/ip-rules', {
-      method: 'POST',
-      json: {
-        account_id: parseInt(document.getElementById('account_id').value, 10),
-        region: document.getElementById('region').value,
-        instance_id,
-        enabled: document.getElementById('enabled').checked,
-        strategy: document.getElementById('strategy').value,
-        check_mode: 'tcp',
-        check_port: num('check_port'),
-        interval_sec: num('interval_sec'),
-        fail_threshold: num('fail_threshold'),
-        allow_cidrs: parse('allow_cidrs'),
-        deny_cidrs: parse('deny_cidrs'),
-        max_attempts: num('max_attempts')
-      }
-    });
-    toast('规则已保存', 'ok');
-    setTimeout(() => location.reload(), 700);
-  } catch (e) {
-    toast(e.message, 'err');
-  }
-}
-
-async function delRule(id) {
-  if (!confirm('删除这条规则？')) return;
-  try {
-    await api('/api/ip-rules/' + id, { method: 'DELETE' });
-    toast('已删除', 'ok');
-    setTimeout(() => location.reload(), 500);
-  } catch (e) { toast(e.message, 'err'); }
-}
-
-async function mon(action) {
-  try {
-    const d = await api('/api/monitor/' + action, { method: 'POST' });
-    const tag = document.getElementById('mon-tag');
-    tag.textContent = '监控' + (d.running ? '运行中' : '已停止');
-    tag.className = 'tag ' + (d.running ? 'ok' : 'err');
-    toast('监控' + (d.running ? '已启动' : '已停止'), 'ok');
-  } catch (e) { toast(e.message, 'err'); }
-}
-
-async function runNow() {
-  try {
-    const d = await api('/api/ip-rules/run-now', { method: 'POST' });
-    document.getElementById('run-card').style.display = 'block';
-    document.getElementById('run-out').textContent = JSON.stringify(d.results, null, 2);
-    toast(`检查了 ${d.results.length} 条规则`, 'ok');
-  } catch (e) { toast(e.message, 'err'); }
-}
-
-// ---------- 实例侧探测 ----------
-
 function openAgent() {
-  if (!document.getElementById('instance_id').value) {
-    return toast('请先在上面选择实例', 'err');
-  }
   document.getElementById('ag-script-box').style.display = 'none';
   document.getElementById('ag-mask').classList.add('on');
+  loadAgentInstances();
 }
 
-// 先存规则（probe_mode=agent）再生成脚本 —— 脚本里的凭证是挂在规则上的，
-// 规则不存在就没地方发凭证。
+// 先存 agent 规则再生成脚本 —— 凭证挂在规则上，规则不存在就没地方发。
 async function genAgentScript() {
-  const instance_id = document.getElementById('instance_id').value;
-  if (!instance_id) return toast('请先选择实例', 'err');
+  const instanceId = document.getElementById('ag-instance').value;
+  if (!instanceId) return toast('请先选择运行中的实例', 'err');
   const num = id => parseInt(document.getElementById(id).value, 10);
-  const parse = id => document.getElementById(id).value.split(',').map(s => s.trim()).filter(Boolean);
   try {
     const saved = await api('/api/ip-rules', {
       method: 'POST',
       json: {
-        account_id: parseInt(document.getElementById('account_id').value, 10),
-        region: document.getElementById('region').value,
-        instance_id,
+        account_id: parseInt(document.getElementById('ag-account').value, 10),
+        region: document.getElementById('ag-region').value,
+        instance_id: instanceId,
         enabled: true,
         strategy: document.getElementById('ag-strategy').value,
-        probe_mode: 'agent',
         agent_target: document.getElementById('ag-target').value.trim(),
         agent_interval_sec: num('ag-interval'),
-        agent_fail_threshold: num('ag-threshold'),
-        allow_cidrs: parse('allow_cidrs'),
-        deny_cidrs: parse('deny_cidrs'),
-        max_attempts: num('max_attempts')
+        agent_fail_threshold: num('ag-threshold')
       }
     });
     const d = await api(`/api/ip-rules/${saved.id}/guard-script`, { method: 'POST' });
@@ -417,7 +274,6 @@ const AG_TAGS = {
   ok: ['ok', '正常'],
   stale: ['err', '可能失联'],
   not_deployed: ['warn', '未部署'],
-  disabled: ['warn', '未启用'],
 };
 
 async function checkAgent(id) {

@@ -29,7 +29,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from .. import __version__, auth
-from ..autoip import Monitor, probe, run_once
+from ..autoip import handle_agent_report
 from ..cache import (
     BEDROCK_TTL,
     CATALOG_TTL,
@@ -66,7 +66,6 @@ BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 store = Store()
-monitor = Monitor(store)
 ddns_monitor = DdnsMonitor(store)
 
 # 实例上报走独立端口，不跟面板主端口混在一起 —— 主端口上有 AWS 凭据、
@@ -110,11 +109,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         print("  登录后请在「用户面板」修改；忘记密码可执行：")
         print("    python3 -m aws_helper.cli reset-password")
         print("=" * 64)
-    monitor.start()
     ddns_monitor.start()
     report_server.start()
     yield
-    monitor.stop()
     ddns_monitor.stop()
     report_server.stop()
 
@@ -255,7 +252,7 @@ def index(request: Request, _: None = Guard):
     return templates.TemplateResponse(
         request,
         "instances.html",
-        {**_page_ctx("instances"), "monitor_on": monitor.running},
+        {**_page_ctx("instances")},
     )
 
 
@@ -369,7 +366,6 @@ def autoip_page(request: Request, _: None = Guard):
         {
             **_page_ctx("autoip"),
             "rules": store.list_ip_rules(),
-            "monitor_on": monitor.running,
             "report_port": REPORT_PORT,
             "report_port_running": report_server.running,
             "default_target": guard_script.DEFAULT_TARGET,
@@ -1700,7 +1696,7 @@ async def api_save_rule(request: Request, _: None = Guard):
         allow_cidrs=[c.strip() for c in (body.get("allow_cidrs") or []) if c.strip()],
         deny_cidrs=[c.strip() for c in (body.get("deny_cidrs") or []) if c.strip()],
         max_attempts=int(body.get("max_attempts", 3)),
-        probe_mode="agent" if body.get("probe_mode") == "agent" else "local",
+        probe_mode="agent",
         agent_target=(body.get("agent_target") or "").strip(),
         agent_interval_sec=int(body.get("agent_interval_sec") or 60),
         agent_fail_threshold=int(body.get("agent_fail_threshold") or 3),
@@ -1712,12 +1708,6 @@ async def api_save_rule(request: Request, _: None = Guard):
 def api_delete_rule(rule_id: int, _: None = Guard):
     store.delete_ip_rule(rule_id)
     return {"ok": True}
-
-
-@app.post("/api/ip-rules/run-now")
-def api_run_rules_now(_: None = Guard):
-    results = run_once(store)
-    return {"ok": True, "results": results}
 
 
 def _report_url() -> str:
@@ -1800,10 +1790,7 @@ def api_agent_status(rule_id: int, _: None = Guard):
     grace = heartbeat * 3
 
     hints: list[str] = []
-    if rule["probe_mode"] != "agent":
-        state = "disabled"
-        summary = "这条规则用面板自己探测，没有实例侧探测器"
-    elif not rule["agent_deployed"]:
+    if not rule["agent_deployed"]:
         state = "not_deployed"
         summary = "还没生成过部署脚本"
         hints.append("点「生成部署脚本」拿到脚本，复制到实例上以 root 执行")
@@ -1843,24 +1830,6 @@ def api_agent_status(rule_id: int, _: None = Guard):
         "report_port": REPORT_PORT,
         "report_port_running": report_server.running,
     }
-
-
-@app.post("/api/probe")
-async def api_probe(request: Request, _: None = Guard):
-    body = await request.json()
-    result = probe(body.get("ip", ""), body.get("mode", "tcp"), int(body.get("port", 22)))
-    return {"ok": result.ok, "detail": result.detail}
-
-
-@app.post("/api/monitor/{action}")
-def api_monitor(action: str, _: None = Guard):
-    if action == "start":
-        monitor.start()
-    elif action == "stop":
-        monitor.stop()
-    else:
-        raise HTTPException(400, "action 只能是 start / stop")
-    return {"ok": True, "running": monitor.running}
 
 
 # ---------------- 任务与日志 ----------------
@@ -1912,4 +1881,9 @@ def api_keypair(account_id: int, region: str, key_name: str, _: None = Guard):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "version": __version__, "monitor": monitor.running}
+    return {
+        "ok": True,
+        "version": __version__,
+        "ddns_monitor": ddns_monitor.running,
+        "report_port": report_server.running,
+    }

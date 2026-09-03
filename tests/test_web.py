@@ -276,7 +276,7 @@ def test_script_preview_rejects_shebang(client):
 
 
 def test_ip_rule_crud(client):
-    c, aid, _ = client
+    c, aid, app_module = client
     resp = c.post(
         "/api/ip-rules",
         json={
@@ -284,29 +284,33 @@ def test_ip_rule_crud(client):
             "region": "us-east-1",
             "instance_id": "i-abc",
             "strategy": "eip",
-            "check_port": 22,
-            "fail_threshold": 2,
+            "agent_target": "www.baidu.com:443",
+            "agent_fail_threshold": 2,
             "deny_cidrs": ["52.0.0.0/8"],
         },
     )
     assert resp.status_code == 200
     rid = resp.json()["id"]
+    assert app_module.store.ip_rule(rid)["probe_mode"] == "agent"
     assert "i-abc" in c.get("/autoip").text
     assert c.request("DELETE", f"/api/ip-rules/{rid}").status_code == 200
     assert "i-abc" not in c.get("/autoip").text
 
 
-def test_monitor_toggle(client):
-    c, _, _ = client
-    assert c.post("/api/monitor/stop").json()["running"] is False
-    assert c.post("/api/monitor/start").json()["running"] is True
-    assert c.post("/api/monitor/bogus").status_code == 400
+def test_panel_side_probe_endpoints_are_gone(client):
+    """local 已下线：面板不再自己探测，也没有后台监控可开关。
 
+    留着这些接口就等于留着一条会打 AWS 和 TCP 的旁路。
+    """
+    c, _, app_module = client
+    paths = {r.path for r in app_module.app.routes if hasattr(r, "path")}
+    assert "/api/monitor/{action}" not in paths
+    assert "/api/probe" not in paths
+    assert "/api/ip-rules/run-now" not in paths
 
-def test_probe_endpoint_reports_unreachable(client):
-    c, _, _ = client
-    body = c.post("/api/probe", json={"ip": "203.0.113.1", "port": 9}).json()
-    assert body["ok"] is False
+    # 断言到路由表之外再走一次 HTTP：光看路由表证明不了没有别的入口
+    assert c.post("/api/monitor/start").status_code == 404
+    assert c.post("/api/probe", json={"ip": "203.0.113.1", "port": 9}).status_code == 404
 
 
 def test_addresses_and_release_idle(client):
@@ -1474,11 +1478,6 @@ def test_agent_status_states(client, monkeypatch):
     c, aid, app_module = client
     monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
 
-    local_id = app_module.store.save_ip_rule(
-        account_id=aid, region="us-east-1", instance_id="i-local"
-    )
-    assert c.get(f"/api/ip-rules/{local_id}/agent-status").json()["state"] == "disabled"
-
     rid = _make_agent_rule(app_module, aid)
     assert c.get(f"/api/ip-rules/{rid}/agent-status").json()["state"] == "not_deployed"
 
@@ -2118,3 +2117,57 @@ def test_copy_keeps_original_intact():
     body = html.split("function load(id)")[1].split("\n}")[0]
     assert "副本" in body
     assert "setMode(null)" in body
+
+
+def test_legacy_local_rules_migrated_to_agent(mock_ec2, monkeypatch, tmp_path):
+    """升级上来的老库里 probe_mode='local'，必须迁成 agent。
+
+    ADD COLUMN 的 DEFAULT 只作用于新行；不迁移的话这些规则既不会被面板探测
+    （已下线），也等不到实例上报，等于永久失效。
+    """
+    app_module = build_app(monkeypatch, tmp_path / "legacy-local")
+    store = app_module.store
+    aid = store.add_account("legacy", "AKIA1", "sk", "us-east-1")
+    rid = store.save_ip_rule(account_id=aid, region="us-east-1", instance_id="i-old")
+
+    # 手工写回 local，模拟旧版本留下的数据
+    store._execute("UPDATE ip_rules SET probe_mode='local' WHERE id=%s", (rid,))
+    assert store.ip_rule(rid)["probe_mode"] == "local"
+
+    store._init_schema()
+    assert store.ip_rule(rid)["probe_mode"] == "agent"
+
+
+def test_autoip_page_has_no_panel_probe_controls():
+    """页面上不能再有监控开关、立即检查和面板侧探测端口这些入口。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/autoip.html").read_text()
+    assert "启动监控" not in html
+    assert "立即检查一轮" not in html
+    assert "/api/monitor/" not in html
+    assert "/api/ip-rules/run-now" not in html
+    assert 'id="check_port"' not in html
+
+
+def test_healthz_no_longer_reports_autoip_monitor(client):
+    """autoip 监控线程已移除，healthz 不能再声称它在运行。"""
+    c, _, _ = client
+    body = c.get("/healthz").json()
+    assert "monitor" not in body
+    assert body["ddns_monitor"] is False or body["ddns_monitor"] is True
+    assert "report_port" in body
+
+
+def test_autoip_page_keeps_agent_entry_point(client):
+    """移除 local 表单时不能把「开启实例侧探测」的入口一起删掉。
+
+    浏览器实测抓到过：按钮原本挂在 local 规则表单里，表单一删就没有任何
+    地方能打开部署弹窗了。
+    """
+    c, aid, _ = client
+    page = c.get("/autoip").text
+    # 查 onclick 属性而不是裸函数名 —— 后者在函数定义里也有，
+    # 删掉按钮照样能通过（控制实验证过）。
+    assert 'onclick="openAgent()"' in page
+    assert "开启实例侧探测" in page

@@ -153,17 +153,14 @@ def main() -> None:
         account_id=account_id,
         region=region,
         instance_id=launched[1].instance_id,
-        enabled=0,
+        enabled=1,
         strategy="eip",
-        check_mode="tcp",
-        check_port=22,
-        interval_sec=600,
-        fail_threshold=3,
-        allow_cidrs=[],
-        deny_cidrs=["52.0.0.0/8"],
-        max_attempts=3,
+        probe_mode="agent",
+        agent_target="www.baidu.com:443",
+        agent_interval_sec=60,
+        agent_fail_threshold=3,
     )
-    print(f"已为 {launched[1].name} 预置一条自动换 IP 规则（默认停用）")
+    print(f"已为 {launched[1].name} 预置一条实例侧自动换 IP 规则")
 
     store.log("account", "演示账号（模拟）", True, "演示环境初始化完成")
     store.close()
