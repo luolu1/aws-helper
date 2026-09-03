@@ -46,6 +46,7 @@ from ..core import (
     bedrock,
     ddns,
     ddns_script,
+    guard_script,
     ipchange,
     launch,
     lightsail,
@@ -57,6 +58,7 @@ from ..ddnsmon import Monitor as DdnsMonitor
 from ..ddnsmon import check_rule as ddns_check_rule
 from ..store import Store
 from ..tasks import manager
+from .report_app import ReportServer
 
 BASE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -64,6 +66,15 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 store = Store()
 monitor = Monitor(store)
 ddns_monitor = DdnsMonitor(store)
+
+# 实例上报走独立端口，不跟面板主端口混在一起 —— 主端口上有 AWS 凭据、
+# 密钥下载、实例密码，不能为了给实例开个上报入口就整个暴露给它们。
+REPORT_PORT = int(os.environ.get("AWS_HELPER_REPORT_PORT", "8766"))
+REPORT_HOST = os.environ.get("AWS_HELPER_REPORT_HOST", "0.0.0.0")
+# 生成脚本时写进 GUARD_REPORT_URL。留空则按面板出站 IP + 上报端口自动拼，
+# 但那个 IP 未必是实例能连到的地址（NAT、多网卡），所以允许显式指定。
+REPORT_PUBLIC_URL = os.environ.get("AWS_HELPER_REPORT_URL", "")
+report_server = ReportServer(store, REPORT_HOST, REPORT_PORT)
 
 SESSION_TTL = int(os.environ.get("AWS_HELPER_SESSION_TTL", "86400"))
 
@@ -99,9 +110,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         print("=" * 64)
     monitor.start()
     ddns_monitor.start()
+    report_server.start()
     yield
     monitor.stop()
     ddns_monitor.stop()
+    report_server.stop()
 
 
 app = FastAPI(title="AWS 小助手", version=__version__, lifespan=lifespan)
@@ -348,6 +361,9 @@ def autoip_page(request: Request, _: None = Guard):
             **_page_ctx("autoip"),
             "rules": store.list_ip_rules(),
             "monitor_on": monitor.running,
+            "report_port": REPORT_PORT,
+            "report_port_running": report_server.running,
+            "default_target": guard_script.DEFAULT_TARGET,
         },
     )
 
@@ -456,6 +472,61 @@ def api_ddns_run(rule_id: int, _: None = Guard):
     # last_check 归零绕过间隔判断，用户点了就该立刻执行
     result = ddns_check_rule(store, {**rule, "last_check": 0})
     return {"ok": True, **result}
+
+
+@app.get("/api/ddns/rules/{rule_id}/status")
+def api_ddns_status(rule_id: int, _: None = Guard):
+    """查这条 DDNS 规则的运行状态，附排查方向。
+
+    跟自动换 IP 的状态接口对齐：光说「失败」没用，要给出下一步查什么。
+    """
+    rule = store.ddns_rule(rule_id)
+    if rule is None:
+        return JSONResponse({"ok": False, "error": "规则不存在"}, status_code=404)
+
+    now = int(time.time())
+    last_check = int(rule["last_check"])
+    interval = int(rule["interval_sec"]) or 300
+    grace = interval * 3
+    fail_count = int(rule["fail_count"])
+    status = rule["last_status"] or ""
+
+    hints: list[str] = []
+    if not int(rule["enabled"]):
+        state = "disabled"
+        summary = "规则已停用"
+    elif last_check == 0:
+        state = "not_run"
+        summary = "还没跑过"
+        hints.append("点「立即执行」跑一次，能直接看到报错")
+    elif fail_count:
+        state = "failing"
+        summary = f"连续失败 {fail_count} 次：{status}"
+        hints.append("Token 是否过期、权限是否为 Zone → DNS → Edit")
+        hints.append(f"Token 的区域范围是否覆盖 {rule['zone']}")
+        hints.append("点「立即执行」看完整报错")
+    elif now - last_check > grace:
+        state = "stale"
+        summary = f"上次执行在 {now - last_check} 秒前，超过 {grace} 秒宽限"
+        hints.append("面板的 DDNS 监控线程可能没在跑，检查面板服务状态")
+    else:
+        state = "ok"
+        summary = f"正常，上次执行在 {now - last_check} 秒前"
+
+    return {
+        "ok": True,
+        "state": state,
+        "summary": summary,
+        "hints": hints,
+        "hostname": rule["hostname"],
+        "last_check": last_check,
+        "last_check_ago": (now - last_check) if last_check else None,
+        "last_status": status,
+        "last_ipv4": rule["last_ipv4"],
+        "last_ipv6": rule["last_ipv6"],
+        "fail_count": fail_count,
+        "monitor_running": ddns_monitor.running,
+    }
 
 
 @app.delete("/api/ddns/rules/{rule_id}")
@@ -1514,6 +1585,10 @@ async def api_save_rule(request: Request, _: None = Guard):
         allow_cidrs=[c.strip() for c in (body.get("allow_cidrs") or []) if c.strip()],
         deny_cidrs=[c.strip() for c in (body.get("deny_cidrs") or []) if c.strip()],
         max_attempts=int(body.get("max_attempts", 3)),
+        probe_mode="agent" if body.get("probe_mode") == "agent" else "local",
+        agent_target=(body.get("agent_target") or "").strip(),
+        agent_interval_sec=int(body.get("agent_interval_sec") or 60),
+        agent_fail_threshold=int(body.get("agent_fail_threshold") or 3),
     )
     return {"ok": True, "id": rule_id}
 
@@ -1528,6 +1603,131 @@ def api_delete_rule(rule_id: int, _: None = Guard):
 def api_run_rules_now(_: None = Guard):
     results = run_once(store)
     return {"ok": True, "results": results}
+
+
+def _report_url() -> str:
+    """实例要往哪个地址上报。
+
+    优先用显式配置的 AWS_HELPER_REPORT_URL —— 自动探测出来的是面板的出站 IP，
+    在 NAT 或多网卡环境下未必是实例能连到的那个地址。
+    """
+    if REPORT_PUBLIC_URL:
+        return REPORT_PUBLIC_URL.rstrip("/") + "/report"
+    ip = ddns.detect_ip(4)
+    if not ip:
+        raise RuntimeError(
+            "探测不到面板的公网 IPv4，无法拼出上报地址。"
+            "请设置环境变量 AWS_HELPER_REPORT_URL，例如 http://面板地址:8766"
+        )
+    return f"http://{ip}:{REPORT_PORT}/report"
+
+
+@app.post("/api/ip-rules/{rule_id}/guard-script")
+def api_guard_script(rule_id: int, _: None = Guard):
+    """生成装在实例上的探测脚本，顺带发一个新的上报凭证。
+
+    每次生成都换凭证：脚本里带着明文凭证，重新生成通常意味着上一份可能
+    已经泄露或作废了。旧脚本会立刻失效，这是有意的。
+    """
+    rule = store.ip_rule(rule_id)
+    if rule is None:
+        return JSONResponse({"ok": False, "error": "规则不存在"}, status_code=404)
+
+    try:
+        url = _report_url()
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    token = store.issue_agent_token(rule_id)
+    try:
+        script = guard_script.render_script(
+            guard_script.GuardRequest(
+                instance_id=rule["instance_id"],
+                report_url=url,
+                token=token,
+                target=rule["agent_target"] or guard_script.DEFAULT_TARGET,
+                interval_sec=int(rule["agent_interval_sec"]),
+                fail_threshold=int(rule["agent_fail_threshold"]),
+            )
+        )
+    except guard_script.GuardScriptError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    host, port = guard_script.parse_target(
+        rule["agent_target"] or guard_script.DEFAULT_TARGET
+    )
+    store.log("autoip", rule["instance_id"], True, "生成实例探测脚本，已换发上报凭证")
+    return {
+        "ok": True,
+        "script": script,
+        "report_url": url,
+        "target": f"{host}:{port}",
+        "service_name": guard_script.SERVICE_NAME,
+    }
+
+
+@app.get("/api/ip-rules/{rule_id}/agent-status")
+def api_agent_status(rule_id: int, _: None = Guard):
+    """查实例探测器的部署状态，并给出可操作的排查方向。
+
+    探测正常时脚本不上报（这是设计要求），所以「有没有部署好」只能靠心跳
+    判断。心跳间隔是探测间隔的 10 倍，宽限到 3 倍心跳周期才算失联 ——
+    实例重启、网络抖动都会漏掉一两次。
+    """
+    rule = store.ip_rule(rule_id)
+    if rule is None:
+        return JSONResponse({"ok": False, "error": "规则不存在"}, status_code=404)
+
+    now = int(time.time())
+    last_seen = int(rule["agent_last_seen"])
+    interval = int(rule["agent_interval_sec"]) or 60
+    heartbeat = interval * 10
+    grace = heartbeat * 3
+
+    hints: list[str] = []
+    if rule["probe_mode"] != "agent":
+        state = "disabled"
+        summary = "这条规则用面板自己探测，没有实例侧探测器"
+    elif not rule["agent_deployed"]:
+        state = "not_deployed"
+        summary = "还没生成过部署脚本"
+        hints.append("点「生成部署脚本」拿到脚本，复制到实例上以 root 执行")
+    elif last_seen == 0:
+        state = "not_deployed"
+        summary = "已生成脚本，但面板从未收到这台实例的上报"
+        hints.append(f"确认脚本已在实例上执行：systemctl status {guard_script.SERVICE_NAME}")
+        hints.append(f"确认实例能连到面板的上报端口 {REPORT_PORT}（安全组、防火墙）")
+        hints.append("在实例上手动跑一次看输出：" + guard_script.INSTALL_PATH)
+    elif now - last_seen > grace:
+        state = "stale"
+        summary = f"最后一次上报在 {now - last_seen} 秒前，超过 {grace} 秒宽限，可能已失联"
+        hints.append(f"看实例上的日志：journalctl -u {guard_script.SERVICE_NAME} -n 50")
+        hints.append("实例可能已关机、脚本被卸载，或出网到面板的链路断了")
+    else:
+        state = "ok"
+        summary = f"正常，最后一次上报在 {now - last_seen} 秒前"
+
+    return {
+        "ok": True,
+        "state": state,
+        "summary": summary,
+        "hints": hints,
+        "probe_mode": rule["probe_mode"],
+        "deployed": bool(rule["agent_deployed"]),
+        "instance_id": rule["instance_id"],
+        "target": rule["agent_target"] or guard_script.DEFAULT_TARGET,
+        "interval_sec": interval,
+        "fail_threshold": int(rule["agent_fail_threshold"]),
+        "last_seen": last_seen,
+        "last_seen_ago": (now - last_seen) if last_seen else None,
+        "last_report": int(rule["agent_last_report"]),
+        "last_report_ago": (
+            now - int(rule["agent_last_report"]) if int(rule["agent_last_report"]) else None
+        ),
+        "last_detail": rule["agent_last_detail"],
+        "report_port": REPORT_PORT,
+        "report_port_running": report_server.running,
+    }
 
 
 @app.post("/api/probe")

@@ -51,6 +51,9 @@ services:
     # 并务必在前面加 HTTPS 反代 —— 面板持有 AWS 凭据。
     ports:
       - "${AWS_HELPER_BIND:-127.0.0.1}:${AWS_HELPER_PORT:-8765}:8765"
+      # 实例上报端口。实例要能连到它，所以默认绑 0.0.0.0 而不是本机 ——
+      # 这个端口上只有一个上报接口，鉴权靠每条规则独立的凭证。
+      - "${AWS_HELPER_REPORT_BIND:-0.0.0.0}:${AWS_HELPER_REPORT_PORT:-8766}:8766"
 
     environment:
       AWS_HELPER_DATABASE_URL: >-
@@ -63,6 +66,11 @@ services:
       AWS_HELPER_PASSWORD: ${AWS_HELPER_PASSWORD:-}
       AWS_HELPER_SESSION_KEY: ${AWS_HELPER_SESSION_KEY:-}
       AWS_HELPER_SESSION_TTL: ${AWS_HELPER_SESSION_TTL:-86400}
+      AWS_HELPER_REPORT_HOST: 0.0.0.0
+      AWS_HELPER_REPORT_PORT: 8766
+      # 容器内探测不到宿主的公网地址，用了 agent 模式请显式设置，
+      # 例如 AWS_HELPER_REPORT_URL=http://面板公网地址:8766
+      AWS_HELPER_REPORT_URL: ${AWS_HELPER_REPORT_URL:-}
 
     volumes:
       - aws-helper-data:/data

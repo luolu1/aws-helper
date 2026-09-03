@@ -185,8 +185,12 @@
         <td class="mono" data-ts="{{ r.last_check }}">{{ r.last_check or '从未' }}</td>
         <td>
           <button class="sm" onclick="runNow({{ r.id }})">立即同步</button>
+          <button class="sm" onclick="checkDdns({{ r.id }})">检测</button>
           <button class="sm danger" onclick="del({{ r.id }})">删除</button>
         </td>
+      </tr>
+      <tr class="dd-detail" data-detail="{{ r.id }}" style="display:none">
+        <td colspan="8"><pre class="out" style="margin:0"></pre></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -336,6 +340,49 @@ async function del(id) {
     setTimeout(() => location.reload(), 600);
   } catch (e) {
     toast(e.message, 'err');
+  }
+}
+
+const DD_TAGS = {
+  ok: ['ok', '正常'],
+  failing: ['err', '连续失败'],
+  stale: ['err', '可能停摆'],
+  not_run: ['warn', '还没跑过'],
+  disabled: ['warn', '已停用'],
+};
+
+function ddAgo(sec) {
+  if (sec === null || sec === undefined) return '从未';
+  if (sec < 60) return sec + ' 秒前';
+  if (sec < 3600) return Math.round(sec / 60) + ' 分钟前';
+  return Math.round(sec / 3600) + ' 小时前';
+}
+
+// 光说「失败」没用，要给出下一步查什么 —— 跟自动换 IP 的检测对齐
+async function checkDdns(id) {
+  const detailRow = document.querySelector(`tr[data-detail="${id}"]`);
+  const pre = detailRow.querySelector('pre');
+  pre.textContent = '检测中…';
+  detailRow.style.display = '';
+  try {
+    const d = await api(`/api/ddns/rules/${id}/status`);
+    const [cls, label] = DD_TAGS[d.state] || ['warn', d.state];
+    const lines = [`[${label}] ${d.summary}`, ''];
+    lines.push('主机名      : ' + d.hostname);
+    lines.push('上次执行    : ' + ddAgo(d.last_check_ago));
+    lines.push('当前 IPv4   : ' + (d.last_ipv4 || '-'));
+    lines.push('当前 IPv6   : ' + (d.last_ipv6 || '-'));
+    if (d.last_status) lines.push('最近状态    : ' + d.last_status);
+    if (!d.monitor_running) {
+      lines.push('', '⚠ 面板的 DDNS 监控线程没在运行，规则不会被自动执行');
+    }
+    if (d.hints.length) {
+      lines.push('', '排查方向:');
+      d.hints.forEach((h, i) => lines.push(`  ${i + 1}. ${h}`));
+    }
+    pre.textContent = lines.join('\n');
+  } catch (e) {
+    pre.textContent = '检测请求失败: ' + e.message;
   }
 }
 </script>

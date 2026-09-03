@@ -89,9 +89,126 @@
     <label class="chk"><input type="checkbox" id="enabled" checked> 启用这条规则</label>
     <span style="flex:1"></span>
     <button class="primary" onclick="saveRule()">保存规则</button>
+    <button onclick="openAgent()">开启实例侧探测（推荐）</button>
   </div>
 </div>
 {% endif %}
+
+<div class="mask" id="ag-mask">
+  <div class="box">
+    <h3>实例侧探测 —— 从境内视角判断被墙</h3>
+    <p class="hint">
+      面板在海外，从海外连实例通常一直是通的，判断不了「被墙」。
+      所以把探测放到实例自己身上：实例定时连一个国内站点，
+      连不上说明出网被拦，这时才上报面板换 IP。
+      <strong>探测正常不上报</strong>，只有低频心跳（探测间隔的 10 倍）
+      用来让面板区分「一切正常」和「脚本挂了」。
+    </p>
+
+    <div class="grid g2">
+      <label class="f">
+        <span>探测目标（留空用默认）</span>
+        <input type="text" id="ag-target" placeholder="{{ default_target }}">
+      </label>
+      <label class="f">
+        <span>换 IP 方式</span>
+        <select id="ag-strategy">
+          <option value="eip">弹性 IP（不停机）</option>
+          <option value="dynamic">停机重启换动态 IP</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="grid g2 mt">
+      <label class="f">
+        <span>探测间隔（秒，最低 20）</span>
+        <input type="number" id="ag-interval" value="60" min="20" max="3600">
+      </label>
+      <label class="f">
+        <span>连续失败几次上报</span>
+        <input type="number" id="ag-threshold" value="3" min="1" max="20">
+      </label>
+    </div>
+
+    <p class="hint mt">
+      上报端口 <span class="mono">{{ report_port }}</span>
+      {% if report_port_running %}
+      <span class="tag ok" style="font-size:11px">运行中</span>
+      {% else %}
+      <span class="tag err" style="font-size:11px">未运行</span>
+      {% endif %}
+      —— 实例要能连到这个端口，安全组和防火墙都要放通。
+      这个端口只有一个上报接口，没有面板的其他功能。
+    </p>
+
+    <div id="ag-script-box" style="display:none" class="mt">
+      <label class="f">
+        <span>一键部署脚本（在实例上以 root 执行）</span>
+        <textarea id="ag-script" rows="10" class="mono" readonly
+                  style="font-size:11px" onclick="this.select()"></textarea>
+      </label>
+      <p class="hint">
+        脚本含上报凭证，等同于「让面板给这台实例换 IP」的权限，
+        部署完建议删掉脚本文件。<strong>每次生成都会换发凭证，旧脚本立刻失效。</strong>
+      </p>
+      <div class="row">
+        <button class="primary" onclick="copyAgentScript()">复制脚本</button>
+        <button onclick="downloadAgentScript()">下载 .sh</button>
+      </div>
+    </div>
+
+    <div class="row end mt">
+      <button onclick="document.getElementById('ag-mask').classList.remove('on')">关闭</button>
+      <button class="primary" onclick="genAgentScript()">保存并生成脚本</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>实例侧探测部署状态</h2>
+  <p class="hint">
+    探测正常时脚本不上报，所以这里靠心跳判断是否部署成功。
+    发现有问题可以点「检测」看具体原因和排查方向。
+  </p>
+  {% set agent_rules = rules | selectattr('probe_mode', 'equalto', 'agent') | list %}
+  {% if agent_rules %}
+  <table>
+    <thead>
+      <tr>
+        <th>实例</th><th>探测目标</th><th>间隔/阈值</th>
+        <th>最后心跳</th><th>最近上报</th><th>状态</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in agent_rules %}
+      <tr data-rule="{{ r.id }}">
+        <td class="mono">{{ r.instance_id }}</td>
+        <td class="mono">{{ r.agent_target or default_target }}</td>
+        <td class="mono">{{ r.agent_interval_sec }}s / {{ r.agent_fail_threshold }}次</td>
+        <td class="mono ag-seen">{{ r.agent_last_seen or '从未' }}</td>
+        <td class="mono ag-report">{{ r.agent_last_report or '无' }}</td>
+        <td class="ag-state">
+          {% if not r.agent_deployed %}
+          <span class="tag warn">未部署</span>
+          {% else %}
+          <span class="hint">点检测</span>
+          {% endif %}
+        </td>
+        <td>
+          <button class="sm" onclick="checkAgent({{ r.id }})">检测</button>
+          <button class="sm" onclick="regenAgent({{ r.id }})">重新生成脚本</button>
+        </td>
+      </tr>
+      <tr class="ag-detail" data-detail="{{ r.id }}" style="display:none">
+        <td colspan="7"><pre class="out" style="margin:0"></pre></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">还没有实例侧探测的规则。上面选好实例后点「开启实例侧探测」。</div>
+  {% endif %}
+</div>
 
 <div class="card">
   <h2>现有规则</h2>
@@ -208,6 +325,129 @@ async function runNow() {
     document.getElementById('run-out').textContent = JSON.stringify(d.results, null, 2);
     toast(`检查了 ${d.results.length} 条规则`, 'ok');
   } catch (e) { toast(e.message, 'err'); }
+}
+
+// ---------- 实例侧探测 ----------
+
+function openAgent() {
+  if (!document.getElementById('instance_id').value) {
+    return toast('请先在上面选择实例', 'err');
+  }
+  document.getElementById('ag-script-box').style.display = 'none';
+  document.getElementById('ag-mask').classList.add('on');
+}
+
+// 先存规则（probe_mode=agent）再生成脚本 —— 脚本里的凭证是挂在规则上的，
+// 规则不存在就没地方发凭证。
+async function genAgentScript() {
+  const instance_id = document.getElementById('instance_id').value;
+  if (!instance_id) return toast('请先选择实例', 'err');
+  const num = id => parseInt(document.getElementById(id).value, 10);
+  const parse = id => document.getElementById(id).value.split(',').map(s => s.trim()).filter(Boolean);
+  try {
+    const saved = await api('/api/ip-rules', {
+      method: 'POST',
+      json: {
+        account_id: parseInt(document.getElementById('account_id').value, 10),
+        region: document.getElementById('region').value,
+        instance_id,
+        enabled: true,
+        strategy: document.getElementById('ag-strategy').value,
+        probe_mode: 'agent',
+        agent_target: document.getElementById('ag-target').value.trim(),
+        agent_interval_sec: num('ag-interval'),
+        agent_fail_threshold: num('ag-threshold'),
+        allow_cidrs: parse('allow_cidrs'),
+        deny_cidrs: parse('deny_cidrs'),
+        max_attempts: num('max_attempts')
+      }
+    });
+    const d = await api(`/api/ip-rules/${saved.id}/guard-script`, { method: 'POST' });
+    document.getElementById('ag-script').value = d.script;
+    document.getElementById('ag-script-box').style.display = 'block';
+    toast(`脚本已生成（探测 ${d.target}，上报到 ${d.report_url}）`, 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function regenAgent(id) {
+  if (!confirm('重新生成脚本会换发凭证，这台实例上的旧脚本会立刻失效。继续？')) return;
+  try {
+    const d = await api(`/api/ip-rules/${id}/guard-script`, { method: 'POST' });
+    document.getElementById('ag-script').value = d.script;
+    document.getElementById('ag-script-box').style.display = 'block';
+    document.getElementById('ag-mask').classList.add('on');
+    toast('脚本已重新生成，需要在实例上重新执行', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function copyAgentScript() {
+  const text = document.getElementById('ag-script').value;
+  if (!text) return toast('先生成脚本', 'err');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('已复制，粘到实例上执行', 'ok');
+  } catch (e) {
+    // 非 HTTPS 下 clipboard API 不可用（面板是明文 HTTP），退回选中让用户手动复制
+    const el = document.getElementById('ag-script');
+    el.select();
+    toast('浏览器不允许自动复制，已全选，按 Ctrl+C', 'err');
+  }
+}
+
+function downloadAgentScript() {
+  const text = document.getElementById('ag-script').value;
+  if (!text) return toast('先生成脚本', 'err');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/x-shellscript' }));
+  a.download = 'guard-deploy.sh';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function agAgo(sec) {
+  if (sec === null || sec === undefined) return '从未';
+  if (sec < 60) return sec + ' 秒前';
+  if (sec < 3600) return Math.round(sec / 60) + ' 分钟前';
+  return Math.round(sec / 3600) + ' 小时前';
+}
+
+const AG_TAGS = {
+  ok: ['ok', '正常'],
+  stale: ['err', '可能失联'],
+  not_deployed: ['warn', '未部署'],
+  disabled: ['warn', '未启用'],
+};
+
+async function checkAgent(id) {
+  const row = document.querySelector(`tr[data-rule="${id}"]`);
+  const detailRow = document.querySelector(`tr[data-detail="${id}"]`);
+  const stateCell = row.querySelector('.ag-state');
+  stateCell.innerHTML = '<span class="hint">检测中…</span>';
+  try {
+    const d = await api(`/api/ip-rules/${id}/agent-status`);
+    const [cls, label] = AG_TAGS[d.state] || ['warn', d.state];
+    stateCell.innerHTML = `<span class="tag ${cls}">${label}</span>`;
+    row.querySelector('.ag-seen').textContent = agAgo(d.last_seen_ago);
+    row.querySelector('.ag-report').textContent = agAgo(d.last_report_ago);
+
+    const lines = [d.summary];
+    if (d.last_detail) lines.push('', '最近一次上报内容: ' + d.last_detail);
+    if (!d.report_port_running) {
+      lines.push('', `⚠ 面板的上报端口 ${d.report_port} 没在运行，实例上报会全部失败`);
+    }
+    if (d.hints.length) {
+      lines.push('', '排查方向:');
+      d.hints.forEach((h, i) => lines.push(`  ${i + 1}. ${h}`));
+    }
+    detailRow.querySelector('pre').textContent = lines.join('\n');
+    detailRow.style.display = '';
+  } catch (e) {
+    stateCell.innerHTML = '<span class="tag err">检测失败</span>';
+    detailRow.querySelector('pre').textContent = '检测请求失败: ' + e.message;
+    detailRow.style.display = '';
+  }
 }
 </script>
 {% endblock %}

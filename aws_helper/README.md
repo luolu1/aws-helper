@@ -108,6 +108,9 @@ python3 -m aws_helper
 | `AWS_HELPER_DATA` | `~/.aws-helper` | 加密密钥目录（业务数据在数据库） |
 | `AWS_HELPER_HOST` | `127.0.0.1` | 监听地址 |
 | `AWS_HELPER_PORT` | `8765` | 监听端口 |
+| `AWS_HELPER_REPORT_HOST` | `0.0.0.0` | 实例上报端口的监听地址 |
+| `AWS_HELPER_REPORT_PORT` | `8766` | 实例上报端口 |
+| `AWS_HELPER_REPORT_URL` | 自动探测 | 写进部署脚本的上报地址，如 `http://1.2.3.4:8766` |
 | `AWS_HELPER_SESSION_TTL` | `86400` | 会话有效期（秒） |
 | `AWS_HELPER_SESSION_KEY` | 随机生成 | 会话签名密钥，不设则重启后需重新登录 |
 | `AWS_HELPER_ENDPOINT_URL` | 无 | 覆盖 AWS endpoint，用于本地测试 |
@@ -117,6 +120,11 @@ python3 -m aws_helper
 
 **面板持有你的 AWS 凭据。** 默认只听 127.0.0.1。要对外暴露必须放到 HTTPS 反代之后，
 并设置一个强密码。
+
+**上报端口是独立的第二个端口**，默认 `0.0.0.0:8766`。它上面只有 `/report`
+和 `/health` 两个路由，没有面板的任何其他功能 —— 实例需要一个上报入口，
+但不该因此拿到整个面板的访问权。鉴权用每条规则独立的 `X-Guard-Token`，
+库里只存 SHA-256 摘要，且凭证绑定实例 ID。
 
 ## 用户面板
 
@@ -462,7 +470,7 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-747 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+799 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、自动换 IP 触发与恢复、SQLite 迁移与序列校正、
@@ -491,11 +499,13 @@ aws_helper/
   ddnsmon.py         DDNS 监控循环
   core/ddns.py       DNS 供应商接口 + Cloudflare + 取本机公网 IP
   core/ddns_script.py 生成自包含的一键部署脚本（bash + curl）
+  core/guard_script.py 生成实例侧被墙探测脚本
   core/respw.py      通过 SSM 重置实例登录密码
   core/reinstall.py  重装系统（ReplaceRootVolume）+ 前置校验
   tasks.py           后台任务与进度跟踪
   autoip.py          自动换 IP 监控循环
   web/app.py         FastAPI 路由
+  web/report_app.py  实例上报专用端口（只有 /report 和 /health）
   web/templates/     左侧目录布局 + 十一个页面
   demo/              演示环境（moto 后端 + 预置数据）
 

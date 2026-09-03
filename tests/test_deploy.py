@@ -440,3 +440,27 @@ def test_dockerignore_excludes_junk():
     text = path.read_text()
     for pattern in ("__pycache__", "tests/", ".git"):
         assert pattern in text
+
+
+def test_compose_exposes_report_port():
+    """实例上报端口必须映射出来，否则 agent 模式的脚本连不到面板。"""
+    import yaml
+
+    d = yaml.safe_load(COMPOSE.read_text())
+    ports = d["services"]["aws-helper"]["ports"]
+    assert any("8766" in p for p in ports), f"缺上报端口映射: {ports}"
+
+
+def test_compose_report_port_binds_all_interfaces():
+    """面板端口默认绑本机，但上报端口必须对外 —— 实例在公网上。"""
+    import yaml
+
+    d = yaml.safe_load(COMPOSE.read_text())
+    report = next(p for p in d["services"]["aws-helper"]["ports"] if "8766" in p)
+    assert "0.0.0.0" in report, f"上报端口必须默认绑 0.0.0.0: {report}"
+
+
+def test_installer_writes_report_config():
+    text = INSTALL_SH.read_text()
+    assert "AWS_HELPER_REPORT_PORT=" in text
+    assert "AWS_HELPER_REPORT_URL=" in text

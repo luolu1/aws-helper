@@ -108,6 +108,18 @@ CREATE TABLE IF NOT EXISTS ip_rules (
     fail_count INTEGER NOT NULL DEFAULT 0,
     last_check BIGINT NOT NULL DEFAULT 0,
     last_change BIGINT NOT NULL DEFAULT 0,
+    -- 探测放到实例上跑（agent 模式）时用到的字段。
+    -- probe 模式 local=面板自己探测，agent=实例上的脚本探测并上报。
+    probe_mode TEXT NOT NULL DEFAULT 'local',
+    -- 上报凭证只存 SHA-256 摘要，明文只在生成脚本那一刻返回一次。
+    -- 面板暴露在公网，库被读到也不能让人伪造上报触发换 IP。
+    agent_token_hash TEXT NOT NULL DEFAULT '',
+    agent_target TEXT NOT NULL DEFAULT '',
+    agent_interval_sec INTEGER NOT NULL DEFAULT 60,
+    agent_fail_threshold INTEGER NOT NULL DEFAULT 3,
+    agent_last_seen BIGINT NOT NULL DEFAULT 0,
+    agent_last_report BIGINT NOT NULL DEFAULT 0,
+    agent_last_detail TEXT NOT NULL DEFAULT '',
     UNIQUE(account_id, region, instance_id)
 );
 
@@ -185,6 +197,14 @@ CREATE INDEX IF NOT EXISTS idx_login_history_created
 # 老库不会自动长出新字段 —— 这里逐条 ADD COLUMN IF NOT EXISTS 补齐。
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("ddns_rules", "cf_account_id", "TEXT NOT NULL DEFAULT ''"),
+    ("ip_rules", "probe_mode", "TEXT NOT NULL DEFAULT 'local'"),
+    ("ip_rules", "agent_token_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("ip_rules", "agent_target", "TEXT NOT NULL DEFAULT ''"),
+    ("ip_rules", "agent_interval_sec", "INTEGER NOT NULL DEFAULT 60"),
+    ("ip_rules", "agent_fail_threshold", "INTEGER NOT NULL DEFAULT 3"),
+    ("ip_rules", "agent_last_seen", "BIGINT NOT NULL DEFAULT 0"),
+    ("ip_rules", "agent_last_report", "BIGINT NOT NULL DEFAULT 0"),
+    ("ip_rules", "agent_last_detail", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # 迁移用：表名 → 列名。顺序有依赖，accounts 必须先导入
@@ -728,6 +748,10 @@ class Store:
         "allow_cidrs": "[]",
         "deny_cidrs": "[]",
         "max_attempts": 3,
+        "probe_mode": "local",
+        "agent_target": "",
+        "agent_interval_sec": 60,
+        "agent_fail_threshold": 3,
     }
 
     def save_ip_rule(self, **kw: Any) -> int:
@@ -756,18 +780,25 @@ class Store:
             tuple(data[f] for f in fields),
         )
 
+    @staticmethod
+    def _clean_rule(row: dict[str, Any]) -> dict[str, Any]:
+        """规则出库时解开 JSON 字段并摘掉凭证摘要。
+
+        摘要必须 pop 掉：规则列表会整个序列化给页面，摘要虽然不可逆，
+        但送出去等于给暴力枚举提供了目标。只保留「有没有发过凭证」。
+        """
+        item = dict(row)
+        item["allow_cidrs"] = json.loads(item["allow_cidrs"])
+        item["deny_cidrs"] = json.loads(item["deny_cidrs"])
+        item["agent_deployed"] = bool(item.pop("agent_token_hash", ""))
+        return item
+
     def list_ip_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT * FROM ip_rules"
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY id DESC"
-        out = []
-        for r in self._fetchall(sql):
-            item = dict(r)
-            item["allow_cidrs"] = json.loads(item["allow_cidrs"])
-            item["deny_cidrs"] = json.loads(item["deny_cidrs"])
-            out.append(item)
-        return out
+        return [self._clean_rule(r) for r in self._fetchall(sql)]
 
     def update_rule_state(
         self,
@@ -793,6 +824,56 @@ class Store:
 
     def delete_ip_rule(self, rule_id: int) -> None:
         self._execute("DELETE FROM ip_rules WHERE id=%s", (rule_id,))
+
+    def ip_rule(self, rule_id: int) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM ip_rules WHERE id=%s", (rule_id,))
+        return self._clean_rule(row) if row else None
+
+    def issue_agent_token(self, rule_id: int) -> str:
+        """给规则发一个上报凭证，返回明文。
+
+        只存 SHA-256 摘要 —— 面板暴露在公网，库被读到也不能让人伪造上报
+        触发换 IP。明文只在这里返回一次，之后想要只能重新生成。
+        """
+        token = secrets.token_urlsafe(32)
+        self._execute(
+            "UPDATE ip_rules SET agent_token_hash=%s WHERE id=%s",
+            (self._hash_token(token), rule_id),
+        )
+        return token
+
+    def rule_by_agent_token(self, token: str) -> dict[str, Any] | None:
+        """按上报凭证找规则。凭证不对返回 None，不透露规则是否存在。"""
+        if not token:
+            return None
+        row = self._fetchone(
+            "SELECT * FROM ip_rules WHERE agent_token_hash=%s",
+            (self._hash_token(token),),
+        )
+        return self._clean_rule(row) if row else None
+
+    def touch_agent(
+        self, rule_id: int, *, reported: bool = False, detail: str = ""
+    ) -> None:
+        """记一次 agent 心跳。reported=True 表示这次带了被墙上报。
+
+        agent_last_seen 每次都更新，用来在面板显示「部署状态」——
+        探测正常时脚本不上报，所以还是要有心跳才能区分「一切正常」和
+        「脚本挂了/机器没了」。
+        """
+        now = int(time.time())
+        if reported:
+            self._execute(
+                "UPDATE ip_rules SET agent_last_seen=%s, agent_last_report=%s,"
+                " agent_last_detail=%s WHERE id=%s",
+                (now, now, detail[:400], rule_id),
+            )
+        else:
+            self._execute(
+                "UPDATE ip_rules SET agent_last_seen=%s, agent_last_detail=%s"
+                " WHERE id=%s",
+                (now, detail[:400], rule_id),
+            )
 
     # ---------- DDNS ----------
 

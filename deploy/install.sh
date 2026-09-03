@@ -26,6 +26,7 @@ PG_USER="awshelper"
 MODE=""
 BIND_HOST="127.0.0.1"
 PORT="8765"
+REPORT_PORT="8766"
 PASSWORD=""
 ASSUME_YES="no"
 
@@ -308,6 +309,14 @@ AWS_HELPER_DB_PASSWORD=$pg_password
 AWS_HELPER_PASSWORD=$password
 AWS_HELPER_SESSION_KEY=$session_key
 AWS_HELPER_SESSION_TTL=86400
+
+# 实例侧探测器的上报端口。独立于面板端口，只有一个上报接口。
+# 用了 agent 模式的自动换 IP 才需要，实例必须能连到这个地址。
+AWS_HELPER_REPORT_PORT=$REPORT_PORT
+AWS_HELPER_REPORT_HOST=0.0.0.0
+# 留空则按面板出站 IP 自动拼；NAT 或多网卡环境下请显式填写，
+# 例如 AWS_HELPER_REPORT_URL=http://面板公网地址:$REPORT_PORT
+AWS_HELPER_REPORT_URL=
 ENVEOF
     chmod 600 "$ENV_FILE"
     ok "已写入配置 $ENV_FILE（权限 600）"

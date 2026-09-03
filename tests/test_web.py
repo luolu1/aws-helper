@@ -1401,3 +1401,239 @@ def test_bulk_fix_error_names_the_types():
     body = html.split("function fixSelectedCredits()")[1].split("\n}")[0]
     assert "请先勾选实例" in body, "没勾任何实例和勾了非 T 是两种情况"
     assert "types.join" in body, "要列出实际勾选的机型"
+
+
+# ---------- 实例侧探测（agent 模式） ----------
+
+
+def _make_agent_rule(app_module, aid, instance_id="i-0abc"):
+    return app_module.store.save_ip_rule(
+        account_id=aid,
+        region="us-east-1",
+        instance_id=instance_id,
+        probe_mode="agent",
+        agent_target="www.baidu.com:443",
+        agent_interval_sec=60,
+        agent_fail_threshold=3,
+    )
+
+
+def test_guard_script_endpoints_require_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_module = build_app(monkeypatch, tmp_path / "guard-anon")
+    c = TestClient(app_module.app)
+    assert c.post("/api/ip-rules/1/guard-script").status_code == 401
+    assert c.get("/api/ip-rules/1/agent-status").status_code == 401
+
+
+def test_guard_script_contains_token_and_target(client, monkeypatch):
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    rid = _make_agent_rule(app_module, aid)
+
+    r = c.post(f"/api/ip-rules/{rid}/guard-script")
+    assert r.status_code == 200
+    d = r.json()
+    assert "GUARD_TOKEN=" in d["script"]
+    assert "www.baidu.com" in d["script"]
+    assert d["report_url"] == "http://panel:8766/report"
+
+
+def test_regenerating_script_invalidates_old_token(client, monkeypatch):
+    """脚本里带明文凭证，重新生成通常意味着上一份可能已泄露。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    rid = _make_agent_rule(app_module, aid)
+
+    first = c.post(f"/api/ip-rules/{rid}/guard-script").json()["script"]
+    old_token = next(
+        l.split("=", 1)[1].strip("'") for l in first.split("\n") if l.startswith("GUARD_TOKEN=")
+    )
+    c.post(f"/api/ip-rules/{rid}/guard-script")
+
+    assert app_module.store.rule_by_agent_token(old_token) is None, "旧凭证必须失效"
+
+
+def test_agent_token_hash_never_leaves_store(client, monkeypatch):
+    """摘要不能出现在任何返回给页面的结构里。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    rid = _make_agent_rule(app_module, aid)
+    c.post(f"/api/ip-rules/{rid}/guard-script")
+
+    rules = app_module.store.list_ip_rules()
+    assert "agent_token_hash" not in rules[0]
+    assert rules[0]["agent_deployed"] is True
+
+    status = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert "agent_token_hash" not in str(status)
+
+
+def test_agent_status_states(client, monkeypatch):
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+
+    local_id = app_module.store.save_ip_rule(
+        account_id=aid, region="us-east-1", instance_id="i-local"
+    )
+    assert c.get(f"/api/ip-rules/{local_id}/agent-status").json()["state"] == "disabled"
+
+    rid = _make_agent_rule(app_module, aid)
+    assert c.get(f"/api/ip-rules/{rid}/agent-status").json()["state"] == "not_deployed"
+
+    c.post(f"/api/ip-rules/{rid}/guard-script")
+    d = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert d["state"] == "not_deployed", "生成了脚本但没收到上报，仍是未部署"
+    assert d["hints"], "未部署必须给排查方向"
+
+    app_module.store.touch_agent(rid, detail="探测正常")
+    d = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert d["state"] == "ok"
+    assert d["last_seen_ago"] is not None
+
+
+def test_agent_status_detects_stale(client, monkeypatch):
+    """探测正常时不上报，所以失联只能靠心跳超时判断。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    rid = _make_agent_rule(app_module, aid)
+    c.post(f"/api/ip-rules/{rid}/guard-script")
+
+    import time as _t
+
+    long_ago = int(_t.time()) - 60 * 10 * 3 - 100
+    app_module.store._execute(
+        "UPDATE ip_rules SET agent_last_seen=%s WHERE id=%s", (long_ago, rid)
+    )
+    d = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert d["state"] == "stale"
+    assert d["hints"]
+
+
+def test_agent_status_404_for_missing_rule(client):
+    c, aid, app_module = client
+    assert c.get("/api/ip-rules/999999/agent-status").status_code == 404
+    assert c.post("/api/ip-rules/999999/guard-script").status_code == 404
+
+
+def test_report_url_needs_config_when_ip_undetectable(client, monkeypatch):
+    """探测不到出站 IP 时要给可操作的报错，而不是拼出个空地址。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "")
+    monkeypatch.setattr(app_module.ddns, "detect_ip", lambda *a, **k: "")
+    rid = _make_agent_rule(app_module, aid)
+
+    r = c.post(f"/api/ip-rules/{rid}/guard-script")
+    assert r.status_code == 400
+    assert "AWS_HELPER_REPORT_URL" in r.json()["error"]
+
+
+# ---------- 上报端口鉴权 ----------
+
+
+def _report_client(app_module):
+    from fastapi.testclient import TestClient
+
+    from aws_helper.web import report_app
+
+    report_app.bind_store(app_module.store)
+    return TestClient(report_app.app)
+
+
+def test_report_rejects_missing_token(client):
+    c, aid, app_module = client
+    rc = _report_client(app_module)
+    r = rc.post("/report", json={"kind": "blocked"})
+    assert r.status_code == 401
+
+
+def test_report_rejects_wrong_token(client):
+    c, aid, app_module = client
+    _make_agent_rule(app_module, aid)
+    rc = _report_client(app_module)
+    r = rc.post(
+        "/report", json={"kind": "blocked"}, headers={"X-Guard-Token": "not-a-token"}
+    )
+    assert r.status_code == 401
+    assert "凭证" in r.json()["error"]
+
+
+def test_report_accepts_valid_token(client):
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    token = app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    r = rc.post(
+        "/report",
+        json={"kind": "alive", "instance_id": "i-0abc", "detail": "ok"},
+        headers={"X-Guard-Token": token},
+    )
+    assert r.status_code == 200
+    assert r.json()["action"] == "heartbeat"
+    assert app_module.store.ip_rule(rid)["agent_last_seen"] > 0
+
+
+def test_report_rejects_instance_id_mismatch(client):
+    """凭证按实例发。脚本被复制到别的机器时，那台的网络状况不代表这台。"""
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    token = app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    r = rc.post(
+        "/report",
+        json={"kind": "blocked", "instance_id": "i-someone-else"},
+        headers={"X-Guard-Token": token},
+    )
+    assert r.status_code == 403
+    assert "不匹配" in r.json()["error"]
+
+
+def test_report_blocked_triggers_ip_change(client):
+    from unittest.mock import MagicMock, patch
+
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    token = app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    with patch.object(app_module.ipchange, "change_ip") as ci:
+        ci.return_value = MagicMock(old_ip="1.1.1.1", new_ip="2.2.2.2", attempts=1)
+        r = rc.post(
+            "/report",
+            json={"kind": "blocked", "instance_id": "i-0abc", "detail": "连不上"},
+            headers={"X-Guard-Token": token},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["action"] == "changed"
+    assert r.json()["new_ip"] == "2.2.2.2"
+
+
+def test_report_port_has_no_panel_routes():
+    """上报端口只能有上报和健康检查 —— 主端口上有 AWS 凭据和实例密码。"""
+    from aws_helper.web import report_app
+
+    paths = {r.path for r in report_app.app.routes if hasattr(r, "path")}
+    assert paths <= {"/report", "/health"}, f"多了路由: {paths}"
+
+
+def test_autoip_page_has_agent_section():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/autoip.html").read_text()
+    assert "ag-target" in html
+    assert "ag-interval" in html
+    assert "function checkAgent" in html
+    assert "function copyAgentScript" in html
+    assert "实例侧探测部署状态" in html
+
+
+def test_ddns_page_has_status_check():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/ddns.html").read_text()
+    assert "function checkDdns" in html
+    assert "排查方向" in html
