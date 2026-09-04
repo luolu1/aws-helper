@@ -1789,17 +1789,38 @@ def api_agent_status(rule_id: int, _: None = Guard):
     heartbeat = interval * 10
     grace = heartbeat * 3
 
+    # 被拒记录优先于「没收到上报」：实例其实连上了，只是鉴权没过。
+    # 不看这个的话页面只会说「从未收到上报」，把用户引向查网络，而真因是凭证。
+    rejects = store.recent_agent_rejects(rule["instance_id"])
+
     hints: list[str] = []
     if not rule["agent_deployed"]:
         state = "not_deployed"
         summary = "还没生成过部署脚本"
         hints.append("点「生成部署脚本」拿到脚本，复制到实例上以 root 执行")
+    elif last_seen == 0 and rejects:
+        state = "rejected"
+        summary = "实例连上了面板，但上报被拒 —— 凭证对不上"
+        hints.append(
+            "最常见的原因：又点了一次「生成部署脚本」，旧脚本立刻失效。"
+            "以最后生成的那一份为准，重新在实例上执行"
+        )
+        hints.append(f"确认实例上的凭证：grep GUARD_TOKEN {guard_script.ENV_PATH}")
+        hints.append("重新执行部署脚本后：systemctl restart " + guard_script.SERVICE_NAME)
     elif last_seen == 0:
         state = "not_deployed"
         summary = "已生成脚本，但面板从未收到这台实例的上报"
         hints.append(f"确认脚本已在实例上执行：systemctl status {guard_script.SERVICE_NAME}")
         hints.append(f"确认实例能连到面板的上报端口 {REPORT_PORT}（安全组、防火墙）")
         hints.append("在实例上手动跑一次看输出：" + guard_script.INSTALL_PATH)
+    elif now - last_seen > grace and rejects:
+        state = "rejected"
+        summary = (
+            f"曾经正常，但最近的上报被拒（上次成功在 {now - last_seen} 秒前）"
+            " —— 凭证已经对不上"
+        )
+        hints.append("重新生成过部署脚本？旧脚本会立刻失效，要把新脚本再执行一遍")
+        hints.append(f"确认实例上的凭证：grep GUARD_TOKEN {guard_script.ENV_PATH}")
     elif now - last_seen > grace:
         state = "stale"
         summary = f"最后一次上报在 {now - last_seen} 秒前，超过 {grace} 秒宽限，可能已失联"
@@ -1827,6 +1848,7 @@ def api_agent_status(rule_id: int, _: None = Guard):
             now - int(rule["agent_last_report"]) if int(rule["agent_last_report"]) else None
         ),
         "last_detail": rule["agent_last_detail"],
+        "rejects": rejects,
         "report_port": REPORT_PORT,
         "report_port_running": report_server.running,
     }

@@ -479,7 +479,7 @@ python3 -m pytest tests/ -q
 可用 `AWS_HELPER_TEST_DATABASE_URL` 覆盖；库不可达时相关测试自动 skip。
 每个测试独占一个随机 schema，跑完自动 DROP。
 
-820 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
+827 个测试。AWS 侧全部用 moto 模拟，不碰真实账号。覆盖开机全链路、
 UserData 注入与顺序、安全组端口、换 IP 两种策略、EIP 泄漏与孤儿回收、
 IP 段规则、凭据与代理加密、账号编辑、密码哈希与强度、会话生命周期、
 登录锁定、CLI 密码重置、实例上报换 IP 与冷却、旧 local 规则迁移、SQLite 迁移与序列校正、

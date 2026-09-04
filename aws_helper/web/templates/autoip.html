@@ -101,7 +101,13 @@
       </label>
       <p class="hint">
         脚本含上报凭证，等同于「让面板给这台实例换 IP」的权限，
-        部署完建议删掉脚本文件。<strong>每次生成都会换发凭证，旧脚本立刻失效。</strong>
+        部署完建议删掉脚本文件。
+      </p>
+      <p class="hint">
+        <span class="tag warn">只用这一份</span>
+        每次生成都会换发凭证，<strong>之前生成的脚本立刻失效</strong>。
+        如果你已经在实例上装过旧脚本，需要把上面这份重新执行一遍，
+        否则实例上报会一直是 <span class="mono">HTTP 401 凭证无效</span>。
       </p>
       <div class="row">
         <button class="primary" onclick="copyAgentScript()">复制脚本</button>
@@ -274,6 +280,7 @@ const AG_TAGS = {
   ok: ['ok', '正常'],
   stale: ['err', '可能失联'],
   not_deployed: ['warn', '未部署'],
+  rejected: ['err', '凭证对不上'],
 };
 
 async function checkAgent(id) {
@@ -290,6 +297,15 @@ async function checkAgent(id) {
 
     const lines = [d.summary];
     if (d.last_detail) lines.push('', '最近一次上报内容: ' + d.last_detail);
+    // 被拒记录是最有用的线索：实例连上了但鉴权没过时，只看「未收到上报」
+    // 会让人去查网络，而真因在这里
+    if (d.rejects && d.rejects.length) {
+      lines.push('', '最近的上报被拒:');
+      d.rejects.forEach(r => {
+        const ts = new Date(r.created_at * 1000).toLocaleString();
+        lines.push(`  ${ts}  ${r.detail}`);
+      });
+    }
     if (!d.report_port_running) {
       lines.push('', `⚠ 面板的上报端口 ${d.report_port} 没在运行，实例上报会全部失败`);
     }
