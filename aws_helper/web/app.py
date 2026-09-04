@@ -1561,6 +1561,15 @@ async def api_change_ip(request: Request, _: None = Guard):
             )
         finally:
             cache.drop(*ec2_instances_key(account_id, region))
+        store.record_ip_change(
+            account_id,
+            region,
+            instance_id,
+            result.new_ip,
+            strategy=result.strategy,
+            trigger="manual",
+            reason="面板手动换 IP",
+        )
         store.log(
             "change-ip",
             instance_id,
@@ -1768,6 +1777,16 @@ def api_guard_script(rule_id: int, _: None = Guard):
         "report_url": url,
         "target": f"{host}:{port}",
         "service_name": guard_script.SERVICE_NAME,
+    }
+
+
+@app.get("/api/ip-history")
+def api_ip_history(account_id: int, region: str, instance_id: str, _: None = Guard):
+    """这台实例最近 10 次 IP 更换，含每个 IP 的存活时间。"""
+    return {
+        "ok": True,
+        "keep": store.IP_HISTORY_KEEP,
+        "history": store.ip_history(account_id, region, instance_id),
     }
 
 

@@ -71,6 +71,15 @@ def handle_agent_report(
         return {"action": "error", "reason": str(exc)}
 
     store.update_rule_state(rule_id, fail_count=0, last_check=now, last_change=now)
+    store.record_ip_change(
+        account_id,
+        rule["region"],
+        rule["instance_id"],
+        changed.new_ip,
+        strategy=rule["strategy"],
+        trigger="agent",
+        reason=detail or "实例上报被墙",
+    )
     cache.drop(*ec2_instances_key(account_id, rule["region"]))
     store.log(
         "autoip",
