@@ -2294,3 +2294,168 @@ def test_check_panel_shows_rejects():
     assert "最近的上报被拒" in html
     assert "d.rejects" in html
     assert "rejected: ['err'" in html
+
+
+# ---------- IP 更换历史与存活时间 ----------
+
+
+def test_ip_history_records_manual_change(client):
+    """面板手动换 IP 要留下记录，触发来源标 manual。"""
+    c, aid, app_module = client
+    from aws_helper.core import launch
+
+    creds = app_module.store.credentials(aid, "us-east-1")
+    inst = launch.launch(creds, launch.LaunchRequest(name="hist", region="us-east-1"))[0]
+
+    wait_task(
+        c,
+        c.post(
+            "/api/change-ip",
+            json={
+                "account_id": aid,
+                "region": "us-east-1",
+                "instance_id": inst.instance_id,
+                "strategy": "eip",
+            },
+        ).json()["task_id"],
+    )
+
+    d = c.get(
+        f"/api/ip-history?account_id={aid}&region=us-east-1&instance_id={inst.instance_id}"
+    ).json()
+    assert len(d["history"]) == 1
+    entry = d["history"][0]
+    assert entry["current"] is True
+    assert entry["trigger"] == "manual"
+    assert entry["alive_sec"] >= 0
+
+
+def test_ip_history_records_agent_triggered_change(client):
+    """实例上报被墙触发的更换要标 agent，并带上上报内容。"""
+    from unittest.mock import MagicMock, patch
+
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    token = app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    with patch.object(app_module.ipchange, "change_ip") as change:
+        change.return_value = MagicMock(old_ip="1.1.1.1", new_ip="2.2.2.2", attempts=1)
+        rc.post(
+            "/report",
+            json={"kind": "blocked", "instance_id": "i-0abc", "detail": "连不上百度"},
+            headers={"X-Guard-Token": token},
+        )
+
+    d = c.get(
+        f"/api/ip-history?account_id={aid}&region=us-east-1&instance_id=i-0abc"
+    ).json()
+    assert len(d["history"]) == 1
+    assert d["history"][0]["ip"] == "2.2.2.2"
+    assert d["history"][0]["trigger"] == "agent"
+    assert "连不上百度" in d["history"][0]["reason"]
+
+
+def test_ip_history_keeps_only_recent_ten(client):
+    """无人值守跑久了记录会一直涨，只留最近 10 条。"""
+    c, aid, app_module = client
+    for i in range(14):
+        app_module.store.record_ip_change(
+            aid, "us-east-1", "i-keep", f"1.0.0.{i}", trigger="agent"
+        )
+
+    d = c.get(
+        f"/api/ip-history?account_id={aid}&region=us-east-1&instance_id=i-keep"
+    ).json()
+    assert d["keep"] == 10
+    assert len(d["history"]) == 10
+    assert d["history"][0]["ip"] == "1.0.0.13", "最新的排最前"
+    assert d["history"][-1]["ip"] == "1.0.0.4", "最旧的已被删掉"
+
+    # 直接数库里的行数：ip_history() 自带 LIMIT，只查接口的话
+    # 裁剪逻辑整段删掉也照样通过（控制实验证过）
+    rows = app_module.store._fetchall(
+        "SELECT ip FROM ip_history WHERE instance_id=%s", ("i-keep",)
+    )
+    assert len(rows) == 10, f"库里应只剩 10 行，实得 {len(rows)}"
+
+
+def test_old_entry_alive_time_is_frozen(client):
+    """已换掉的 IP 存活时间必须定格，不能随当前时间一起涨。
+
+    只存 started_at、由页面拿当前时间去减的话，历史条目会越看越长 ——
+    那不是"这个 IP 活了多久"，而是"多久以前开始用的"。
+    """
+    import time as _t
+
+    c, aid, app_module = client
+    store = app_module.store
+    store.record_ip_change(aid, "us-east-1", "i-freeze", "1.1.1.1", trigger="agent")
+    _t.sleep(1.1)
+    store.record_ip_change(aid, "us-east-1", "i-freeze", "2.2.2.2", trigger="agent")
+
+    first = store.ip_history(aid, "us-east-1", "i-freeze")
+    old_alive = first[1]["alive_sec"]
+    cur_alive = first[0]["alive_sec"]
+    _t.sleep(1.2)
+    second = store.ip_history(aid, "us-east-1", "i-freeze")
+
+    assert second[1]["alive_sec"] == old_alive, "换掉的 IP 存活时间不该变"
+    assert second[0]["alive_sec"] > cur_alive, "当前 IP 存活时间应继续增长"
+
+
+def test_only_one_current_ip_per_instance(client):
+    """换新 IP 时旧的必须收尾，否则会出现两条「正在用」。"""
+    c, aid, app_module = client
+    store = app_module.store
+    for ip in ("1.1.1.1", "2.2.2.2", "3.3.3.3"):
+        store.record_ip_change(aid, "us-east-1", "i-one", ip, trigger="agent")
+
+    hist = store.ip_history(aid, "us-east-1", "i-one")
+    current = [h for h in hist if h["current"]]
+    assert len(current) == 1
+    assert current[0]["ip"] == "3.3.3.3"
+
+
+def test_ip_history_isolated_per_instance(client):
+    """两台实例的记录不能混，否则存活时间和 IP 全对不上。"""
+    c, aid, app_module = client
+    store = app_module.store
+    store.record_ip_change(aid, "us-east-1", "i-a", "1.1.1.1", trigger="agent")
+    store.record_ip_change(aid, "us-east-1", "i-b", "2.2.2.2", trigger="agent")
+
+    a = store.ip_history(aid, "us-east-1", "i-a")
+    b = store.ip_history(aid, "us-east-1", "i-b")
+    assert [h["ip"] for h in a] == ["1.1.1.1"]
+    assert [h["ip"] for h in b] == ["2.2.2.2"]
+    assert a[0]["current"] is True, "另一台换 IP 不该把这台的记录收尾"
+
+
+def test_ip_history_requires_login(mock_ec2, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_module = build_app(monkeypatch, tmp_path / "hist-anon")
+    c = TestClient(app_module.app)
+    resp = c.get("/api/ip-history?account_id=1&region=us-east-1&instance_id=i-1")
+    assert resp.status_code == 401
+
+
+def test_history_removed_with_account(client):
+    """删账号要连带清掉历史，否则实例 ID 被复用时会显示别人的记录。"""
+    c, aid, app_module = client
+    store = app_module.store
+    store.record_ip_change(aid, "us-east-1", "i-gone", "1.1.1.1", trigger="agent")
+    assert store.ip_history(aid, "us-east-1", "i-gone")
+
+    store.delete_account(aid)
+    assert store.ip_history(aid, "us-east-1", "i-gone") == []
+
+
+def test_autoip_page_has_history_button():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/autoip.html").read_text()
+    assert "IP 记录" in html
+    assert "function showHistory" in html
+    assert "存活时间" in html
+    assert "function agDuration" in html, "秒数要转成人话，横跨几天时没法读"

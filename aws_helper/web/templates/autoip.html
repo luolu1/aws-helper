@@ -154,12 +154,16 @@
         </td>
         <td>
           <button class="sm" onclick="checkAgent({{ r.id }})">检测</button>
+          <button class="sm" onclick="showHistory({{ r.id }}, {{ r.account_id }}, '{{ r.region }}', '{{ r.instance_id }}')">IP 记录</button>
           <button class="sm" onclick="regenAgent({{ r.id }})">重新生成脚本</button>
           <button class="sm danger" onclick="delRule({{ r.id }})">删除</button>
         </td>
       </tr>
       <tr class="ag-detail" data-detail="{{ r.id }}" style="display:none">
         <td colspan="7"><pre class="out" style="margin:0"></pre></td>
+      </tr>
+      <tr class="ag-history" data-history="{{ r.id }}" style="display:none">
+        <td colspan="7"></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -282,6 +286,64 @@ const AG_TAGS = {
   not_deployed: ['warn', '未部署'],
   rejected: ['err', '凭证对不上'],
 };
+
+// 秒数转人话。存活时间可能横跨几天，只显示秒没法读。
+function agDuration(sec) {
+  if (sec === null || sec === undefined) return '-';
+  if (sec < 60) return sec + ' 秒';
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时 ${Math.floor((sec % 3600) / 60)} 分`;
+  return `${Math.floor(sec / 86400)} 天 ${Math.floor((sec % 86400) / 3600)} 小时`;
+}
+
+const AG_TRIGGER = { agent: '实例上报被墙', manual: '面板手动', launch: '开机时' };
+
+async function showHistory(id, accountId, region, instanceId) {
+  const row = document.querySelector(`tr[data-history="${id}"]`);
+  const cell = row.querySelector('td');
+  if (row.style.display !== 'none') {
+    row.style.display = 'none';
+    return;
+  }
+  cell.innerHTML = '<span class="hint">加载中…</span>';
+  row.style.display = '';
+  try {
+    const d = await api(
+      `/api/ip-history?account_id=${accountId}&region=${encodeURIComponent(region)}`
+      + `&instance_id=${encodeURIComponent(instanceId)}`
+    );
+    if (!d.history.length) {
+      cell.innerHTML = '<span class="hint">还没有换过 IP。这里会记录最近 '
+        + d.keep + ' 次更换和每个 IP 的存活时间。</span>';
+      return;
+    }
+    const rows = d.history.map(h => {
+      const started = new Date(h.started_at * 1000).toLocaleString();
+      const tag = h.current
+        ? '<span class="tag ok" style="font-size:11px">正在用</span>'
+        : '<span class="hint">已更换</span>';
+      const why = AG_TRIGGER[h.trigger] || h.trigger || '-';
+      return `<tr>
+        <td class="mono">${escapeHtml(h.ip)}</td>
+        <td>${tag}</td>
+        <td class="mono">${agDuration(h.alive_sec)}</td>
+        <td class="mono">${escapeHtml(started)}</td>
+        <td>${escapeHtml(why)}</td>
+        <td class="hint">${escapeHtml(h.reason || '-')}</td>
+      </tr>`;
+    }).join('');
+    cell.innerHTML = `
+      <div class="hint" style="margin:0 0 6px">最近 ${d.history.length} 次 IP 更换（最多留 ${d.keep} 条）</div>
+      <table style="margin:0">
+        <thead><tr>
+          <th>IP</th><th>状态</th><th>存活时间</th><th>启用于</th><th>触发</th><th>原因</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (e) {
+    cell.innerHTML = '<span class="tag err">加载失败</span> ' + escapeHtml(e.message);
+  }
+}
 
 async function checkAgent(id) {
   const row = document.querySelector(`tr[data-rule="${id}"]`);
