@@ -894,6 +894,44 @@ class Store:
             return None
         return self._clean_rule(rows[0]) if len(rows) == 1 else None
 
+    def record_agent_reject(self, token: str, instance_id: str, kind: str) -> None:
+        """记一次被拒的上报，把真实原因留在日志里。
+
+        上报接口对外统一回「凭证无效」，不区分原因（那会向公网探测者确认
+        凭证有效性）。但用户看到实例日志里的 401 时需要知道到底是哪种：
+        重新生成脚本作废了旧凭证，还是脚本被复制到了别的机器。
+        """
+        digest = self._hash_token(token) if token else ""
+        known = bool(
+            digest
+            and self._fetchone(
+                "SELECT 1 FROM ip_rules WHERE agent_token_hash=%s", (digest,)
+            )
+        )
+        if not token:
+            reason = "上报未带凭证"
+        elif known:
+            reason = (
+                f"凭证有效但实例 ID 不匹配（上报方自称 {instance_id or '未提供'}）"
+                "，脚本可能被复制到了别的机器"
+            )
+        else:
+            reason = (
+                "凭证不在库里 —— 通常是又点了一次「生成部署脚本」，"
+                "旧脚本已作废，需要把新脚本重新在实例上执行一遍"
+            )
+        self.log("autoip", instance_id or "未知实例", False, f"上报被拒（{kind}）: {reason}")
+
+    def recent_agent_rejects(self, instance_id: str, limit: int = 3) -> list[dict[str, Any]]:
+        """取这台实例最近的上报被拒记录，供面板的「检测」展示。"""
+        rows = self._fetchall(
+            "SELECT created_at, detail FROM logs"
+            " WHERE kind='autoip' AND target=%s AND ok=0 AND detail LIKE '上报被拒%%'"
+            " ORDER BY id DESC LIMIT %s",
+            (instance_id, limit),
+        )
+        return [dict(r) for r in rows]
+
     def save_agent_token_hash(self, rule_id: int, token: str) -> None:
         """把已知明文的凭证摘要写到规则上。
 

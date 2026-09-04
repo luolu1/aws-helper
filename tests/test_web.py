@@ -2171,3 +2171,126 @@ def test_autoip_page_keeps_agent_entry_point(client):
     # 删掉按钮照样能通过（控制实验证过）。
     assert 'onclick="openAgent()"' in page
     assert "开启实例侧探测" in page
+
+
+# ---------- 上报被拒的可诊断性 ----------
+
+
+def test_unknown_token_is_logged_with_reason(client):
+    """401 只告诉实例「凭证无效」，但面板必须留下真实原因。
+
+    用户实测踩到的场景：连点两次「生成部署脚本」，第二次换发凭证让第一份
+    脚本作废，实例上报稳定 401。此前面板只显示「从未收到上报」，
+    把人引向查网络，而真因是凭证。
+    """
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    r = rc.post(
+        "/report",
+        json={"kind": "started", "instance_id": "i-0abc"},
+        headers={"X-Guard-Token": "stale-token-from-old-script"},
+    )
+    assert r.status_code == 401
+
+    rejects = app_module.store.recent_agent_rejects("i-0abc")
+    assert rejects, "被拒必须留下日志"
+    assert "不在库里" in rejects[0]["detail"]
+    assert "生成部署脚本" in rejects[0]["detail"], "要指出重新生成会作废旧脚本"
+
+
+def test_mismatched_instance_logged_differently(client):
+    """凭证有效但实例 ID 不符是另一种故障，提示不能和凭证过期混为一谈。"""
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    token = app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    r = rc.post(
+        "/report",
+        json={"kind": "blocked", "instance_id": "i-someone-else"},
+        headers={"X-Guard-Token": token},
+    )
+    assert r.status_code == 401
+
+    rejects = app_module.store.recent_agent_rejects("i-someone-else")
+    assert rejects
+    assert "实例 ID 不匹配" in rejects[0]["detail"]
+    assert "复制到了别的机器" in rejects[0]["detail"]
+
+
+def test_reject_response_does_not_reveal_reason(client):
+    """两种失败对外必须是同一句话 —— 区分开等于确认凭证有效。"""
+    c, aid, app_module = client
+    rid = _make_agent_rule(app_module, aid)
+    token = app_module.store.issue_agent_token(rid)
+    rc = _report_client(app_module)
+
+    bad_token = rc.post(
+        "/report", json={"instance_id": "i-0abc"}, headers={"X-Guard-Token": "nope"}
+    )
+    bad_instance = rc.post(
+        "/report", json={"instance_id": "i-other"}, headers={"X-Guard-Token": token}
+    )
+    assert bad_token.status_code == bad_instance.status_code == 401
+    assert bad_token.json() == bad_instance.json()
+
+
+def test_agent_status_surfaces_rejects(client, monkeypatch):
+    """检测按钮要直接说是凭证问题，并给出重新执行脚本的指引。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    rid = _make_agent_rule(app_module, aid)
+    c.post(f"/api/ip-rules/{rid}/guard-script")
+
+    rc = _report_client(app_module)
+    rc.post(
+        "/report",
+        json={"kind": "started", "instance_id": "i-0abc"},
+        headers={"X-Guard-Token": "old-script-token"},
+    )
+
+    d = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert d["state"] == "rejected", f"应识别为凭证问题，实得 {d['state']}"
+    assert "凭证" in d["summary"]
+    assert d["rejects"], "要把被拒记录带给页面"
+    assert any("重新在实例上执行" in h for h in d["hints"])
+
+
+def test_agent_status_prefers_rejects_over_not_deployed(client, monkeypatch):
+    """有被拒记录时不能再说「从未收到上报」—— 实例明明连上了。"""
+    c, aid, app_module = client
+    monkeypatch.setattr(app_module, "REPORT_PUBLIC_URL", "http://panel:8766")
+    rid = _make_agent_rule(app_module, aid)
+    c.post(f"/api/ip-rules/{rid}/guard-script")
+
+    before = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert before["state"] == "not_deployed"
+
+    rc = _report_client(app_module)
+    rc.post("/report", json={"instance_id": "i-0abc"}, headers={"X-Guard-Token": "x"})
+
+    after = c.get(f"/api/ip-rules/{rid}/agent-status").json()
+    assert after["state"] == "rejected"
+    assert "从未收到" not in after["summary"]
+
+
+def test_dialog_warns_old_script_expires():
+    """弹窗必须说清旧脚本立刻失效，否则用户重新生成后不知道要再装一遍。"""
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/autoip.html").read_text()
+    assert "只用这一份" in html
+    assert "立刻失效" in html
+    assert "401" in html, "要点明症状，用户才能对上实例日志"
+
+
+def test_check_panel_shows_rejects():
+    from pathlib import Path
+
+    html = Path("aws_helper/web/templates/autoip.html").read_text()
+    assert "最近的上报被拒" in html
+    assert "d.rejects" in html
+    assert "rejected: ['err'" in html

@@ -66,8 +66,10 @@ async def report(
     # 具体哪一台。凭证对但实例 ID 不在这批里 → 脚本被复制到了别处，拒绝。
     rule = _store.rule_by_agent_token(x_guard_token, claimed)
     if rule is None:
-        # 不说明是凭证错、规则没了，还是实例不匹配 —— 这个端口在公网上，
-        # 别给探测者线索
+        # 响应统一是「凭证无效」—— 这个端口在公网上，区分「凭证过期」和
+        # 「实例不匹配」等于告诉探测者凭证有效。但面板侧必须留下真实原因，
+        # 否则用户只能看到 401，没法知道是不是重新生成脚本作废了旧凭证。
+        _store.record_agent_reject(x_guard_token, claimed, kind)
         return JSONResponse({"ok": False, "error": "凭证无效"}, status_code=401)
 
     result = autoip.handle_agent_report(_store, rule, kind, detail)
