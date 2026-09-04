@@ -122,6 +122,25 @@ CREATE TABLE IF NOT EXISTS ip_rules (
     UNIQUE(account_id, region, instance_id)
 );
 
+CREATE TABLE IF NOT EXISTS ip_history (
+    id SERIAL PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    region TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    strategy TEXT NOT NULL DEFAULT '',
+    trigger TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    started_at BIGINT NOT NULL,
+    -- 这个 IP 被换掉的时刻。仍在用的那条是 0，换掉时才回填 ——
+    -- 存活时间要能反映"当前这个用了多久"，只存开始时间的话页面得自己算，
+    -- 而历史条目的存活时间必须是定格的，不能随当前时间一起涨。
+    ended_at BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS ip_history_lookup
+    ON ip_history(account_id, region, instance_id, id DESC);
+
 CREATE TABLE IF NOT EXISTS logs (
     id SERIAL PRIMARY KEY,
     created_at BIGINT NOT NULL,
@@ -1080,6 +1099,87 @@ class Store:
 
     def delete_ddns_rule(self, rule_id: int) -> None:
         self._execute("DELETE FROM ddns_rules WHERE id=%s", (rule_id,))
+
+    # ---------- 日志 ----------
+
+    # ---------- IP 更换历史 ----------
+
+    # 每台实例只留最近这么多条。IP 更换是低频动作，留太多没意义，
+    # 而无人值守跑久了会一直涨。
+    IP_HISTORY_KEEP = 10
+
+    def record_ip_change(
+        self,
+        account_id: int,
+        region: str,
+        instance_id: str,
+        new_ip: str,
+        *,
+        strategy: str = "",
+        trigger: str = "",
+        reason: str = "",
+    ) -> None:
+        """记一次 IP 更换：给旧 IP 收尾，给新 IP 开一条。
+
+        旧 IP 的 ended_at 在这里回填，存活时间才能定格 —— 否则历史条目的
+        时长会随当前时间一起涨。
+        """
+        now = int(time.time())
+        with self.pool.connection() as conn:
+            conn.execute(
+                "UPDATE ip_history SET ended_at=%s"
+                " WHERE account_id=%s AND region=%s AND instance_id=%s AND ended_at=0",
+                (now, account_id, region, instance_id),
+            )
+            conn.execute(
+                "INSERT INTO ip_history"
+                "(account_id, region, instance_id, ip, strategy, trigger, reason, started_at)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    account_id,
+                    region,
+                    instance_id,
+                    new_ip,
+                    strategy,
+                    trigger,
+                    reason[:400],
+                    now,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM ip_history WHERE id IN ("
+                "  SELECT id FROM ip_history"
+                "  WHERE account_id=%s AND region=%s AND instance_id=%s"
+                "  ORDER BY id DESC OFFSET %s"
+                ")",
+                (account_id, region, instance_id, self.IP_HISTORY_KEEP),
+            )
+            conn.commit()
+
+    def ip_history(
+        self, account_id: int, region: str, instance_id: str
+    ) -> list[dict[str, Any]]:
+        """按时间倒序取这台实例的 IP 更换记录，附各自存活秒数。
+
+        仍在用的那条（ended_at=0）用当前时间算，所以它的时长会一直涨；
+        已换掉的用 ended_at 定格。
+        """
+        rows = self._fetchall(
+            "SELECT ip, strategy, trigger, reason, started_at, ended_at"
+            " FROM ip_history"
+            " WHERE account_id=%s AND region=%s AND instance_id=%s"
+            " ORDER BY id DESC LIMIT %s",
+            (account_id, region, instance_id, self.IP_HISTORY_KEEP),
+        )
+        now = int(time.time())
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            ended = int(item["ended_at"])
+            item["current"] = ended == 0
+            item["alive_sec"] = max(0, (ended or now) - int(item["started_at"]))
+            out.append(item)
+        return out
 
     # ---------- 日志 ----------
 
